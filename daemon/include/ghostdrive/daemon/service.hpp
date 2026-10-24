@@ -22,6 +22,11 @@
 #include "ghostdrive/vfs/filesystem.hpp"
 #include "ghostdrive/vfs/tree.hpp"
 
+namespace ghostdrive::discovery {
+class LanDiscovery;
+struct LanSighting;
+}  // namespace ghostdrive::discovery
+
 namespace ghostdrive::daemon {
 
 inline constexpr std::uint16_t kDefaultPort = 7373;
@@ -35,6 +40,8 @@ struct ServiceOptions {
     // Addresses put in invite codes. Empty: this host's non-loopback IPv4 addresses, then
     // 127.0.0.1.
     std::vector<asio::ip::address> invite_addresses;
+    // Advertise this device and find the others on the LAN (mDNS), when built with DNS-SD.
+    bool lan_discovery = true;
 };
 
 struct PeerStatus {
@@ -94,6 +101,7 @@ private:
     asio::awaitable<void> receive_index(std::shared_ptr<transport::Connection> conn,
                                         std::shared_ptr<transport::Stream> stream, Hello hello);
     asio::awaitable<void> run_pairing(std::shared_ptr<transport::Connection> conn);
+    void on_lan_sighting(const discovery::LanSighting& sighting);
 
     asio::any_io_executor io_;
     asio::any_io_executor disk_;
@@ -106,8 +114,11 @@ private:
     std::unique_ptr<vfs::Filesystem> fs_;
 
     std::shared_ptr<transport::Endpoint> endpoint_;
+    std::unique_ptr<discovery::LanDiscovery> lan_;
     std::map<core::PublicKey, std::shared_ptr<transport::Connection>> live_;
-    std::set<core::PublicKey> dialing_;
+    // Dials in flight, per member and address: a stale address timing out must not hold up one
+    // just found on the LAN.
+    std::set<std::pair<core::PublicKey, asio::ip::udp::endpoint>> dialing_;
     std::vector<PendingInvite> invites_;
     std::map<core::PublicKey, int> member_connections_;
     std::size_t pairing_connections_ = 0;

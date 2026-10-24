@@ -191,6 +191,15 @@ document assumes the corrected version.
   each other; observers cannot track a device across epochs or learn its key. A forged
   advertisement only wastes one dial, because the TLS pin check rejects it. Announcements are
   rate-limited and the cache is capped.
+  As built in step (d): through the system DNS-SD API (mDNSResponder on macOS, Avahi's
+  compatibility library on Linux), one shared connection driven by Asio. The TXT record is
+  `v=1 id=<base32>`, where the ID is `HMAC-SHA256(drive_secret, "ghostdrive-lan-v1" || epoch
+  || device key)` truncated to 12 bytes, with one-hour epochs; members check the neighbouring
+  epochs too, for clock skew. A sighting updates the stored address and dials right away, in
+  parallel with any dial to a stale address. Resolutions are capped (64 in flight, 32 per 10 s).
+  The rotating ID hides which GhostDrive device advertises, but the SRV record points at the
+  machine's normal `.local` host name, which macOS already advertises for other services; a
+  random host record would hide that too and is left for later. IPv4 only for now.
 - **WAN.**
   1. Each device keeps a QUIC connection to its rendezvous server.
   2. The server reports the observed address (server-reflexive candidate), using STUN or QUIC

@@ -11,6 +11,7 @@ target_include_directories(ghostdrive_daemon PUBLIC include PRIVATE src)
 target_link_libraries(ghostdrive_daemon
     PUBLIC
         ghostdrive::vfs
+        ghostdrive::discovery
         ghostdrive::transport
         ghostdrive::core
     PRIVATE

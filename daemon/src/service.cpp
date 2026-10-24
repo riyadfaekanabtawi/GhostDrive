@@ -15,6 +15,10 @@
 #include <asio/use_awaitable.hpp>
 
 #include "async.hpp"
+#include "ghostdrive/discovery/lan_id.hpp"
+#ifdef GHOSTDRIVE_HAVE_DNSSD
+#include "ghostdrive/discovery/lan_discovery.hpp"
+#endif
 #include "ghostdrive/transport/frame.hpp"
 #include "ghostdrive/vfs/chunk_exchange.hpp"
 
@@ -125,11 +129,44 @@ Status Service::start() {
 
     asio::co_spawn(io_, accept_loop(), asio::detached);
     asio::co_spawn(io_, dial_loop(), asio::detached);
+#ifdef GHOSTDRIVE_HAVE_DNSSD
+    if (options_.lan_discovery) {
+        auto lan = discovery::LanDiscovery::start(
+            io_, port(),
+            [this] {
+                return discovery::lan_id(drive_.secret(), drive_.key().public_key(),
+                                         discovery::lan_epoch(std::chrono::system_clock::now()));
+            },
+            [this](const discovery::LanSighting& s) { on_lan_sighting(s); });
+        // Without mDNS the drive still works through stored addresses.
+        if (lan) lan_ = std::move(lan).value();
+    }
+#endif
     return {};
+}
+
+void Service::on_lan_sighting(const discovery::LanSighting& sighting) {
+    if (stopped_) return;
+    auto devices = drive_.index().devices();
+    if (!devices) return;
+    std::vector<core::PublicKey> members;
+    for (const auto& d : devices.value()) members.push_back(d.key);
+    auto key = discovery::match_lan_id(sighting.id, drive_.secret(), members,
+                                       std::chrono::system_clock::now());
+    if (!key) return;  // another drive, or a stale or forged advertisement
+    auto text = format_address(sighting.endpoint);
+    auto known = drive_.peer_addresses();
+    if (auto it = known.find(*key); it == known.end() || it->second != text) {
+        (void)drive_.set_peer_address(*key, text);
+    }
+    if (live_.contains(*key) || dialing_.contains({*key, sighting.endpoint})) return;
+    dialing_.insert({*key, sighting.endpoint});
+    asio::co_spawn(io_, dial(*key, sighting.endpoint), asio::detached);
 }
 
 void Service::stop() {
     stopped_ = true;
+    lan_.reset();
     for (auto& [key, conn] : live_) conn->close();
     live_.clear();
     if (endpoint_) endpoint_->close();
@@ -209,10 +246,10 @@ asio::awaitable<void> Service::dial_loop() {
     auto alive = alive_;
     while (*alive && !stopped_) {
         for (const auto& [key, text] : drive_.peer_addresses()) {
-            if (live_.contains(key) || dialing_.contains(key) || !is_member(key)) continue;
+            if (live_.contains(key) || !is_member(key)) continue;
             auto address = parse_address(text);
-            if (!address) continue;
-            dialing_.insert(key);
+            if (!address || dialing_.contains({key, *address})) continue;
+            dialing_.insert({key, *address});
             asio::co_spawn(io_, dial(key, *address), asio::detached);
         }
         co_await sleep_for(options_.redial);
@@ -224,7 +261,7 @@ asio::awaitable<void> Service::dial(core::PublicKey key, Udp::endpoint address) 
     auto endpoint = endpoint_;
     auto conn = co_await endpoint->connect(address, key);
     if (!*alive) co_return;
-    dialing_.erase(key);
+    dialing_.erase({key, address});
     if (!conn || stopped_) co_return;
     // Both sides may dial at once; the later connection simply replaces the earlier one.
     co_await run_member(std::move(conn).value());

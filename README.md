@@ -7,8 +7,8 @@ server. The only server component is a rendezvous/relay you can host yourself; i
 encrypted packets and never stores file data.
 
 Status: early, but usable between devices on the same network (macOS with FUSE-T, Linux with
-libfuse3). Devices are reached by the address in the invite code; finding each other across the
-internet (rendezvous, hole punching, relay) is not built yet. See
+libfuse3). Devices find each other on the local network automatically (mDNS); reaching them
+across the internet (rendezvous, hole punching, relay) is not built yet. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How you use it

@@ -33,6 +33,7 @@ ServiceOptions loopback_options() {
     options.invite_addresses = {asio::ip::address_v4::loopback()};
     options.sync_poll = 50ms;
     options.redial = 200ms;
+    options.lan_discovery = false;  // the LAN test below turns it on
     return options;
 }
 
@@ -54,12 +55,12 @@ protected:
         return done();
     }
 
-    void start_a() {
+    void start_a(ServiceOptions options = loopback_options()) {
         auto drive = Drive::create(dir_.path() / "a", "desk");
         ASSERT_TRUE(drive) << drive.error().message;
         drive_a_ = std::move(drive).value();
         a_ = std::make_unique<Service>(io_.get_executor(), disk_.get_executor(), *drive_a_,
-                                       loopback_options());
+                                       options);
         ASSERT_TRUE(a_->start());
     }
 
@@ -250,6 +251,43 @@ TEST_F(TwoDevices, UnpairedDevicesCannotConnectWithoutAnInvite) {
     ASSERT_TRUE(conn);
     EXPECT_FALSE(*conn);
     endpoint->close();
+}
+
+TEST_F(TwoDevices, DevicesFindEachOtherOnTheLanWithoutStoredAddresses) {
+#ifndef GHOSTDRIVE_HAVE_DNSSD
+    GTEST_SKIP() << "built without DNS-SD";
+#else
+    // Bound to every interface, since mDNS hands out the host's LAN address.
+    ServiceOptions lan;
+    lan.listen = asio::ip::udp::endpoint(asio::ip::address_v4::any(), 0);
+    lan.invite_addresses = {asio::ip::address_v4::loopback()};
+    lan.sync_poll = 50ms;
+    lan.redial = 200ms;
+    start_a(lan);
+
+    auto code = a_->create_invite(60s);
+    ASSERT_TRUE(code);
+    auto joined = join_with(code.value(), "b");
+    ASSERT_TRUE(joined) << joined.error().message;
+    auto drive = Drive::join(dir_.path() / "b", "laptop", joined.value().info);
+    ASSERT_TRUE(drive);
+    // Both sides know only addresses that lead nowhere.
+    ASSERT_TRUE(drive.value()->set_peer_address(drive_a_->key().public_key(), "127.0.0.1:9"));
+    ASSERT_TRUE(drive_a_->set_peer_address(drive.value()->key().public_key(), "127.0.0.1:9"));
+    drive_b_ = std::move(drive).value();
+    b_ = std::make_unique<Service>(io_.get_executor(), disk_.get_executor(), *drive_b_, lan);
+    ASSERT_TRUE(b_->start());
+
+    ASSERT_TRUE(drain(
+        [&] {
+            return a_->connected_to(drive_b_->key().public_key()) &&
+                   b_->connected_to(drive_a_->key().public_key());
+        },
+        30s))
+        << "mDNS did not bring the devices together";
+    // The address found on the LAN replaced the dead one.
+    EXPECT_NE(drive_b_->peer_addresses().at(drive_a_->key().public_key()), "127.0.0.1:9");
+#endif
 }
 
 }  // namespace
