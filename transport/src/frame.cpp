@@ -1,5 +1,6 @@
 #include "ghostdrive/transport/frame.hpp"
 
+#include <algorithm>
 #include <string>
 
 #include "ghostdrive/transport/endpoint.hpp"
@@ -23,7 +24,7 @@ std::uint32_t get_u32(std::span<const std::byte> in) noexcept {
 
 bool known_type(std::uint8_t type) noexcept {
     return type >= static_cast<std::uint8_t>(FrameType::get_chunk) &&
-           type <= static_cast<std::uint8_t>(FrameType::error);
+           type <= static_cast<std::uint8_t>(FrameType::drive_info);
 }
 
 core::Bytes make_frame(FrameType type, std::span<const std::byte> payload) {
@@ -107,8 +108,20 @@ asio::awaitable<core::Result<Frame>> read_frame(Stream& stream, std::uint32_t ma
     if (auto st = co_await read_exact(stream, header_bytes); !st) co_return st.error();
     auto header = decode_header(header_bytes, max_payload);
     if (!header) co_return header.error();
-    Frame frame{header.value().type, core::Bytes(header.value().length)};
-    if (auto st = co_await read_exact(stream, frame.payload); !st) co_return st.error();
+    // Grow the buffer only as bytes arrive, so a header that claims a large payload commits no
+    // more memory than the peer actually sends (which QUIC flow control bounds).
+    constexpr std::size_t kStep = 256 * 1024;
+    Frame frame{header.value().type, {}};
+    std::size_t remaining = header.value().length;
+    while (remaining > 0) {
+        std::size_t step = std::min(remaining, kStep);
+        std::size_t old = frame.payload.size();
+        frame.payload.resize(old + step);
+        if (auto st = co_await read_exact(stream, std::span(frame.payload).subspan(old)); !st) {
+            co_return st.error();
+        }
+        remaining -= step;
+    }
     co_return frame;
 }
 

@@ -292,5 +292,31 @@ TEST_F(MetadataIndexTest, ChunkHolders) {
     EXPECT_TRUE(index.holders(c).value().empty());
 }
 
+
+TEST_F(MetadataIndexTest, RemoteRecordsCannotWrapClocksOrCounters) {
+    auto index = open("a.db", kDeviceA);
+    HybridClock clock;  // real time, so "far future" is measured against now
+
+    auto huge = file("counter.txt", 1, 1);
+    for (int i = 0; i < 3; ++i) huge.version.bump(kDeviceB);
+    huge.version = VersionVector::parse(huge.version.serialize()).value();
+    // Build a counter at the edge directly through the wire format.
+    Bytes raw = huge.version.serialize();
+    for (std::size_t i = 12; i < 20; ++i) raw[i] = std::byte{0xFF};  // value of the only counter
+    huge.version = VersionVector::parse(raw).value();
+    huge.hlc = clock.now();
+    EXPECT_EQ(index.apply_remote(huge, clock).error().code, Errc::invalid_argument);
+
+    auto future = file("future.txt", 1, 2);
+    future.version.bump(kDeviceB);
+    future.hlc = (HybridClock::physical_ms(clock.now()) + 7ull * 24 * 3600 * 1000) << 16;
+    EXPECT_EQ(index.apply_remote(future, clock).error().code, Errc::invalid_argument);
+
+    auto fine = file("fine.txt", 1, 3);
+    fine.version.bump(kDeviceB);
+    fine.hlc = clock.now();
+    EXPECT_TRUE(index.apply_remote(fine, clock));
+}
+
 }  // namespace
 }  // namespace ghostdrive::core

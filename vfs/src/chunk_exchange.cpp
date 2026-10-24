@@ -22,9 +22,19 @@ constexpr std::uint32_t kMaxRequestPayload = 64;
 asio::awaitable<void> serve_one(std::shared_ptr<transport::Stream> stream,
                                 const core::ChunkStore& store, asio::any_io_executor disk) {
     auto request = co_await wire::read_frame(*stream, kMaxRequestPayload);
+    if (!request) co_return;
+    co_await answer_chunk_request(std::move(stream), request.value(), store, std::move(disk));
+}
+
+}  // namespace
+
+asio::awaitable<void> answer_chunk_request(std::shared_ptr<transport::Stream> stream,
+                                           const wire::Frame& request,
+                                           const core::ChunkStore& store,
+                                           asio::any_io_executor disk) {
     std::optional<core::ChunkId> id;
-    if (request && request.value().type == wire::FrameType::get_chunk) {
-        auto decoded = wire::decode_get_chunk(request.value().payload);
+    if (request.type == wire::FrameType::get_chunk) {
+        auto decoded = wire::decode_get_chunk(request.payload);
         if (decoded) id = decoded.value();
     }
     if (!id) {
@@ -49,7 +59,6 @@ asio::awaitable<void> serve_one(std::shared_ptr<transport::Stream> stream,
     (void)co_await stream->write(parts, true);
 }
 
-}  // namespace
 
 asio::awaitable<void> serve_chunks(std::shared_ptr<transport::Connection> conn,
                                    const core::ChunkStore& store, asio::any_io_executor disk) {
@@ -69,7 +78,8 @@ asio::awaitable<core::Result<core::Bytes>> request_chunk(transport::Connection& 
     auto request = wire::encode_get_chunk(id);
     if (auto st = co_await stream.value()->write(request, true); !st) co_return st.error();
 
-    auto reply = co_await wire::read_frame(*stream.value(), std::max<std::uint32_t>(max_size, 2));
+    auto limit = std::clamp<std::uint32_t>(max_size, 2, wire::kMaxPayload);
+    auto reply = co_await wire::read_frame(*stream.value(), limit);
     if (!reply) co_return reply.error();
     switch (reply.value().type) {
         case wire::FrameType::chunk_data:

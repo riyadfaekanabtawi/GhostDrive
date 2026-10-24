@@ -100,7 +100,8 @@ protected:
             [this](const core::PublicKey& key) -> std::shared_ptr<transport::Connection> {
                 auto it = connections_.find(key);
                 return it == connections_.end() ? nullptr : it->second;
-            });
+            },
+            per_request_timeout_);
         FilesystemOptions fs_options;
         fs_options.request_timeout = request_timeout_;
         fs_ = std::make_unique<Filesystem>(io_.get_executor(), tree_, *fetcher_, fs_options);
@@ -242,6 +243,7 @@ protected:
     core::ChunkCache cache_;
     Tree tree_;
     std::chrono::milliseconds request_timeout_{30'000};
+    std::chrono::milliseconds per_request_timeout_{10'000};
     std::shared_ptr<transport::Endpoint> client_;
     std::unique_ptr<Fetcher> fetcher_;
     std::unique_ptr<Filesystem> fs_;
@@ -395,6 +397,25 @@ TEST_F(RemoteRead, PartialWriteToARemoteFileFetchesOnlyTheTouchedBlock) {
     }
     std::copy(patch.begin(), patch.end(), data.begin() + static_cast<std::ptrdiff_t>(offset));
     auto got = read_file("remote.bin", 64 * 1024);
+    ASSERT_TRUE(got) << got.error().message;
+    EXPECT_TRUE(got.value() == data);
+}
+
+TEST_F(RemoteRead, ASilentHolderIsPassedOverForTheNextOne) {
+    per_request_timeout_ = 300ms;
+    start_client();
+    // The silent peer gets the smaller key, so it is asked first.
+    auto k1 = core::DeviceKey::generate().value();
+    auto k2 = core::DeviceKey::generate().value();
+    if (k2.public_key() < k1.public_key()) std::swap(k1, k2);
+    auto& silent = add_server(Behavior::silent, {}, std::move(k1));
+    auto& honest = add_server(Behavior::honest, {}, std::move(k2));
+    connect(silent);
+    connect(honest);
+    auto data = random_bytes(1000, 9);
+    publish("f", data, {&honest}, {&silent, &honest});
+
+    auto got = read_file("f", 4096);
     ASSERT_TRUE(got) << got.error().message;
     EXPECT_TRUE(got.value() == data);
 }

@@ -352,5 +352,34 @@ TEST_F(WriteTest, InvalidNamesAreRejected) {
     EXPECT_EQ(under_file.error().code, core::Errc::not_directory);
 }
 
+TEST_F(WriteTest, RemoteEditWhileOpenBecomesAConflictCopy) {
+    auto ino = make_file("doc.txt", random_bytes(100, 20));
+    auto h = fs_.open(ino, true);
+    ASSERT_TRUE(h);
+
+    // Another device edits the file while it is open here.
+    auto remote = record_of("doc.txt");
+    remote.version.bump(0xB0B);
+    remote.modified_by = 0xB0B;
+    remote.hlc = clock_.now() + 1000;
+    remote.mtime_ns += 1;
+    ASSERT_TRUE(index_.apply_remote(remote, clock_));
+
+    ASSERT_TRUE(write(h.value(), 0, random_bytes(10, 21)));
+    ASSERT_TRUE(flush(h.value()));
+    fs_.release(h.value());
+
+    // The remote version kept the name; the local edit is a conflict copy beside it.
+    EXPECT_EQ(record_of("doc.txt").modified_by, 0xB0Bu);
+    auto entries = tree_.readdir(kRootIno);
+    ASSERT_TRUE(entries);
+    std::vector<std::string> conflicts;
+    for (const auto& e : *entries) {
+        if (e.name.find(".sync-conflict-") != std::string::npos) conflicts.push_back(e.name);
+    }
+    ASSERT_EQ(conflicts.size(), 1u);
+    EXPECT_EQ(record_of(conflicts[0]).size, 100u);
+}
+
 }  // namespace
 }  // namespace ghostdrive::vfs

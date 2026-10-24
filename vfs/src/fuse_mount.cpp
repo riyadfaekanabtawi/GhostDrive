@@ -7,6 +7,10 @@
 #include <fcntl.h>
 #include <fuse_lowlevel.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/mount.h>
+#include <sys/param.h>
+#endif
 #include <sys/statvfs.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -36,6 +40,9 @@ struct FuseMount::Impl {
     fuse_session* session = nullptr;
     std::thread loop;
     bool mounted = false;
+    // The mountpoint as the kernel recorded it (macOS), which can differ in case from the path
+    // we were given on a case-insensitive volume.
+    std::string kernel_mountpoint;
 
     // Directory listings are snapshotted at opendir so offsets stay stable while reading.
     std::mutex dirs_mutex;
@@ -358,6 +365,14 @@ void op_setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
     });
 }
 
+#ifdef __APPLE__
+std::string kernel_mount_name(const std::filesystem::path& path) {
+    struct statfs sf{};
+    if (::statfs(path.c_str(), &sf) != 0) return {};
+    return sf.f_mntonname;
+}
+#endif
+
 const fuse_lowlevel_ops kOps = [] {
     fuse_lowlevel_ops ops{};
     ops.lookup = op_lookup;
@@ -406,6 +421,7 @@ core::Result<std::unique_ptr<FuseMount>> FuseMount::mount(Filesystem& fs,
     if (!fs.writable()) args.insert(args.end(), {"-o", "ro"});
 #ifdef __APPLE__
     args.insert(args.end(), {"-o", "volname=" + options.volume_name});
+    if (!options.kernel_attr_cache) args.insert(args.end(), {"-o", "noattrcache"});
 #endif
     if (options.debug) args.emplace_back("-d");
     for (const auto& extra : options.extra_options) args.insert(args.end(), {"-o", extra});
@@ -434,6 +450,9 @@ core::Result<std::unique_ptr<FuseMount>> FuseMount::mount(Filesystem& fs,
         mount->unmount();
         return Error{Errc::timeout, "mount did not appear at " + mountpoint.string()};
     }
+#ifdef __APPLE__
+    mount->impl_->kernel_mountpoint = kernel_mount_name(mountpoint);
+#endif
     return mount;
 }
 
@@ -441,7 +460,16 @@ void FuseMount::unmount() {
     if (!impl_ || !impl_->mounted) return;
     impl_->mounted = false;
     fuse_session_exit(impl_->session);
-    // Unmounting makes the kernel side end the session, which returns the loop.
+#ifdef __APPLE__
+    // Unmount by the kernel's own name first. FUSE-T looks its mount up by the path it was
+    // given, so a path that differs in letter case leaves the mount behind; and its own unmount
+    // polls for several seconds when it does the unmount itself.
+    const auto& name = impl_->kernel_mountpoint;
+    if (!name.empty() && kernel_mount_name(name) == name) {
+        if (::unmount(name.c_str(), 0) != 0) ::unmount(name.c_str(), MNT_FORCE);
+    }
+#endif
+    // Ends the session, which returns the loop (Linux: unmounts via fusermount3).
     fuse_session_unmount(impl_->session);
     if (impl_->loop.joinable()) impl_->loop.join();
     fuse_session_destroy(impl_->session);

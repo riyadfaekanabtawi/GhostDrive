@@ -3,6 +3,7 @@
 #include <asio/any_completion_handler.hpp>
 #include <asio/any_io_executor.hpp>
 #include <asio/awaitable.hpp>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -36,8 +37,11 @@ struct FetcherStats {
 // same chunk share one fetch. Runs on `io`; disk reads and hashing run on `disk`.
 class Fetcher {
 public:
+    // A holder that has not answered one GetChunk within `request_timeout` is passed over for
+    // the next one, so a silent peer cannot stall reads.
     Fetcher(asio::any_io_executor io, asio::any_io_executor disk, const core::ChunkStore& store,
-            const core::MetadataIndex& index, core::ChunkCache& cache, ConnectionLookup peers);
+            const core::MetadataIndex& index, core::ChunkCache& cache, ConnectionLookup peers,
+            std::chrono::milliseconds request_timeout = std::chrono::seconds(10));
 
     // `size` is the chunk's expected length (from the file record); replies of any other
     // length are rejected.
@@ -66,6 +70,7 @@ private:
     const core::MetadataIndex& index_;
     core::ChunkCache& cache_;
     ConnectionLookup peers_;
+    std::chrono::milliseconds request_timeout_;
     std::unordered_map<core::ChunkId, std::shared_ptr<Pending>> in_flight_;
     FetcherStats stats_;
 };

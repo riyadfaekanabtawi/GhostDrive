@@ -3,6 +3,7 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <tuple>
 
@@ -474,6 +475,22 @@ Result<FileRecord> MetadataIndex::delete_local(std::string_view path, HybridCloc
 
 Result<ApplyOutcome> MetadataIndex::apply_remote(const FileRecord& record, HybridClock& clock) {
     if (auto st = validate(record); !st) return st.error();
+    // A peer must not push our clock or a version counter to the end of its range: both wrap,
+    // which would freeze the file (our edits would compare as older) or lose every conflict.
+    constexpr std::uint64_t kMaxCounter = std::uint64_t{1} << 62;
+    constexpr std::uint64_t kMaxClockSkewMs = 24ull * 60 * 60 * 1000;
+    for (const auto& c : record.version.counters()) {
+        if (c.value >= kMaxCounter) {
+            return Error{Errc::invalid_argument, "remote record has an out-of-range version"};
+        }
+    }
+    const auto wall_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    if (HybridClock::physical_ms(record.hlc) > wall_ms + kMaxClockSkewMs) {
+        return Error{Errc::invalid_argument, "remote record is timestamped too far in the future"};
+    }
     std::lock_guard lock(impl_->mutex);
     clock.update(record.hlc);
 

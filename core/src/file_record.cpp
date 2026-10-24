@@ -32,8 +32,13 @@ Status validate(const FileRecord& record) {
         }
         return {};
     }
-    if (record.size > 0 && record.block_size == 0) {
-        return Error{Errc::invalid_argument, "record has no block size: " + record.path};
+    if (record.size > 0) {
+        // Fixed power-of-two chunking (ARCHITECTURE.md section 11.3). Anything else would let a
+        // peer's record dictate allocation sizes.
+        const auto b = record.block_size;
+        if (b < kMinBlockSize || b > kMaxBlockSize || (b & (b - 1)) != 0) {
+            return Error{Errc::invalid_argument, "record has an invalid block size: " + record.path};
+        }
     }
     if (record.chunks.size() != chunk_count(record.size, record.block_size)) {
         return Error{Errc::invalid_argument, "chunk list does not match size: " + record.path};

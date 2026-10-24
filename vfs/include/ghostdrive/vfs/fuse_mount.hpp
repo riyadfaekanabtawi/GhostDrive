@@ -15,6 +15,10 @@ struct FuseMountOptions {
     double entry_timeout_s = 1.0;
     double attr_timeout_s = 1.0;
     bool debug = false;
+    // macOS/FUSE-T: let the kernel's NFS client cache attributes and lookups. Off by default:
+    // FUSE-T cannot invalidate those caches, so with caching a change from another device can
+    // take up to a minute to show; without it every stat is answered from memory here.
+    bool kernel_attr_cache = false;
     // Passed through as "-o <value>", for example "rwsize=65536" on FUSE-T.
     std::vector<std::string> extra_options;
 };

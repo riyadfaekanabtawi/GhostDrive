@@ -138,5 +138,14 @@ TEST(Tree, RefreshAppliesOnlyNewIndexRecords) {
     EXPECT_EQ(tree.applied_sequence(), index.value().max_sequence().value());
 }
 
+
+TEST(Tree, SetIdBitsFromPeersAreDropped) {
+    Tree tree;
+    auto r = file("tool");
+    r.mode = 04755;
+    tree.apply(r);
+    EXPECT_EQ(tree.getattr(*tree.resolve("tool"))->perm, 0755u);
+}
+
 }  // namespace
 }  // namespace ghostdrive::vfs

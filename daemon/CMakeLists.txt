@@ -1,0 +1,31 @@
+add_library(ghostdrive_daemon
+    src/codec.cpp
+    src/control.cpp
+    src/drive.cpp
+    src/invite.cpp
+    src/service.cpp
+)
+add_library(ghostdrive::daemon ALIAS ghostdrive_daemon)
+
+target_include_directories(ghostdrive_daemon PUBLIC include PRIVATE src)
+target_link_libraries(ghostdrive_daemon
+    PUBLIC
+        ghostdrive::vfs
+        ghostdrive::transport
+        ghostdrive::core
+    PRIVATE
+        OpenSSL::Crypto
+        ghostdrive_warnings
+)
+
+add_executable(ghostdrived ghostdrived.cpp)
+target_include_directories(ghostdrived PRIVATE src)
+target_link_libraries(ghostdrived PRIVATE ghostdrive::daemon ghostdrive_warnings)
+if(TARGET ghostdrive_vfs_fuse)
+    target_link_libraries(ghostdrived PRIVATE ghostdrive::vfs_fuse)
+    target_compile_definitions(ghostdrived PRIVATE GHOSTDRIVE_HAVE_FUSE=1)
+endif()
+
+if(GHOSTDRIVE_BUILD_TESTS)
+    add_subdirectory(tests)
+endif()

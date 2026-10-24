@@ -65,5 +65,22 @@ TEST(FileRecord, ConflictCopyPathEncodesDevice) {
     EXPECT_TRUE(is_valid_drive_path(p));
 }
 
+
+TEST(FileRecord, BlockSizeMustBeAPowerOfTwoInRange) {
+    FileRecord r;
+    r.path = "f";
+    r.size = 1;
+    r.chunks.resize(1);
+    for (std::uint32_t ok : {kMinBlockSize, 1024u * 1024, kMaxBlockSize}) {
+        r.block_size = ok;
+        EXPECT_TRUE(validate(r)) << ok;
+    }
+    for (std::uint32_t bad : {0u, 4096u, kMinBlockSize + 1, 3u * kMinBlockSize, 2 * kMaxBlockSize,
+                              0xFFFFFFFFu}) {
+        r.block_size = bad;
+        EXPECT_FALSE(validate(r)) << bad;
+    }
+}
+
 }  // namespace
 }  // namespace ghostdrive::core

@@ -6,15 +6,38 @@ being read, directly from that device over QUIC, end-to-end encrypted. There is 
 server. The only server component is a rendezvous/relay you can host yourself; it forwards
 encrypted packets and never stores file data.
 
-Status: early implementation. The core library (identity, chunk store, metadata index) exists;
-networking and the mount do not. Nothing is usable yet. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Status: early, but usable between devices on the same network (macOS with FUSE-T, Linux with
+libfuse3). Devices are reached by the address in the invite code; finding each other across the
+internet (rendezvous, hole punching, relay) is not built yet. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How you use it
 
-- A background daemon, `ghostdrived`, runs on each device and owns the mount.
-- The drive appears as a normal folder or volume (Finder, Files, any file manager or app).
-- A command-line tool, `ghostdrive`, pairs devices, shows status, and mounts or unmounts.
-- A desktop menu-bar/tray app and mobile apps are planned; see the architecture document.
+The drive appears as a normal volume (Finder sidebar, any app). The terminal is only for setup;
+a menu-bar app with QR pairing is planned.
+
+On the first device:
+
+```
+ghostdrive init              # create a drive
+ghostdrived &                # run it; the drive mounts at ~/GhostDrive
+ghostdrive invite            # prints a one-time code
+```
+
+On each other device (same network):
+
+```
+ghostdrive join gd1-...      # the code from `invite`
+ghostdrived &
+```
+
+Files you put in `~/GhostDrive` on one device appear on the others. Opening a file stored on
+another device fetches just the parts being read. `ghostdrive status` lists the devices and
+whether they are online; `ghostdrive stop` unmounts and stops the daemon.
+
+The invite code contains the inviting device's full key, so the new device cannot be tricked
+into joining an impostor; anyone holding the code can join until it is used or expires (10
+minutes by default), so send it privately.
 
 ## Limitations
 

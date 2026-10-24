@@ -235,6 +235,42 @@ document assumes the corrected version.
 
   It is designed in step (a) and used by vfs/ only through the same internal interfaces.
 
+As built after step (c), before discovery (ahead of the planned order so the drive is usable):
+- **Pairing by invite code** (the text form of the QR flow in section 2.3). `ghostdrive invite`
+  asks the daemon for a code holding its full public key, a one-time 128-bit token, and its
+  addresses. `ghostdrive join` pins that key, so only the inviter can complete the handshake,
+  and sends the token. While an invite is open the inviter completes handshakes with unknown
+  keys, but such a connection only reaches the pairing exchange: after a valid token (compared
+  in constant time, consumed on use) the inviter pins the new key and sends `DriveInfo` (drive
+  ID, drive secret, members). SAS comparison for pairing without a code is not built.
+- **Membership does not replicate yet.** A third device joining through A is pinned by A only;
+  B learns of it when membership replication lands.
+- **Index exchange** follows section 6. Each side opens one stream per connection and sends
+  `Hello{index_id, max_sequence}`; the receiver answers `IndexRequest{after}` from its stored
+  progress (0 if the index_id changed), and `IndexBatch` frames of up to 256 records follow,
+  then new records as they are committed (polled every 250 ms). Each record says whether the
+  sender holds every chunk of that version, which feeds `holders()` on the receiver.
+- **Data directory** (0700): `device.key` and `drive` (ID, secret, name) are 0600 and refused
+  when readable by others; `index.db`, `chunks/`, `staging/`, `peers` (last known address per
+  member), and the control socket.
+- **Control socket**: one text command per connection (`status`, `invite [ttl]`, `stop`,
+  `ping`); reachable only by the owning user because of the directory and socket modes.
+- **Limits on peers** (from the security review of this step): frames grow their buffer only
+  as bytes arrive; at most two connections per member and eight pairing connections at once;
+  block sizes must be powers of two in 128 KiB to 16 MiB; remote records whose clock is more
+  than a day ahead or whose version counters near 2^62 are rejected, so neither can be wrapped;
+  a member's claim to hold chunks counts only for the version actually stored; a holder that
+  does not answer a GetChunk within 10 s is passed over. Still open: records are not signed, so
+  a member can attribute a change to another device (`modified_by`), and membership changes do
+  not replicate.
+- **FUSE-T caching**: the macOS NFS client caches attributes and negative lookups, and FUSE-T
+  cannot invalidate them (notifications are unsupported on its NFS backend). Mounts use
+  `-o noattrcache`, and a directory's mtime is the time its entries last changed on this
+  device, so remote changes appear within about a second. Unmounting goes through the kernel's
+  own name for the mountpoint; FUSE-T's unmount alone leaves the mount behind when the given
+  path differs in letter case, and polls for seconds when it does the unmount itself.
+
+
 ## 4. Data path of one read()
 
 The scenario: an app on device A calls `read(fd, buf, 1 MiB)` at offset 300 MiB into `movie.mkv`.

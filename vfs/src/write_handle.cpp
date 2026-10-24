@@ -58,6 +58,17 @@ Status pread_full(int fd, std::span<std::byte> out, std::uint64_t offset,
     return {};
 }
 
+// True if `current` carries a change from a device other than `local` that `base` lacks.
+bool changed_elsewhere(const core::FileRecord& current, const core::FileRecord& base,
+                       std::uint64_t local) {
+    for (const auto& counter : current.version.counters()) {
+        if (counter.device != local && counter.value > base.version.get(counter.device)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::int64_t wall_clock_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -291,6 +302,19 @@ asio::awaitable<Status> WriteHandle::commit() {
             core::FileRecord record;
             if (base_) record = *base_;
             record.path = path_;
+            // commit_local supersedes whatever version is stored. If another device changed
+            // the file since this writer opened it, keep both: ours becomes a conflict copy.
+            if (base_) {
+                auto current = ctx_.index.get(path_);
+                if (!current) return current.error();
+                if (current.value() && changed_elsewhere(*current.value(), *base_,
+                                                         ctx_.index.local_device())) {
+                    path_ = core::conflict_copy_path(path_, wall_clock_ns(),
+                                                     ctx_.index.local_device());
+                    record.path = path_;
+                    record.version = {};
+                }
+            }
             record.deleted = false;
             record.size = file_size;
             record.mode = mode_override_ ? *mode_override_ : (base_ ? base_->mode : new_file_mode_);

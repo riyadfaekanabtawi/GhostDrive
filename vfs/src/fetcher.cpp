@@ -2,6 +2,9 @@
 
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
+#include <asio/redirect_error.hpp>
+#include <asio/steady_timer.hpp>
+#include <asio/use_awaitable.hpp>
 #include <optional>
 #include <string>
 
@@ -15,15 +18,47 @@ using core::Error;
 using core::Result;
 using core::SharedChunk;
 
+namespace {
+
+// One GetChunk that gives up after `timeout`. The request itself keeps running (it holds the
+// connection) and its late answer is discarded; the stream ends when the connection does.
+asio::awaitable<Result<core::Bytes>> request_with_deadline(
+    asio::any_io_executor io, std::shared_ptr<transport::Connection> conn, core::ChunkId id,
+    std::uint32_t size, std::chrono::milliseconds timeout) {
+    struct State {
+        explicit State(asio::any_io_executor ex) : timer(std::move(ex)) {}
+        asio::steady_timer timer;
+        std::optional<Result<core::Bytes>> result;
+    };
+    auto state = std::make_shared<State>(io);
+    state->timer.expires_after(timeout);
+    asio::co_spawn(
+        io,
+        [state, conn, id, size]() -> asio::awaitable<void> {
+            auto r = co_await request_chunk(*conn, id, size);
+            state->result = std::move(r);
+            state->timer.cancel();
+        },
+        asio::detached);
+    std::error_code ec;
+    co_await state->timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+    if (!state->result) co_return Error{Errc::timeout, "peer did not answer GetChunk in time"};
+    co_return std::move(*state->result);
+}
+
+}  // namespace
+
 Fetcher::Fetcher(asio::any_io_executor io, asio::any_io_executor disk,
                  const core::ChunkStore& store, const core::MetadataIndex& index,
-                 core::ChunkCache& cache, ConnectionLookup peers)
+                 core::ChunkCache& cache, ConnectionLookup peers,
+                 std::chrono::milliseconds request_timeout)
     : io_(std::move(io)),
       disk_(std::move(disk)),
       store_(store),
       index_(index),
       cache_(cache),
-      peers_(std::move(peers)) {}
+      peers_(std::move(peers)),
+      request_timeout_(request_timeout) {}
 
 asio::awaitable<Result<SharedChunk>> Fetcher::get(core::ChunkId id, std::uint32_t size) {
     if (auto cached = cache_.get(id)) {
@@ -79,7 +114,7 @@ asio::awaitable<Result<SharedChunk>> Fetcher::fetch_remote(core::ChunkId id,
     for (const auto& key : holders.value()) {
         auto conn = peers_ ? peers_(key) : nullptr;
         if (!conn || !conn->is_open()) continue;
-        auto data = co_await request_chunk(*conn, id, size);
+        auto data = co_await request_with_deadline(io_, conn, id, size, request_timeout_);
         if (!data) {
             last_error = data.error();
             continue;

@@ -16,7 +16,8 @@ class Stream;
 
 // Peer protocol frames. Every frame is
 //   u32 payload length (little endian) | u8 version | u8 type | payload
-// One bidirectional stream carries one request: GetChunk, answered by ChunkData or Error.
+// A stream's first frame says what it is for: GetChunk (answered by ChunkData or Error), Hello
+// (an index exchange), or Join (pairing).
 namespace wire {
 
 inline constexpr std::uint8_t kVersion = 1;
@@ -28,6 +29,13 @@ enum class FrameType : std::uint8_t {
     get_chunk = 1,
     chunk_data = 2,
     error = 3,
+    // Index exchange (one stream per direction, opened by the sender of the records).
+    hello = 4,
+    index_request = 5,
+    index_batch = 6,
+    // Pairing a new device by invite code.
+    join = 7,
+    drive_info = 8,
 };
 
 enum class ErrorCode : std::uint16_t {

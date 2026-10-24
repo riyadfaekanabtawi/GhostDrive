@@ -95,7 +95,7 @@ private:
     std::optional<Ino> resolve_locked(std::string_view path) const;
     std::string path_locked(Ino ino) const;
     Attr attr_locked(Ino ino, const Node& node) const;
-    void touch_ancestors_locked(Ino dir, std::int64_t mtime_ns);
+    void entries_changed_locked(Ino dir);
 
     mutable std::shared_mutex mutex_;
     std::unordered_map<Ino, Node> nodes_;

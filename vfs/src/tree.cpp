@@ -1,6 +1,7 @@
 #include "ghostdrive/vfs/tree.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 
 namespace ghostdrive::vfs {
@@ -81,6 +82,8 @@ std::optional<Ino> Tree::parent_for_locked(std::string_view path, bool create) {
         nodes_[ino] =
             Node{.parent = cursor, .name = std::string(parts[i]), .type = NodeType::directory};
         nodes_.at(cursor).children.emplace(std::string(parts[i]), ino);
+        entries_changed_locked(cursor);
+        entries_changed_locked(ino);
         cursor = ino;
     }
     return cursor;
@@ -107,20 +110,26 @@ void Tree::upsert_locked(const core::FileRecord& record) {
         ino = next_ino_++;
         nodes_[ino] = Node{.parent = *parent, .name = std::string(name), .type = type};
         siblings.emplace(std::string(name), ino);
+        entries_changed_locked(*parent);
     }
     auto& node = nodes_.at(ino);
     node.record = record;
-    node.mtime_ns = std::max(node.mtime_ns, record.mtime_ns);
-    if (type == NodeType::file) node.mtime_ns = record.mtime_ns;
-    touch_ancestors_locked(*parent, record.mtime_ns);
+    if (type == NodeType::file) {
+        node.mtime_ns = record.mtime_ns;
+    } else {
+        node.mtime_ns = std::max(node.mtime_ns, record.mtime_ns);
+    }
 }
 
-void Tree::touch_ancestors_locked(Ino dir, std::int64_t mtime_ns) {
-    for (;; dir = nodes_.at(dir).parent) {
-        auto& node = nodes_.at(dir);
-        node.mtime_ns = std::max(node.mtime_ns, mtime_ns);
-        if (dir == kRootIno) break;
-    }
+void Tree::entries_changed_locked(Ino dir) {
+    // A directory's mtime is when its entries last changed here, not any file's mtime: a
+    // renamed or deleted file keeps its old mtime, and NFS clients (FUSE-T) keep serving a
+    // cached listing while the directory's mtime stays the same.
+    auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    auto& node = nodes_.at(dir);
+    node.mtime_ns = std::max<std::int64_t>(now, node.mtime_ns + 1);
 }
 
 void Tree::remove_locked(std::string_view path) {
@@ -136,6 +145,7 @@ void Tree::remove_locked(std::string_view path) {
     }
     nodes_.at(parent).children.erase(node.name);
     nodes_.erase(*ino);
+    entries_changed_locked(parent);
     prune_locked(parent);
 }
 
@@ -147,6 +157,7 @@ void Tree::prune_locked(Ino dir) {
         Ino parent = node.parent;
         nodes_.at(parent).children.erase(node.name);
         nodes_.erase(dir);
+        entries_changed_locked(parent);
         dir = parent;
     }
 }
@@ -177,6 +188,7 @@ bool Tree::move(std::string_view from, std::string_view to) {
         Ino dst_parent = nodes_.at(*dst).parent;
         nodes_.at(dst_parent).children.erase(nodes_.at(*dst).name);
         erase_subtree_locked(*dst);
+        entries_changed_locked(dst_parent);
     }
     auto new_parent = parent_for_locked(to, true);
     if (!new_parent) return false;
@@ -187,6 +199,8 @@ bool Tree::move(std::string_view from, std::string_view to) {
     node.parent = *new_parent;
     node.name = std::string(last_component(to));
     nodes_.at(*new_parent).children.emplace(node.name, *src);
+    entries_changed_locked(old_parent);
+    entries_changed_locked(*new_parent);
     prune_locked(old_parent);
 
     // Keep the stored records' paths in step with where they now live.
@@ -232,7 +246,8 @@ Attr Tree::attr_locked(Ino ino, const Node& node) const {
     attr.type = node.type;
     attr.mtime_ns = node.mtime_ns;
     if (node.type == NodeType::directory) {
-        attr.perm = node.record ? (node.record->mode & 07777) : kDirPerm;
+        // Set-ID and sticky bits from peers are dropped: they mean nothing on a synced drive.
+        attr.perm = node.record ? (node.record->mode & 0777) : kDirPerm;
         if (attr.perm == 0) attr.perm = kDirPerm;
         std::uint32_t subdirs = 0;
         for (const auto& [name, child] : node.children) {
@@ -240,7 +255,7 @@ Attr Tree::attr_locked(Ino ino, const Node& node) const {
         }
         attr.nlink = 2 + subdirs;
     } else {
-        attr.perm = node.record->mode & 07777;
+        attr.perm = node.record->mode & 0777;
         if (attr.perm == 0) attr.perm = kDefaultFilePerm;
         attr.size = node.record->size;
         attr.nlink = 1;

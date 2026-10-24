@@ -1,0 +1,144 @@
+#include "ghostdrive/daemon/codec.hpp"
+
+#include <gtest/gtest.h>
+
+#include "ghostdrive/transport/frame.hpp"
+
+namespace ghostdrive::daemon {
+namespace {
+
+namespace wire = transport::wire;
+
+std::span<const std::byte> payload_of(const core::Bytes& frame, wire::FrameType expected) {
+    auto header = wire::decode_header(
+        std::span<const std::byte, wire::kHeaderSize>(frame.data(), wire::kHeaderSize));
+    EXPECT_TRUE(header);
+    EXPECT_EQ(header.value().type, expected);
+    EXPECT_EQ(header.value().length, frame.size() - wire::kHeaderSize);
+    return std::span(frame).subspan(wire::kHeaderSize);
+}
+
+core::FileRecord sample_record() {
+    core::FileRecord r;
+    r.path = "photos/2026/beach.jpg";
+    r.size = 300'000;
+    r.mode = 0644;
+    r.mtime_ns = -5;  // negative times survive the trip
+    r.hlc = 0x1234'5678'9ABC;
+    r.version.bump(7);
+    r.version.bump(7);
+    r.version.bump(99);
+    r.modified_by = 99;
+    r.block_size = 128 * 1024;
+    r.sequence = 42;
+    for (std::uint8_t i = 0; i < 3; ++i) {
+        core::ChunkId id;
+        id.digest.fill(std::byte{i});
+        r.chunks.push_back(id);
+    }
+    return r;
+}
+
+TEST(Codec, HelloAndRequestRoundTrip) {
+    auto frame = encode_hello(Hello{0xAABB, 17});
+    auto hello = decode_hello(payload_of(frame, wire::FrameType::hello));
+    ASSERT_TRUE(hello);
+    EXPECT_EQ(hello.value().index_id, 0xAABBu);
+    EXPECT_EQ(hello.value().max_sequence, 17u);
+
+    auto req = encode_index_request(IndexRequest{99});
+    auto decoded = decode_index_request(payload_of(req, wire::FrameType::index_request));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded.value().after, 99u);
+}
+
+TEST(Codec, IndexBatchRoundTrip) {
+    auto deleted = sample_record();
+    deleted.path = "old.txt";
+    deleted.deleted = true;
+    deleted.chunks.clear();
+    deleted.size = 0;
+    std::vector<IndexEntry> entries{{sample_record(), true}, {deleted, false}};
+    auto frame = encode_index_batch(entries);
+    auto decoded = decode_index_batch(payload_of(frame, wire::FrameType::index_batch));
+    ASSERT_TRUE(decoded) << decoded.error().message;
+    ASSERT_EQ(decoded.value().size(), 2u);
+    const auto& a = decoded.value()[0].record;
+    auto expected = sample_record();
+    EXPECT_TRUE(decoded.value()[0].sender_holds);
+    EXPECT_EQ(a.path, expected.path);
+    EXPECT_EQ(a.size, expected.size);
+    EXPECT_EQ(a.mode, expected.mode);
+    EXPECT_EQ(a.mtime_ns, expected.mtime_ns);
+    EXPECT_EQ(a.hlc, expected.hlc);
+    EXPECT_EQ(a.version, expected.version);
+    EXPECT_EQ(a.modified_by, expected.modified_by);
+    EXPECT_EQ(a.block_size, expected.block_size);
+    EXPECT_EQ(a.sequence, expected.sequence);
+    EXPECT_EQ(a.chunks, expected.chunks);
+    EXPECT_FALSE(decoded.value()[1].sender_holds);
+    EXPECT_TRUE(decoded.value()[1].record.deleted);
+}
+
+TEST(Codec, TruncatedOrPaddedPayloadsAreRejected) {
+    std::vector<IndexEntry> entries{{sample_record(), true}};
+    auto frame = encode_index_batch(entries);
+    auto payload = payload_of(frame, wire::FrameType::index_batch);
+    for (std::size_t cut = 0; cut < payload.size(); cut += 7) {
+        EXPECT_FALSE(decode_index_batch(payload.first(cut))) << "cut at " << cut;
+    }
+    core::Bytes padded(payload.begin(), payload.end());
+    padded.push_back(std::byte{0});
+    EXPECT_FALSE(decode_index_batch(padded));
+}
+
+TEST(Codec, OversizedCountsAreRejectedBeforeAllocating) {
+    // A batch claiming more entries than the limit.
+    core::Bytes huge{std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF}, std::byte{0x7F}};
+    auto r = decode_index_batch(huge);
+    ASSERT_FALSE(r);
+    EXPECT_EQ(r.error().code, core::Errc::protocol);
+}
+
+TEST(Codec, JoinAndDriveInfoRoundTrip) {
+    Join join;
+    join.token.fill(std::byte{0x5A});
+    join.name = "laptop";
+    join.listen_port = 7373;
+    auto jf = encode_join(join);
+    auto j = decode_join(payload_of(jf, wire::FrameType::join));
+    ASSERT_TRUE(j);
+    EXPECT_EQ(j.value().token, join.token);
+    EXPECT_EQ(j.value().name, "laptop");
+    EXPECT_EQ(j.value().listen_port, 7373);
+
+    DriveInfo info;
+    info.drive_id.fill(std::byte{1});
+    info.secret.fill(std::byte{2});
+    Member m;
+    m.key.fill(std::byte{3});
+    m.name = "desktop";
+    m.address = "192.168.1.20:7373";
+    info.members.push_back(m);
+    auto df = encode_drive_info(info);
+    auto d = decode_drive_info(payload_of(df, wire::FrameType::drive_info));
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d.value().drive_id, info.drive_id);
+    EXPECT_EQ(d.value().secret, info.secret);
+    ASSERT_EQ(d.value().members.size(), 1u);
+    EXPECT_EQ(d.value().members[0].key, m.key);
+    EXPECT_EQ(d.value().members[0].address, m.address);
+}
+
+
+TEST(Codec, DeviceNamesLoseControlBytes) {
+    Join join;
+    join.name = "evil\x1b[2Jname\n";
+    auto frame = encode_join(join);
+    auto decoded = decode_join(payload_of(frame, wire::FrameType::join));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded.value().name, "evil?[2Jname?");
+}
+
+}  // namespace
+}  // namespace ghostdrive::daemon
