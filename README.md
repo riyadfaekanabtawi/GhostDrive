@@ -46,7 +46,10 @@ Other presets: `release`, `asan` (AddressSanitizer + UBSan), `ubsan`. On macOS 2
 Apple clang 17, every AddressSanitizer binary hangs at startup inside the sanitizer runtime;
 use `ubsan` there.
 
-Later steps will need libfuse3 development headers on Linux and FUSE-T on macOS.
+The mount front end needs libfuse3 development headers on Linux (`libfuse3-dev`) or FUSE-T on
+macOS (`brew install --cask macos-fuse-t/homebrew-cask/fuse-t`; free for non-commercial use).
+Without them it is skipped and everything else still builds. Mount tests carry the `mount` label;
+skip them with `ctest --preset default -LE mount` where mounting is not possible.
 
 ## License
 
