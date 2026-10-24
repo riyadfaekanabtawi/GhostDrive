@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -117,6 +118,9 @@ private:
 // Who a connection is allowed to talk to. Peers are authenticated only by pinned Ed25519 keys.
 using PinCheck = std::function<bool(const core::PublicKey&)>;
 
+inline constexpr std::size_t kRelayTokenSize = 16;
+using RelayToken = std::array<std::byte, kRelayTokenSize>;
+
 struct EndpointOptions {
     Udp::endpoint bind{asio::ip::address_v4::loopback(), 0};
     // Incoming connections are accepted only from keys this returns true for. Empty rejects all.
@@ -127,6 +131,13 @@ struct EndpointOptions {
     std::size_t max_pending_handshakes = 256;
     std::chrono::milliseconds idle_timeout{30'000};
     std::chrono::milliseconds handshake_timeout{10'000};
+    // Sends a keep-alive after this much idle time (0: never), which also keeps NAT mappings
+    // for the connection open.
+    std::chrono::milliseconds keep_alive{0};
+    // Servers on the open internet: answer a new Initial with a Retry and create state only
+    // when the client returns the token, proving it receives at its address (RFC 9000 8.1).
+    // Stops spoofed Initials from filling handshake slots or reflecting handshakes.
+    bool require_address_validation = false;
     Impairment impairment{};
 };
 
@@ -140,7 +151,10 @@ public:
 
     // The peer's pinned key. Valid once connect() or accept() has returned the connection.
     const core::PublicKey& peer_key() const noexcept { return peer_key_; }
+    // The address the connection was created with. It does not follow NAT rebinding; use
+    // current_remote_endpoint() for where packets go now.
     const Udp::endpoint& remote_endpoint() const noexcept { return remote_; }
+    Udp::endpoint current_remote_endpoint() const;
     bool is_open() const noexcept { return !closed_; }
 
     // Opens a bidirectional stream, waiting for stream credit from the peer if needed.
@@ -164,9 +178,12 @@ private:
     static Result<std::shared_ptr<Connection>> create_client(
         const std::shared_ptr<Endpoint>& endpoint, const Udp::endpoint& remote,
         const core::PublicKey& expected_peer);
+    // `original_dcid` is set when the Initial carried a valid Retry token; it is the DCID the
+    // client used before the Retry.
     static Result<std::shared_ptr<Connection>> create_server(
         const std::shared_ptr<Endpoint>& endpoint, const Udp::endpoint& remote,
-        std::span<const std::uint8_t> initial_packet);
+        std::span<const std::uint8_t> initial_packet,
+        const std::optional<std::vector<std::uint8_t>>& original_dcid = std::nullopt);
 
 public:
     Connection(Private, const std::shared_ptr<Endpoint>& endpoint, const Udp::endpoint& remote,
@@ -263,6 +280,20 @@ public:
     // Sends a raw datagram on the shared socket. Subject to the impairment shim.
     void send_datagram(std::span<const std::byte> datagram, const Udp::endpoint& to);
 
+    // Relaying through a rendezvous server. Each relayed peer gets a virtual address (in the
+    // unrouted 198.18.0.0/15 range); QUIC dials and talks to it like any address, and the
+    // endpoint wraps those packets into relay datagrams to `server` and unwraps the replies.
+    // `token` is this client's registration token, carried in every relay datagram both ways,
+    // so neither end accepts a relay datagram from someone who merely spoofs an address.
+    // Relayed packets are accepted only from keys `allowed` returns true for.
+    void set_relay(Udp::endpoint server, RelayToken token, PinCheck allowed);
+    void clear_relay();
+    // The virtual address of a relayed peer; nullopt once the table is full.
+    std::optional<Udp::endpoint> relay_address(const core::PublicKey& peer);
+    bool is_relay_address(const Udp::endpoint& address) const {
+        return relay_peer_.contains(address);
+    }
+
     // Closes every connection and the socket. Pending operations fail with Errc::closed.
     void close();
 
@@ -285,6 +316,7 @@ private:
     void start_receive();
     void on_receive(std::size_t length);
     void route_quic(std::span<const std::uint8_t> packet, const Udp::endpoint& from);
+    void send_retry(std::span<const std::uint8_t> packet, const Udp::endpoint& to);
 
     void start_connect(ConnectionHandler handler, const Udp::endpoint& remote,
                        const core::PublicKey& peer_key);
@@ -310,6 +342,11 @@ private:
     std::deque<std::shared_ptr<Connection>> accepted_;
     ConnectionHandler accept_handler_;
     DatagramHandler datagram_handler_;
+    std::optional<Udp::endpoint> relay_server_;
+    RelayToken relay_token_{};
+    PinCheck relay_allowed_;
+    std::map<core::PublicKey, Udp::endpoint> relay_address_;
+    std::map<Udp::endpoint, core::PublicKey> relay_peer_;
 
     std::optional<Impairer> impairer_;
 

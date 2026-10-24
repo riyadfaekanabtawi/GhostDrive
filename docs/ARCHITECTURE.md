@@ -215,6 +215,22 @@ document assumes the corrected version.
 - **Hard NAT.** The client probes two reflexive servers. If the mapped ports differ, the NAT
   maps per destination ("hard"). If both sides are hard, the client stays on the relay. No
   classic cone-type classification is done.
+- **As built in steps (d) and (e):**
+  - The daemon holds one QUIC connection to its configured server, from the same UDP socket as
+    everything else, so the address the server reports is that socket's NAT mapping. Every
+    connection sends keep-alives after 15 s idle so mappings stay open.
+  - Candidates are the server-observed address only. Host and port-mapped candidates and the
+    sealed offers are not built; on one LAN, mDNS covers the host case.
+  - `Connect{peer}` makes the server send `PeerAt` to both sides at once. Both send ten probes
+    over two seconds to the other's observed address; the device with the smaller key dials.
+  - If no direct connection exists `relay_after` (3 s) later, the smaller key dials the peer's
+    virtual relay address instead. The order is direct first, then relay, the reverse of the
+    plan above, which keeps the code simple for now.
+  - Upgrade from relay to direct is by a new connection, not migration: devices keep asking the
+    server for relayed peers, and a direct connection that succeeds replaces the relayed one
+    (which is closed). A relayed connection never replaces a live direct one.
+  - No NAT classification; the relay is the fallback for every hard case.
+  - QUIC packets are at most 1400 bytes so the 37-byte relay header fits in a 1500-byte MTU.
 
 ### 3.5 rendezvous/ (server binary)
 - One self-hostable binary: signalling plus datagram relay. It is stateless apart from in-memory
@@ -227,6 +243,41 @@ document assumes the corrected version.
   never sees the drive secret.
 - **Abuse controls.** A per-key token bucket, per-IP connection limits, and a maximum datagram
   size. Packets to slow receivers are dropped, not buffered. Nothing is written to disk.
+- **As built in step (e)**, `ghostdrive-rendezvous`, with two changes from the plan above:
+  - Client authentication is mutual TLS instead of the signed nonce. TLS 1.3 CertificateVerify
+    already proves possession of the client key and binds it to the connection, which is what
+    the nonce signature was for. The server therefore completes handshakes with any key (the
+    one accept-any verifier outside tests) and serves nothing until the client registers.
+  - Groups are `HMAC-SHA256(drive_secret, "ghostdrive-rendezvous-group-v1")` instead of a
+    member-signed token: the server could not check such a signature anyway, since it does not
+    know the members. Only members can compute the ID, and it says nothing about the secret.
+  - Relay datagrams are raw UDP to the server's port: `0D 'G' 'D' 01 | 'R' | token(16) |
+    key(32) | QUIC packet`. `Registered` gives each client a random 128-bit token, carried in
+    every relay datagram in both directions. The server identifies the sender by its token (and
+    requires the source to be that client's current path), never by source address alone, so
+    an off-path spoofer can neither relay as a member nor spend its budget; it forwards only
+    within one group, to the receiver's current path, with the receiver's token. Clients accept
+    relay datagrams only from their server, with their own token, and only for member keys,
+    and hand the inner packet to QUIC from a virtual address in 198.18.0.0/15 (bounded table);
+    QUIC still authenticates the peer end to end.
+  - New Initials get a Retry (RFC 9000 section 8.1): no state is created until the client
+    returns the token from its own address, so spoofed Initials cannot fill handshake slots or
+    use the server as a reflector. Handshakes time out after 5 s.
+  - Limits: 10,000 clients, 16 per IPv4 address or IPv6 /64, 256 per group, registration
+    within 10 s, 30 `Connect` per 10 s, 64 queued control frames per client (more are
+    dropped), relayed payloads must be QUIC packets of at most 1400 bytes, and a per-client
+    token bucket (4 MiB/s, 1 MiB burst) that drops instead of queueing. `--allow-group HEX`
+    restricts the server to the operator's own drives; `ghostdrive status` shows the group.
+  - Daemons act on a `PeerAt` for one peer at most every 2 s and run at most 32 dials at once,
+    so even a malicious server cannot turn them into amplifiers. Probes carry no key. Active
+    migration is disabled on every connection.
+  - Still open: the group ID is a bearer credential, so a device removed from the drive can
+    keep registering and learn members' public addresses until the drive secret is rotated
+    (revocation, section 7). Relay headers carry public keys in clear, so an on-path observer
+    can follow a device across networks; carrying relay traffic as QUIC DATAGRAM frames on the
+    authenticated connections (RFC 9221) would close both this and the token's visibility.
+  - Hosting needs UDP: a VPS or any host that forwards a UDP port. Platforms that only proxy
+    HTTP(S) to one port, such as Hugging Face Spaces, cannot run it.
 
 ### 3.6 daemon/, cli/, capi/
 - `ghostdrived` owns the core, transport, discovery, and mount. It exposes a local control API

@@ -5,8 +5,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 
 #include "ghostdrive/core/result.hpp"
 
@@ -55,6 +57,8 @@ bool verify_signature(const PublicKey& key, std::span<const std::byte> message,
 
 // Human-readable device ID: base32 of the public key in dash-separated groups of four.
 std::string fingerprint(const PublicKey& key);
+// Parses a fingerprint back into a key; dashes and spaces are ignored.
+std::optional<PublicKey> parse_fingerprint(std::string_view text);
 
 // First 64 bits of the public key, big endian. Used as the device ID in version vectors.
 std::uint64_t short_id(const PublicKey& key) noexcept;

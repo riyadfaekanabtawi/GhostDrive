@@ -2,6 +2,7 @@ add_executable(ghostdrive_integration_tests
     transport_loopback_test.cpp
     vfs_remote_read_test.cpp
     two_devices_test.cpp
+    rendezvous_test.cpp
 )
 target_include_directories(ghostdrive_integration_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/tests)
 target_link_libraries(ghostdrive_integration_tests
@@ -9,6 +10,7 @@ target_link_libraries(ghostdrive_integration_tests
         ghostdrive::transport
         ghostdrive::vfs
         ghostdrive::daemon
+        ghostdrive::rendezvous
         GTest::gtest_main
         ghostdrive_warnings
 )
@@ -25,5 +27,10 @@ if(TARGET ghostdrive_vfs_fuse)
         COMMAND ${PROJECT_SOURCE_DIR}/tests/e2e/two_devices.sh ${PROJECT_BINARY_DIR}
                 ${CMAKE_CURRENT_BINARY_DIR}/e2e)
     set_tests_properties(e2e.two_devices PROPERTIES
+        LABELS "e2e;mount" RUN_SERIAL TRUE TIMEOUT 180 PASS_REGULAR_EXPRESSION "PASS")
+    add_test(NAME e2e.via_rendezvous
+        COMMAND ${PROJECT_SOURCE_DIR}/tests/e2e/via_rendezvous.sh ${PROJECT_BINARY_DIR}
+                ${CMAKE_CURRENT_BINARY_DIR}/e2e-rendezvous)
+    set_tests_properties(e2e.via_rendezvous PROPERTIES
         LABELS "e2e;mount" RUN_SERIAL TRUE TIMEOUT 180 PASS_REGULAR_EXPRESSION "PASS")
 endif()

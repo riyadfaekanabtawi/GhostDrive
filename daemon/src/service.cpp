@@ -16,6 +16,8 @@
 
 #include "async.hpp"
 #include "ghostdrive/discovery/lan_id.hpp"
+#include "ghostdrive/discovery/rendezvous_codec.hpp"
+#include "ghostdrive/transport/demux.hpp"
 #ifdef GHOSTDRIVE_HAVE_DNSSD
 #include "ghostdrive/discovery/lan_discovery.hpp"
 #endif
@@ -123,12 +125,15 @@ Status Service::start() {
     options.accept_peer = [this](const core::PublicKey& key) {
         return is_member(key) || invites_active();
     };
+    // Keeps NAT mappings open for member and rendezvous connections.
+    options.keep_alive = std::chrono::seconds(15);
     auto endpoint = transport::Endpoint::create(io_, drive_.key(), options);
     if (!endpoint) return endpoint.error();
     endpoint_ = std::move(endpoint).value();
 
     asio::co_spawn(io_, accept_loop(), asio::detached);
     asio::co_spawn(io_, dial_loop(), asio::detached);
+    asio::co_spawn(io_, rendezvous_loop(), asio::detached);
 #ifdef GHOSTDRIVE_HAVE_DNSSD
     if (options_.lan_discovery) {
         auto lan = discovery::LanDiscovery::start(
@@ -159,14 +164,157 @@ void Service::on_lan_sighting(const discovery::LanSighting& sighting) {
     if (auto it = known.find(*key); it == known.end() || it->second != text) {
         (void)drive_.set_peer_address(*key, text);
     }
-    if (live_.contains(*key) || dialing_.contains({*key, sighting.endpoint})) return;
-    dialing_.insert({*key, sighting.endpoint});
-    asio::co_spawn(io_, dial(*key, sighting.endpoint), asio::detached);
+    if (auto it = live_.find(*key); it != live_.end() && !is_relayed(it->second)) return;
+    start_dial(*key, sighting.endpoint);
+}
+
+void Service::start_dial(const core::PublicKey& peer, const Udp::endpoint& address) {
+    // Bounded: hints from mDNS or the server may name many addresses.
+    constexpr std::size_t kMaxDials = 32;
+    if (stopped_ || dialing_.size() >= kMaxDials || dialing_.contains({peer, address})) return;
+    dialing_.insert({peer, address});
+    asio::co_spawn(io_, dial(peer, address), asio::detached);
+}
+
+bool Service::is_relayed(const std::shared_ptr<transport::Connection>& conn) const {
+    return endpoint_ && endpoint_->is_relay_address(conn->current_remote_endpoint());
+}
+
+// QUIC needs one client and one server; when both learn of each other at once, the device with
+// the smaller key dials (ARCHITECTURE.md section 2.6) and the other waits to accept.
+bool Service::dials_first(const core::PublicKey& peer) const {
+    return drive_.key().public_key() < peer;
+}
+
+asio::awaitable<void> Service::rendezvous_loop() {
+    auto alive = alive_;
+    std::chrono::milliseconds backoff{1'000};
+    while (*alive && !stopped_) {
+        auto config = drive_.rendezvous();
+        if (!config) {
+            co_await sleep_for(std::chrono::seconds(5));
+            continue;
+        }
+        Udp::resolver resolver(io_);
+        std::error_code ec;
+        auto results = co_await resolver.async_resolve(
+            Udp::v4(), config->host, std::to_string(config->port),
+            asio::redirect_error(asio::use_awaitable, ec));
+        if (!*alive || stopped_) co_return;
+        std::shared_ptr<transport::Connection> conn;
+        Udp::endpoint server;
+        if (!ec && !results.empty()) {
+            server = results.begin()->endpoint();
+            auto connected = co_await endpoint_->connect(server, config->key);
+            if (!*alive || stopped_) co_return;
+            if (connected) conn = std::move(connected).value();
+        }
+        if (!conn) {
+            co_await sleep_for(backoff);
+            backoff = std::min<std::chrono::milliseconds>(backoff * 2, std::chrono::seconds(30));
+            continue;
+        }
+
+        auto group = discovery::rendezvous_group(drive_.secret());
+        auto control = co_await conn->open_stream();
+        bool registered = false;
+        if (control && group) {
+            auto request = discovery::encode(discovery::Register{group.value()});
+            if (co_await control.value()->write(request)) {
+                auto reply = co_await wire::read_frame(*control.value(), 64);
+                if (reply && reply.value().type == wire::FrameType::rendezvous_registered) {
+                    if (auto r = discovery::decode_registered(reply.value().payload)) {
+                        observed_ = r.value().observed;
+                        // Relayed packets are accepted only with our token and only from
+                        // members; QUIC then authenticates the member itself.
+                        endpoint_->set_relay(server, r.value().relay_token,
+                                             [this](const core::PublicKey& key) { return is_member(key); });
+                        registered = true;
+                    }
+                }
+            }
+        }
+        if (!*alive) co_return;
+        if (registered) {
+            backoff = std::chrono::milliseconds(1'000);
+            rendezvous_conn_ = conn;
+            asio::co_spawn(io_, request_peers(conn, control.value()), asio::detached);
+            for (;;) {
+                auto frame = co_await wire::read_frame(*control.value(), 64);
+                if (!*alive) co_return;
+                if (!frame || frame.value().type != wire::FrameType::rendezvous_peer_at) break;
+                auto at = discovery::decode_peer_at(frame.value().payload);
+                if (!at) break;
+                if (at.value().address) on_peer_at(at.value().peer, *at.value().address);
+            }
+        }
+        conn->close();
+        if (rendezvous_conn_ == conn) rendezvous_conn_.reset();
+        observed_.reset();
+        endpoint_->clear_relay();
+        co_await sleep_for(backoff);
+    }
+}
+
+asio::awaitable<void> Service::request_peers(std::shared_ptr<transport::Connection> conn,
+                                             std::shared_ptr<transport::Stream> control) {
+    auto alive = alive_;
+    while (*alive && !stopped_ && conn->is_open()) {
+        if (auto devices = drive_.index().devices()) {
+            for (const auto& d : devices.value()) {
+                // Members not reachable directly: offline here, or only through the relay.
+                auto it = live_.find(d.key);
+                if (it != live_.end() && !is_relayed(it->second)) continue;
+                auto request = discovery::encode(discovery::Connect{d.key});
+                if (!co_await control->write(request)) co_return;
+                if (!*alive) co_return;
+            }
+        }
+        co_await sleep_for(options_.rendezvous_interval);
+    }
+}
+
+void Service::on_peer_at(const core::PublicKey& peer, const Udp::endpoint& address) {
+    if (stopped_) return;
+    auto now = std::chrono::steady_clock::now();
+    auto& last = last_peer_at_[peer];
+    if (now - last < std::chrono::seconds(2)) return;
+    last = now;
+    if (!is_member(peer)) {
+        last_peer_at_.erase(peer);
+        return;
+    }
+    if (auto it = live_.find(peer); it != live_.end() && !is_relayed(it->second)) return;
+    if (!options_.relay_only) {
+        // Both sides probe each other's public address, opening their NAT mappings, and the
+        // first device dials once the other's probes are on their way.
+        asio::co_spawn(io_, punch(address), asio::detached);
+        if (dials_first(peer)) start_dial(peer, address);
+    }
+    if (!live_.contains(peer)) asio::co_spawn(io_, relay_fallback(peer), asio::detached);
+}
+
+asio::awaitable<void> Service::punch(Udp::endpoint address) {
+    auto alive = alive_;
+    // Probes carry nothing, not even our key: they only open the NAT mapping.
+    auto probe = transport::make_probe();
+    for (int i = 0; i < 10 && *alive && !stopped_; ++i) {
+        endpoint_->send_datagram(probe, address);
+        co_await sleep_for(std::chrono::milliseconds(200));
+    }
+}
+
+asio::awaitable<void> Service::relay_fallback(core::PublicKey peer) {
+    auto alive = alive_;
+    if (!options_.relay_only) co_await sleep_for(options_.relay_after);
+    if (!*alive || stopped_ || live_.contains(peer) || !dials_first(peer)) co_return;
+    if (auto relay = endpoint_->relay_address(peer)) start_dial(peer, *relay);
 }
 
 void Service::stop() {
     stopped_ = true;
     lan_.reset();
+    if (rendezvous_conn_) rendezvous_conn_->close();
     for (auto& [key, conn] : live_) conn->close();
     live_.clear();
     if (endpoint_) endpoint_->close();
@@ -211,6 +359,11 @@ ServiceStatus Service::status() const {
     out.device_name = drive_.device_name();
     out.fingerprint = core::fingerprint(drive_.key().public_key());
     out.port = port();
+    if (auto config = drive_.rendezvous()) out.rendezvous = config->host + ":" + std::to_string(config->port);
+    out.observed = observed_;
+    if (auto group = discovery::rendezvous_group(drive_.secret())) {
+        out.rendezvous_group = core::to_hex(group.value());
+    }
     auto addresses = drive_.peer_addresses();
     if (auto devices = drive_.index().devices()) {
         for (const auto& d : devices.value()) {
@@ -218,7 +371,10 @@ ServiceStatus Service::status() const {
             p.key = d.key;
             p.name = d.name;
             if (auto it = addresses.find(d.key); it != addresses.end()) p.address = it->second;
-            p.connected = live_.contains(d.key);
+            if (auto it = live_.find(d.key); it != live_.end()) {
+                p.connected = true;
+                p.relayed = is_relayed(it->second);
+            }
             out.peers.push_back(std::move(p));
         }
     }
@@ -248,9 +404,8 @@ asio::awaitable<void> Service::dial_loop() {
         for (const auto& [key, text] : drive_.peer_addresses()) {
             if (live_.contains(key) || !is_member(key)) continue;
             auto address = parse_address(text);
-            if (!address || dialing_.contains({key, *address})) continue;
-            dialing_.insert({key, *address});
-            asio::co_spawn(io_, dial(key, *address), asio::detached);
+            if (!address) continue;
+            start_dial(key, *address);
         }
         co_await sleep_for(options_.redial);
     }
@@ -277,7 +432,18 @@ asio::awaitable<void> Service::run_member(std::shared_ptr<transport::Connection>
         co_return;
     }
     ++member_connections_[key];
-    live_[key] = conn;
+    // Prefer a direct path: a relayed connection never replaces a live direct one, and a new
+    // direct one retires the relayed one it upgrades.
+    auto previous = live_.find(key);
+    bool keep_previous = previous != live_.end() && previous->second->is_open() &&
+                         !is_relayed(previous->second) && is_relayed(conn);
+    if (!keep_previous) {
+        if (previous != live_.end() && previous->second != conn && is_relayed(previous->second) &&
+            !is_relayed(conn)) {
+            previous->second->close();
+        }
+        live_[key] = conn;
+    }
     asio::co_spawn(io_, push_index(conn), asio::detached);
     for (;;) {
         auto stream = co_await conn->accept_stream();
@@ -494,6 +660,7 @@ asio::awaitable<void> Service::run_pairing(std::shared_ptr<transport::Connection
     info.drive_id = drive_.drive_id();
     info.secret = drive_.secret();
     info.members.push_back(Member{drive_.key().public_key(), drive_.device_name(), ""});
+    if (auto config = drive_.rendezvous()) info.rendezvous = config->to_string();
     auto addresses = drive_.peer_addresses();
     if (auto devices = drive_.index().devices()) {
         for (const auto& d : devices.value()) {

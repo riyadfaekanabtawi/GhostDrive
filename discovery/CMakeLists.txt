@@ -1,8 +1,8 @@
-add_library(ghostdrive_discovery src/lan_id.cpp)
+add_library(ghostdrive_discovery src/lan_id.cpp src/rendezvous_codec.cpp)
 add_library(ghostdrive::discovery ALIAS ghostdrive_discovery)
 target_include_directories(ghostdrive_discovery PUBLIC include)
 target_link_libraries(ghostdrive_discovery
-    PUBLIC ghostdrive::core asio::asio
+    PUBLIC ghostdrive::core ghostdrive::transport asio::asio
     PRIVATE OpenSSL::Crypto ghostdrive_warnings)
 
 # LAN discovery goes through the system's DNS-SD API: built into macOS, and provided on Linux

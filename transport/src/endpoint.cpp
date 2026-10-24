@@ -1,6 +1,7 @@
 #include "ghostdrive/transport/endpoint.hpp"
 
 #include <ngtcp2/ngtcp2.h>
+#include <ngtcp2/ngtcp2_crypto.h>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
@@ -176,9 +177,30 @@ void Endpoint::on_receive(std::size_t length) {
         case PacketKind::quic:
             route_quic(packet, rx_from_);
             break;
-        case PacketKind::ghostdrive:
+        case PacketKind::ghostdrive: {
+            auto relayed = parse_relay(std::as_bytes(packet));
+            if (relayed && relay_server_ && rx_from_ == *relay_server_) {
+                // Only the server knows our token, so this did come through it. Accept it only
+                // from a key we allow, and hand the packet to QUIC from that key's virtual
+                // address; QUIC then authenticates the peer itself.
+                if (CRYPTO_memcmp(relayed->token.data(), relay_token_.data(), kRelayTokenSize) != 0) break;
+                core::PublicKey source{};
+                std::copy(relayed->key.begin(), relayed->key.end(), source.begin());
+                if (!relay_allowed_ || !relay_allowed_(source)) break;
+                auto inner = relayed->payload;
+                auto virtual_address = relay_address(source);
+                if (virtual_address && classify_packet(inner) == PacketKind::quic) {
+                    route_quic(std::span(reinterpret_cast<const std::uint8_t*>(inner.data()), inner.size()),
+                               *virtual_address);
+                }
+                break;
+            }
+            // As a relay client, a relay datagram from anyone but our server is ignored; a relay
+            // server (no relay configured) hands every datagram to its handler.
+            if (relayed && relay_server_) break;
             if (datagram_handler_) datagram_handler_(std::as_bytes(packet), rx_from_);
             break;
+        }
         case PacketKind::unknown:
             break;
     }
@@ -199,16 +221,94 @@ void Endpoint::route_quic(std::span<const std::uint8_t> packet, const Udp::endpo
     bool long_header = (packet[0] & 0x80) != 0;
     if (!long_header || !options_.accept_peer || closed_) return;
     if (pending_handshakes_ >= options_.max_pending_handshakes) return;
-    auto conn = Connection::create_server(shared_from_this(), from, packet);
+    std::optional<std::vector<std::uint8_t>> original_dcid;
+    if (options_.require_address_validation) {
+        ngtcp2_pkt_hd hd;
+        if (ngtcp2_accept(&hd, packet.data(), packet.size()) != 0) return;
+        if (hd.tokenlen == 0 || hd.token[0] != NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY2) {
+            send_retry(packet, from);
+            return;
+        }
+        ngtcp2_cid odcid;
+        auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+        if (ngtcp2_crypto_verify_retry_token2(
+                &odcid, hd.token, hd.tokenlen, static_secret_.data(), static_secret_.size(),
+                hd.version, reinterpret_cast<const ngtcp2_sockaddr*>(from.data()),
+                static_cast<ngtcp2_socklen>(from.size()), &hd.dcid, 10 * NGTCP2_SECONDS,
+                static_cast<ngtcp2_tstamp>(now)) != 0) {
+            return;  // forged, stale, or for another address: create nothing
+        }
+        original_dcid.emplace(odcid.data, odcid.data + odcid.datalen);
+    }
+    auto conn = Connection::create_server(shared_from_this(), from, packet, original_dcid);
     if (!conn) return;
     conn.value()->on_packet(packet, from);
+}
+
+void Endpoint::send_retry(std::span<const std::uint8_t> packet, const Udp::endpoint& to) {
+    ngtcp2_pkt_hd hd;
+    if (ngtcp2_accept(&hd, packet.data(), packet.size()) != 0) return;
+    ngtcp2_cid retry_scid{};
+    retry_scid.datalen = kCidLen;
+    if (RAND_bytes(retry_scid.data, static_cast<int>(retry_scid.datalen)) != 1) return;
+    auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    std::array<std::uint8_t, NGTCP2_CRYPTO_MAX_RETRY_TOKENLEN2> token{};
+    auto token_len = ngtcp2_crypto_generate_retry_token2(
+        token.data(), static_secret_.data(), static_secret_.size(), hd.version,
+        reinterpret_cast<const ngtcp2_sockaddr*>(to.data()), static_cast<ngtcp2_socklen>(to.size()),
+        &retry_scid, &hd.dcid, static_cast<ngtcp2_tstamp>(now));
+    if (token_len < 0) return;
+    // A Retry is never larger than the Initial that caused it, so it cannot amplify.
+    std::array<std::uint8_t, NGTCP2_MAX_UDP_PAYLOAD_SIZE> buffer{};
+    auto written = ngtcp2_crypto_write_retry(buffer.data(), std::min(buffer.size(), packet.size()),
+                                             hd.version, &hd.scid, &retry_scid, &hd.dcid,
+                                             token.data(), static_cast<std::size_t>(token_len));
+    if (written <= 0) return;
+    send_now(std::as_bytes(std::span(buffer.data(), static_cast<std::size_t>(written))), to);
 }
 
 void Endpoint::send_datagram(std::span<const std::byte> datagram, const Udp::endpoint& to) {
     send_packet(datagram, to);
 }
 
+void Endpoint::set_relay(Udp::endpoint server, RelayToken token, PinCheck allowed) {
+    relay_server_ = server;
+    relay_token_ = token;
+    relay_allowed_ = std::move(allowed);
+}
+
+void Endpoint::clear_relay() {
+    relay_server_.reset();
+    relay_allowed_ = nullptr;
+}
+
+std::optional<Udp::endpoint> Endpoint::relay_address(const core::PublicKey& peer) {
+    if (auto it = relay_address_.find(peer); it != relay_address_.end()) return it->second;
+    // Only allowed keys get here, so the table holds at most the drive's members; the cap is a
+    // backstop that refuses rather than wraps.
+    constexpr std::size_t kMaxRelayPeers = 4096;
+    if (relay_address_.size() >= kMaxRelayPeers) return std::nullopt;
+    // 198.18.0.0/15 is reserved for benchmarking and never routed, so it cannot collide with a
+    // real peer.
+    auto index = static_cast<std::uint32_t>(relay_address_.size()) + 1;
+    asio::ip::address_v4 address((198u << 24) | (18u << 16) | index);
+    Udp::endpoint ep(address, 7);
+    relay_address_.emplace(peer, ep);
+    relay_peer_.emplace(ep, peer);
+    return ep;
+}
+
 void Endpoint::send_packet(std::span<const std::byte> packet, const Udp::endpoint& to) {
+    if (auto it = relay_peer_.find(to); it != relay_peer_.end()) {
+        if (!relay_server_) return;  // no relay configured: the packet is lost, as on a dead path
+        auto wrapped = make_relay(relay_token_, it->second, packet);
+        send_packet(wrapped, *relay_server_);
+        return;
+    }
     if (!impairer_) {
         send_now(packet, to);
         return;

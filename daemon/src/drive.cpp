@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cerrno>
 #include <cstdlib>
 #include <cstdio>
@@ -165,7 +166,8 @@ DrivePaths::DrivePaths(std::filesystem::path r)
       chunks(root / "chunks"),
       staging(root / "staging"),
       peers(root / "peers"),
-      control(control_socket_for(root)) {}
+      control(control_socket_for(root)),
+      rendezvous(root / "rendezvous") {}
 
 std::filesystem::path default_data_dir() {
     const char* home = std::getenv("HOME");
@@ -249,6 +251,9 @@ core::Result<std::unique_ptr<Drive>> Drive::join(const std::filesystem::path& ro
     }
     auto drive = assemble(paths, std::move(key).value(), info.drive_id, info.secret, device_name);
     if (!drive) return drive.error();
+    if (auto config = RendezvousConfig::parse(info.rendezvous)) {
+        (void)drive.value()->set_rendezvous(*config);
+    }
     for (const auto& member : info.members) {
         if (member.key == drive.value()->key().public_key()) continue;
         if (auto st = drive.value()->index().add_device(member.key, member.name); !st) {
@@ -325,6 +330,48 @@ Status Drive::set_peer_address(const core::PublicKey& key, const std::string& ad
     for (const auto& [k, a] : all) out << core::to_hex(k) << ' ' << a << '\n';
     auto text = out.str();
     return write_private_file(paths_.peers, core::as_bytes(text));
+}
+
+std::string RendezvousConfig::to_string() const {
+    return host + ":" + std::to_string(port) + " " + core::fingerprint(key);
+}
+
+std::optional<RendezvousConfig> RendezvousConfig::parse(std::string_view text) {
+    auto space = text.find(' ');
+    if (space == std::string_view::npos) return std::nullopt;
+    auto address = text.substr(0, space);
+    auto key = core::parse_fingerprint(text.substr(space + 1));
+    auto colon = address.rfind(':');
+    if (!key || colon == std::string_view::npos || colon == 0) return std::nullopt;
+    RendezvousConfig config;
+    config.host = std::string(address.substr(0, colon));
+    auto digits = address.substr(colon + 1);
+    auto [end, err] = std::from_chars(digits.data(), digits.data() + digits.size(), config.port);
+    if (err != std::errc{} || end != digits.data() + digits.size() || config.port == 0) {
+        return std::nullopt;
+    }
+    // Host names and numeric addresses only; the value is written to a file and shown to users.
+    if (config.host.size() > 253 ||
+        std::any_of(config.host.begin(), config.host.end(), [](char c) {
+            return !(std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-' ||
+                     c == ':' || c == '[' || c == ']');
+        })) {
+        return std::nullopt;
+    }
+    config.key = *key;
+    return config;
+}
+
+std::optional<RendezvousConfig> Drive::rendezvous() const {
+    std::ifstream in(paths_.rendezvous);
+    std::string line;
+    if (!std::getline(in, line)) return std::nullopt;
+    return RendezvousConfig::parse(line);
+}
+
+Status Drive::set_rendezvous(const RendezvousConfig& config) {
+    auto text = config.to_string() + "\n";
+    return write_private_file(paths_.rendezvous, core::as_bytes(text));
 }
 
 }  // namespace ghostdrive::daemon

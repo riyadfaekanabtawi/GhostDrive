@@ -42,6 +42,12 @@ struct ServiceOptions {
     std::vector<asio::ip::address> invite_addresses;
     // Advertise this device and find the others on the LAN (mDNS), when built with DNS-SD.
     bool lan_discovery = true;
+    // Rendezvous: how often to ask the server for members that are offline or only relayed,
+    // and how long hole punching gets before the relay is tried.
+    std::chrono::milliseconds rendezvous_interval{10'000};
+    std::chrono::milliseconds relay_after{3'000};
+    // Testing: skip direct attempts and go straight to the relay.
+    bool relay_only = false;
 };
 
 struct PeerStatus {
@@ -49,12 +55,16 @@ struct PeerStatus {
     std::string name;
     std::string address;
     bool connected = false;
+    bool relayed = false;  // connected through the rendezvous server's relay
 };
 
 struct ServiceStatus {
     std::string device_name;
     std::string fingerprint;
     std::uint16_t port = 0;
+    std::string rendezvous;  // configured server, empty if none
+    std::string rendezvous_group;  // hex, for the server's --allow-group
+    std::optional<asio::ip::udp::endpoint> observed;  // public address the server sees
     std::vector<PeerStatus> peers;
 };
 
@@ -102,6 +112,15 @@ private:
                                         std::shared_ptr<transport::Stream> stream, Hello hello);
     asio::awaitable<void> run_pairing(std::shared_ptr<transport::Connection> conn);
     void on_lan_sighting(const discovery::LanSighting& sighting);
+    asio::awaitable<void> rendezvous_loop();
+    asio::awaitable<void> request_peers(std::shared_ptr<transport::Connection> conn,
+                                        std::shared_ptr<transport::Stream> control);
+    void on_peer_at(const core::PublicKey& peer, const asio::ip::udp::endpoint& address);
+    asio::awaitable<void> punch(asio::ip::udp::endpoint address);
+    asio::awaitable<void> relay_fallback(core::PublicKey peer);
+    bool is_relayed(const std::shared_ptr<transport::Connection>& conn) const;
+    bool dials_first(const core::PublicKey& peer) const;
+    void start_dial(const core::PublicKey& peer, const asio::ip::udp::endpoint& address);
 
     asio::any_io_executor io_;
     asio::any_io_executor disk_;
@@ -115,6 +134,11 @@ private:
 
     std::shared_ptr<transport::Endpoint> endpoint_;
     std::unique_ptr<discovery::LanDiscovery> lan_;
+    std::shared_ptr<transport::Connection> rendezvous_conn_;
+    // When each peer's PeerAt was last acted on: a server, honest or not, cannot make us punch
+    // and dial faster than this.
+    std::map<core::PublicKey, std::chrono::steady_clock::time_point> last_peer_at_;
+    std::optional<asio::ip::udp::endpoint> observed_;
     std::map<core::PublicKey, std::shared_ptr<transport::Connection>> live_;
     // Dials in flight, per member and address: a stale address timing out must not hold up one
     // just found on the LAN.

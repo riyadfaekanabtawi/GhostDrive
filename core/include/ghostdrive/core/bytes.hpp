@@ -18,6 +18,8 @@ std::optional<Bytes> from_hex(std::string_view text);
 
 // RFC 4648 base32, upper case, no padding.
 std::string base32_encode(std::span<const std::byte> data);
+// Inverse of base32_encode; ignores case. Trailing bits that do not fill a byte are dropped.
+std::optional<Bytes> base32_decode(std::string_view text);
 
 // Cryptographically secure random bytes (OpenSSL RAND_bytes).
 Status random_bytes(std::span<std::byte> out);

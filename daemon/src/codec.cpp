@@ -269,6 +269,7 @@ core::Bytes encode_drive_info(const DriveInfo& info) {
         w.str16(m.name);
         w.str16(m.address);
     }
+    w.str16(info.rendezvous);
     return w.frame(wire::FrameType::drive_info);
 }
 
@@ -288,7 +289,9 @@ core::Result<DriveInfo> decode_drive_info(std::span<const std::byte> payload) {
         m.address = std::move(*address);
         info.members.push_back(std::move(m));
     }
-    if (!r.done()) return malformed("DriveInfo");
+    auto rendezvous = r.str16(kMaxNameBytes);
+    if (!rendezvous || !r.done()) return malformed("DriveInfo");
+    info.rendezvous = std::move(*rendezvous);
     return info;
 }
 

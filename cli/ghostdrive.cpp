@@ -27,6 +27,8 @@ constexpr const char* kUsage =
     "  init [--name NAME]               create a new drive on this device\n"
     "  invite [--ttl SECONDS]           print a one-time code for adding another device\n"
     "  join CODE [--name NAME] [--port N]  add this device to a drive using an invite code\n"
+    "  rendezvous [HOST:PORT FINGERPRINT]  show or set the rendezvous server, for reaching\n"
+    "                                   devices on other networks (see ghostdrive-rendezvous)\n"
     "\n"
     "Running (start the daemon with `ghostdrived`):\n"
     "  status                           show this device and the other devices\n"
@@ -127,6 +129,26 @@ int cmd_invite(const Args& args) {
     return 0;
 }
 
+int cmd_rendezvous(const Args& args) {
+    auto drive = daemon::Drive::open(args.data);
+    if (!drive) return fail(drive.error().message);
+    if (args.positional.empty()) {
+        auto config = drive.value()->rendezvous();
+        std::cout << (config ? config->to_string() : std::string("none")) << "\n";
+        return 0;
+    }
+    if (args.positional.size() < 2) return fail("rendezvous needs HOST:PORT and the server's fingerprint");
+    std::string fingerprint;
+    for (std::size_t i = 1; i < args.positional.size(); ++i) fingerprint += args.positional[i];
+    auto config = daemon::RendezvousConfig::parse(args.positional[0] + " " + fingerprint);
+    if (!config) return fail("expected HOST:PORT followed by the fingerprint the server printed");
+    if (auto st = drive.value()->set_rendezvous(*config); !st) return fail(st.error().message);
+    std::cout << "Rendezvous server set to " << config->to_string()
+              << ".\nA running daemon picks it up within a few seconds. Devices that join from now on\n"
+                 "get it automatically; run this on devices that joined before.\n";
+    return 0;
+}
+
 int cmd_join(const Args& args) {
     if (args.positional.size() != 1) return fail("join needs the invite code");
     if (daemon::Drive::exists(args.data)) {
@@ -190,6 +212,7 @@ int main(int argc, char** argv) {
     if (args.command == "id") return cmd_id(args);
     if (args.command == "invite") return cmd_invite(args);
     if (args.command == "join") return cmd_join(args);
+    if (args.command == "rendezvous") return cmd_rendezvous(args);
     if (args.command == "status") return cmd_control(args, "status");
     if (args.command == "stop") return cmd_control(args, "stop");
     std::cerr << kUsage;

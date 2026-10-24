@@ -4,7 +4,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 
 #include "ghostdrive/core/chunk_store.hpp"
 #include "ghostdrive/core/hlc.hpp"
@@ -27,6 +29,7 @@ struct DrivePaths {
     std::filesystem::path staging;  // staging files of open writers
     std::filesystem::path peers;    // last known address of each member device
     std::filesystem::path control;  // Unix socket of the running daemon
+    std::filesystem::path rendezvous;  // "host:port FINGERPRINT" of the rendezvous server
 };
 
 // Default data directory: ~/Library/Application Support/GhostDrive on macOS,
@@ -34,6 +37,15 @@ struct DrivePaths {
 std::filesystem::path default_data_dir();
 // Default mountpoint: ~/GhostDrive.
 std::filesystem::path default_mountpoint();
+
+struct RendezvousConfig {
+    std::string host;
+    std::uint16_t port = 0;
+    core::PublicKey key{};
+
+    std::string to_string() const;  // "host:port FINGERPRINT"
+    static std::optional<RendezvousConfig> parse(std::string_view text);
+};
 
 // One device's membership of one drive: identity, secret, index, chunks and peer addresses.
 class Drive {
@@ -62,6 +74,11 @@ public:
     // Thread-safe.
     std::map<core::PublicKey, std::string> peer_addresses() const;
     core::Status set_peer_address(const core::PublicKey& key, const std::string& address);
+
+    // The rendezvous server, if one is configured. Re-read on every call, so the daemon
+    // notices a change made with `ghostdrive rendezvous` while it runs.
+    std::optional<RendezvousConfig> rendezvous() const;
+    core::Status set_rendezvous(const RendezvousConfig& config);
 
     Drive(DrivePaths paths, core::DeviceKey key, DriveId drive_id, core::DriveSecret secret,
           std::string device_name, core::MetadataIndex index, core::ChunkStore store);

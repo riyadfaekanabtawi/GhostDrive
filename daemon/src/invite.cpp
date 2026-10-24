@@ -14,24 +14,7 @@ namespace {
 constexpr std::string_view kPrefix = "gd1-";
 constexpr std::uint8_t kFormatVersion = 1;
 constexpr std::size_t kMaxAddresses = 16;
-constexpr std::string_view kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-std::optional<core::Bytes> base32_decode(std::string_view text) {
-    core::Bytes out;
-    std::uint32_t buffer = 0;
-    int bits = 0;
-    for (char c : text) {
-        auto pos = kAlphabet.find(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-        if (pos == std::string_view::npos) return std::nullopt;
-        buffer = (buffer << 5) | static_cast<std::uint32_t>(pos);
-        bits += 5;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push_back(static_cast<std::byte>((buffer >> bits) & 0xFF));
-        }
-    }
-    return out;
-}
 
 Error bad_code(const char* why) {
     return Error{Errc::invalid_argument, std::string("invalid invite code: ") + why};
@@ -76,7 +59,7 @@ core::Result<Invite> decode_invite(std::string_view code) {
         text += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     }
     if (text.rfind("GD1", 0) != 0) return bad_code("missing gd1 prefix");
-    auto raw = base32_decode(std::string_view(text).substr(3));
+    auto raw = core::base32_decode(std::string_view(text).substr(3));
     if (!raw) return bad_code("not base32");
 
     std::span<const std::byte> in(*raw);

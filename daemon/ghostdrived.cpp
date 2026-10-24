@@ -26,7 +26,7 @@ namespace {
 using namespace ghostdrive;
 
 constexpr const char* kUsage =
-    "usage: ghostdrived [--data DIR] [--mount PATH | --no-mount] [--port N]\n"
+    "usage: ghostdrived [--data DIR] [--mount PATH | --no-mount] [--port N] [--no-lan]\n"
     "\n"
     "Runs this device of the drive in DIR (default: the per-user data directory) and mounts\n"
     "it at PATH (default: ~/GhostDrive). Stop with Ctrl-C or `ghostdrive stop`.\n";
@@ -36,6 +36,7 @@ struct Args {
     std::filesystem::path mountpoint = daemon::default_mountpoint();
     bool mount = true;
     std::uint16_t port = daemon::kDefaultPort;
+    bool lan = true;
 };
 
 bool parse_args(int argc, char** argv, Args& args) {
@@ -52,6 +53,8 @@ bool parse_args(int argc, char** argv, Args& args) {
             args.mountpoint = v;
         } else if (a == "--no-mount") {
             args.mount = false;
+        } else if (a == "--no-lan") {
+            args.lan = false;
         } else if (a == "--port") {
             auto v = value();
             if (!v) return false;
@@ -94,6 +97,7 @@ int main(int argc, char** argv) {
 
     daemon::ServiceOptions options;
     options.listen = asio::ip::udp::endpoint(asio::ip::address_v4::any(), args.port);
+    options.lan_discovery = args.lan;
     daemon::Service service(io.get_executor(), disk.get_executor(), *drive.value(), options);
     if (auto st = service.start(); !st) {
         std::cerr << "ghostdrived: " << st.error().message << "\n";

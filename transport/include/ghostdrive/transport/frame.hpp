@@ -36,6 +36,11 @@ enum class FrameType : std::uint8_t {
     // Pairing a new device by invite code.
     join = 7,
     drive_info = 8,
+    // Rendezvous server control stream.
+    rendezvous_register = 9,
+    rendezvous_registered = 10,
+    rendezvous_connect = 11,
+    rendezvous_peer_at = 12,
 };
 
 enum class ErrorCode : std::uint16_t {

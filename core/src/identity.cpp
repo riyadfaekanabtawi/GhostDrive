@@ -142,6 +142,18 @@ std::string fingerprint(const PublicKey& key) {
     return out;
 }
 
+std::optional<PublicKey> parse_fingerprint(std::string_view text) {
+    std::string compact;
+    for (char c : text) {
+        if (c != '-' && c != ' ') compact.push_back(c);
+    }
+    auto bytes = base32_decode(compact);
+    if (!bytes || bytes->size() != kPublicKeySize || compact.size() != 52) return std::nullopt;
+    PublicKey key{};
+    std::copy(bytes->begin(), bytes->end(), key.begin());
+    return key;
+}
+
 std::uint64_t short_id(const PublicKey& key) noexcept {
     std::uint64_t value = 0;
     for (std::size_t i = 0; i < 8; ++i)

@@ -26,7 +26,9 @@ using detail::post_completion;
 namespace {
 
 constexpr std::size_t kCidLen = 18;
-constexpr std::size_t kMaxUdpPayload = 1452;
+// Leaves room for the 37-byte relay header inside a 1500-byte MTU (1472 bytes of UDP payload
+// over IPv4), so relayed packets are never fragmented.
+constexpr std::size_t kMaxUdpPayload = 1400;
 constexpr std::size_t kMaxPacketsPerFlush = 64;
 constexpr std::size_t kMaxVectors = 16;
 
@@ -85,6 +87,9 @@ void fill_params(ngtcp2_transport_params& params, const EndpointOptions& options
     params.active_connection_id_limit = 4;
     // The demux tells QUIC from our own datagrams by the fixed bit, so it must not be greased.
     params.grease_quic_bit = 0;
+    // Paths change only by NAT rebinding (handled by ngtcp2) or by a new connection; never let
+    // a peer move a connection, which would also slip a direct one onto the relay unnoticed.
+    params.disable_active_migration = 1;
 }
 
 }  // namespace
@@ -310,13 +315,17 @@ Result<std::shared_ptr<Connection>> Connection::create_client(
         return Error{Errc::protocol, std::string("ngtcp2_conn_client_new: ") + ngtcp2_strerror(rv)};
     }
     if (auto st = self->init_tls(endpoint->client_ctx_.get()); !st) return st.error();
+    if (endpoint->options_.keep_alive.count() > 0) {
+        ngtcp2_conn_set_keep_alive_timeout(self->conn_, to_duration(endpoint->options_.keep_alive));
+    }
     endpoint->register_cid({scid.data, scid.datalen}, self);
     return self;
 }
 
 Result<std::shared_ptr<Connection>> Connection::create_server(
     const std::shared_ptr<Endpoint>& endpoint, const Udp::endpoint& remote,
-    std::span<const std::uint8_t> initial_packet) {
+    std::span<const std::uint8_t> initial_packet,
+    const std::optional<std::vector<std::uint8_t>>& original_dcid) {
     ngtcp2_pkt_hd hd;
     if (ngtcp2_accept(&hd, initial_packet.data(), initial_packet.size()) != 0) {
         return Error{Errc::protocol, "not an acceptable Initial packet"};
@@ -330,7 +339,18 @@ Result<std::shared_ptr<Connection>> Connection::create_server(
     fill_settings(settings, endpoint->options_);
     ngtcp2_transport_params params;
     fill_params(params, endpoint->options_);
-    params.original_dcid = hd.dcid;
+    if (original_dcid) {
+        // After a Retry the client addresses the CID we put in the Retry (now its DCID); the
+        // transport parameters must name both, so the client can check nobody tampered.
+        ngtcp2_cid_init(&params.original_dcid, original_dcid->data(), original_dcid->size());
+        params.retry_scid = hd.dcid;
+        params.retry_scid_present = 1;
+        settings.token = hd.token;
+        settings.tokenlen = hd.tokenlen;
+        settings.token_type = NGTCP2_TOKEN_TYPE_RETRY;
+    } else {
+        params.original_dcid = hd.dcid;
+    }
     params.original_dcid_present = 1;
     params.stateless_reset_token_present = 1;
     if (ngtcp2_crypto_generate_stateless_reset_token(params.stateless_reset_token,
@@ -349,6 +369,9 @@ Result<std::shared_ptr<Connection>> Connection::create_server(
         return Error{Errc::protocol, std::string("ngtcp2_conn_server_new: ") + ngtcp2_strerror(rv)};
     }
     if (auto st = self->init_tls(endpoint->server_ctx_.get()); !st) return st.error();
+    if (endpoint->options_.keep_alive.count() > 0) {
+        ngtcp2_conn_set_keep_alive_timeout(self->conn_, to_duration(endpoint->options_.keep_alive));
+    }
     endpoint->register_cid({scid.data, scid.datalen}, self);
     // The client keeps addressing the original DCID until it sees our first packet.
     endpoint->register_cid({hd.dcid.data, hd.dcid.datalen}, self);
@@ -382,6 +405,11 @@ Status Connection::init_tls(ssl_ctx_st* ssl_ctx) {
     }
     ngtcp2_conn_set_tls_native_handle(conn_, ossl_ctx_);
     return {};
+}
+
+Udp::endpoint Connection::current_remote_endpoint() const {
+    if (conn_ == nullptr) return remote_;
+    return to_endpoint(ngtcp2_conn_get_path2(conn_)->remote, remote_);
 }
 
 bool Connection::authorize(const core::PublicKey& key) const {

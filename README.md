@@ -39,6 +39,24 @@ The invite code contains the inviting device's full key, so the new device canno
 into joining an impostor; anyone holding the code can join until it is used or expires (10
 minutes by default), so send it privately.
 
+### Devices on different networks
+
+Run the rendezvous server on any machine with a public IP that accepts UDP (a small VPS is
+enough; platforms that only forward HTTP, such as Hugging Face Spaces, will not work):
+
+```
+ghostdrive-rendezvous --port 7374          # prints the server's fingerprint
+```
+
+Then, on a device of the drive:
+
+```
+ghostdrive rendezvous your.server.example:7374 <fingerprint>
+```
+
+Devices that join afterwards inherit the setting. They connect directly when hole punching
+works and otherwise through the server's relay, which forwards only encrypted packets.
+
 ## Limitations
 
 - Across the internet, devices need a rendezvous server to find each other, and a relay when

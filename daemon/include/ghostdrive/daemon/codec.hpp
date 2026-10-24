@@ -65,6 +65,7 @@ struct DriveInfo {
     DriveId drive_id{};
     core::DriveSecret secret{};
     std::vector<Member> members;
+    std::string rendezvous;  // "host:port FINGERPRINT", empty when the drive has none
 };
 
 core::Bytes encode_hello(const Hello& hello);

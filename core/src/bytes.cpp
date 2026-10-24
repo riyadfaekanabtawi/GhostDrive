@@ -63,6 +63,26 @@ std::string base32_encode(std::span<const std::byte> data) {
     return out;
 }
 
+std::optional<Bytes> base32_decode(std::string_view text) {
+    Bytes out;
+    out.reserve(text.size() * 5 / 8);
+    unsigned buffer = 0;
+    int bits = 0;
+    for (char c : text) {
+        char upper = (c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A') : c;
+        auto pos = std::string_view(kBase32Alphabet).find(upper);
+        if (pos == std::string_view::npos) return std::nullopt;
+        buffer = (buffer << 5) | static_cast<unsigned>(pos);
+        bits += 5;
+        if (bits >= 8) {
+            out.push_back(static_cast<std::byte>((buffer >> (bits - 8)) & 0xFF));
+            bits -= 8;
+        }
+        buffer &= (1u << bits) - 1;
+    }
+    return out;
+}
+
 Status random_bytes(std::span<std::byte> out) {
     if (out.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         return Error{Errc::invalid_argument, "random_bytes: request too large"};
