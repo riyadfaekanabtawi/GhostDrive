@@ -17,6 +17,9 @@ enum class Errc {
     crypto,
     database,
     permission,
+    closed,
+    timeout,
+    protocol,
 };
 
 struct Error {

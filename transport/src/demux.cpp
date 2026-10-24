@@ -1,0 +1,17 @@
+#include "ghostdrive/transport/demux.hpp"
+
+#include <algorithm>
+
+namespace ghostdrive::transport {
+
+PacketKind classify_packet(std::span<const std::byte> packet) noexcept {
+    if (packet.empty()) return PacketKind::unknown;
+    if ((std::to_integer<unsigned>(packet[0]) & 0x40u) != 0) return PacketKind::quic;
+    if (packet.size() >= kDatagramMagic.size() &&
+        std::equal(kDatagramMagic.begin(), kDatagramMagic.end(), packet.begin())) {
+        return PacketKind::ghostdrive;
+    }
+    return PacketKind::unknown;
+}
+
+}  // namespace ghostdrive::transport

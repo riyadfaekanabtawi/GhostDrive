@@ -128,9 +128,11 @@ document assumes the corrected version.
 - ngtcp2 (sans-IO) driven by our own event loop. One UDP socket per address family, shared by
   QUIC, hole-punch probes, and relay-encapsulated datagrams.
 - **Demux on the first byte.** QUIC packets always have the fixed bit (0x40) set. Our probe and
-  relay frames start with a magic prefix that has a distinct first byte. The prefix still needs a
-  concrete value chosen against RFC 9000 section 17 and RFC 9287, which lets peers grease the
-  fixed bit; negotiate grease off.
+  relay frames start with the magic prefix `0D 'G' 'D' 01` (last byte is the format version).
+  0x0D has the fixed bit clear and lies in 4..15, which RFC 7983 and RFC 9443 leave unassigned,
+  so it collides with neither STUN (0..3) nor DTLS (20..63). The 0x80-0xBF range was rejected
+  because Version Negotiation packets may have the fixed bit clear. `grease_quic_bit` (RFC 9287)
+  is never negotiated.
 - **Coroutine API.** `co_await conn.open_stream()`, `co_await stream.read(std::span<std::byte>)`,
   `co_await stream.write(std::span<const std::byte>)`. ngtcp2 callbacks fire synchronously
   inside `ngtcp2_conn_read_pkt`/`writev_stream`. They only record events, and awaiting coroutines
@@ -146,6 +148,10 @@ document assumes the corrected version.
     or `Error{code}`.
 
   Frames are length-prefixed, with hand-written little-endian encoding and version-tagged messages.
+- **Pre-authentication limits.** Incoming handshakes in progress are capped
+  (`max_pending_handshakes`); `accept_peer` runs only after CertificateVerify. Still open: Retry
+  (address validation) for internet-facing endpoints, and closing live connections when a key is
+  unpinned (needed for revocation, section 7).
 - **Impairment shim** for tests: delay, loss, reorder, and duplication on the socket shim, with a
   seeded random source.
 
@@ -269,7 +275,7 @@ Every copy of payload bytes on this path:
 | C3 | B: user -> kernel (`sendmsg`) | Kernel socket boundary. |
 | C4 | Relay (relayed path only): recv buffer -> send buffer | Relay rewraps frames; could be zero-copy later with splice or io_uring. |
 | C5 | A: kernel -> pooled buffer (`recvmsg`) | Kernel socket boundary. |
-| C6 | A: ciphertext -> plaintext (decrypt) | ngtcp2 decrypts into its own buffer. In-place decrypt is not exposed; verify in step (b). |
+| C6 | A: ciphertext -> plaintext (decrypt) | ngtcp2 decrypts into its own buffer (`conn->crypto.decrypt_buf`, checked in ngtcp2 1.25.0). In-place decrypt is not exposed. |
 | C7 | A: ngtcp2 stream data -> chunk buffer | Callback data is only valid during the callback, so it is reassembled into the chunk buffer. |
 | C8 | A: chunk buffer -> kernel (FUSE reply) | `write`/`writev` to /dev/fuse. `fuse_reply_data` with splice can move pages on Linux (later). |
 | C9 | A, macOS FUSE-T only: FUSE-T -> NFS reply -> kernel NFS client | Inside FUSE-T; outside our control. |
@@ -448,8 +454,9 @@ proceed with them unless you object:
     with the GUI. A PAKE is not used in the MVP.
 12. **Wire encoding.** Hand-written length-prefixed binary frames with version tags, with no
     protobuf or flatbuffers dependency.
-13. **TLS backend.** OpenSSL 3.5+ from vcpkg. Its Ed25519 TLS 1.3 support and the version vcpkg
-    pins need checking in step (b).
+13. **TLS backend.** OpenSSL 3.5+ from vcpkg. Checked in step (b): vcpkg pins OpenSSL 3.6.5 and
+    ngtcp2 1.25.0, and TLS 1.3 with Ed25519 certificates works through `ngtcp2_crypto_ossl` (the
+    loopback tests run mutual Ed25519 authentication).
 
 ## 12. Sources
 

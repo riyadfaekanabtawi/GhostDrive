@@ -35,6 +35,9 @@ public:
     const PublicKey& public_key() const noexcept { return public_key_; }
     Result<Signature> sign(std::span<const std::byte> message) const;
 
+    // OpenSSL key for building the TLS certificate. Never serialize or log it.
+    evp_pkey_st* native_handle() const noexcept { return pkey_.get(); }
+
 private:
     struct PkeyDeleter {
         void operator()(evp_pkey_st* pkey) const noexcept;

@@ -3,8 +3,15 @@
   "version-string": "0.0.0",
   "builtin-baseline": "0c2a9ace1964b818b15f7ae50ba1c42404918a7b",
   "dependencies": [
+    "asio",
     "blake3",
     "gtest",
+    {
+      "name": "ngtcp2",
+      "features": [
+        "openssl"
+      ]
+    },
     "openssl",
     "sqlite3"
   ]
