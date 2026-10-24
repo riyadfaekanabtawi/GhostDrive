@@ -59,5 +59,14 @@ wait_for 15 sh -c "! test -e '$MB/greeting.txt'" || fail "old name still on B"
 rm "$MB/reply.txt"
 wait_for 15 sh -c "! test -e '$MA/reply.txt'" || fail "delete never reached A"
 
+# Removing B from A cuts it off, and B is told who removed it.
+"$GD" remove desk --data "$A" >/dev/null 2>&1 && fail "A removed itself"
+"$GD" remove laptop --data "$A" | grep -q "Removed laptop" || fail "remove laptop"
+wait_for 15 sh -c "'$GD' status --data '$A' | grep -q 'none yet'" || fail "A still lists B"
+wait_for 15 sh -c "'$GD' status --data '$B' | grep -q 'Removed:   desk removed this device'" \
+    || fail "B was not told it was removed"
+sleep 3
+"$GD" status --data "$B" | grep -q "online   desk" && fail "B reconnected after removal"
+
 "$GD" status --data "$A"
 echo "PASS"

@@ -41,6 +41,8 @@ enum class FrameType : std::uint8_t {
     rendezvous_registered = 10,
     rendezvous_connect = 11,
     rendezvous_peer_at = 12,
+    // Membership entries between members (one stream per direction).
+    membership = 13,
 };
 
 enum class ErrorCode : std::uint16_t {

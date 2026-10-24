@@ -32,6 +32,8 @@ constexpr const char* kUsage =
     "\n"
     "Running (start the daemon with `ghostdrived`):\n"
     "  status                           show this device and the other devices\n"
+    "  remove NAME|ID                   take a device out of the drive for good (a lost or\n"
+    "                                   stolen one); the other devices learn of it\n"
     "  stop                             unmount and stop the daemon\n"
     "  id                               print this device's ID\n"
     "\n"
@@ -187,7 +189,8 @@ int cmd_join(const Args& args) {
                     "`ghostdrive invite`, and check that both devices are on the same network.");
     }
 
-    auto drive = daemon::Drive::join(args.data, args.name, result->value().info);
+    auto drive =
+        daemon::Drive::join(args.data, args.name, result->value().info, invite.value().inviter);
     core::secure_zero(result->value().info.secret);
     if (!drive) return fail(drive.error().message);
     auto address = result->value().inviter_address;
@@ -215,6 +218,13 @@ int main(int argc, char** argv) {
     if (args.command == "rendezvous") return cmd_rendezvous(args);
     if (args.command == "status") return cmd_control(args, "status");
     if (args.command == "stop") return cmd_control(args, "stop");
+    if (args.command == "remove") {
+        if (args.positional.size() != 1) {
+            std::cerr << "ghostdrive: remove needs the device's name or ID\n";
+            return 2;
+        }
+        return cmd_control(args, "remove " + args.positional[0]);
+    }
     std::cerr << kUsage;
     return 2;
 }

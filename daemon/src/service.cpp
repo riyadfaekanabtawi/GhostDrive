@@ -37,7 +37,8 @@ namespace {
 constexpr std::size_t kBatchRecords = 256;
 // The first frame of any stream is small: a GetChunk, Hello or Join.
 constexpr std::uint32_t kMaxFirstFrame = 4096;
-constexpr std::uint32_t kMaxDriveInfo = 64 * 1024;
+constexpr std::uint32_t kMaxDriveInfo = 8 * 1024 * 1024;  // the largest membership log fits
+constexpr std::uint32_t kMaxMembershipFrame = 256 * 1024;
 constexpr std::chrono::seconds kPairingTimeout{15};
 constexpr std::size_t kMaxPairingConnections = 8;
 constexpr int kMaxConnectionsPerMember = 2;
@@ -116,6 +117,7 @@ Service::~Service() {
 
 Status Service::start() {
     if (auto refreshed = fs_->refresh(drive_.index()); !refreshed) return refreshed.error();
+    if (auto st = refresh_membership(true); !st) return st;
 
     transport::EndpointOptions options;
     options.bind = options_.listen;
@@ -354,6 +356,50 @@ core::Result<std::string> Service::create_invite(std::chrono::seconds ttl) {
     return encode_invite(invite);
 }
 
+core::Result<std::string> Service::remove_member(const std::string& name_or_id) {
+    // Any device known here can be removed, including one in a contest nobody settled.
+    auto view = drive_.membership().view();
+    std::optional<core::PublicKey> target;
+    if (auto id = core::parse_fingerprint(name_or_id); id && view.names.contains(*id)) {
+        target = *id;
+    } else {
+        for (const auto& [key, name] : view.names) {
+            if (name != name_or_id || view.removed.contains(key)) continue;
+            if (target) {
+                return Error{Errc::invalid_argument,
+                             "more than one device is called " + name_or_id +
+                                 "; give its ID from `ghostdrive status` instead"};
+            }
+            target = key;
+        }
+    }
+    if (!target) {
+        if (name_or_id == drive_.device_name() ||
+            core::parse_fingerprint(name_or_id) == drive_.key().public_key()) {
+            return Error{Errc::invalid_argument,
+                         "this device cannot remove itself; remove it from another device"};
+        }
+        return Error{Errc::not_found, "no device called " + name_or_id + " in this drive"};
+    }
+    if (auto st = drive_.membership().remove(drive_.key(), *target); !st) return st.error();
+    if (auto st = refresh_membership(true); !st) return st.error();
+
+    std::string out = "Removed " + view.names[*target] + " (" + core::fingerprint(*target) +
+                      "). It can no longer connect to this drive's devices.\n";
+    // Devices it vouched for that no other device invited: it may have made them up.
+    for (const auto& [key, name] : view.members) {
+        if (key == *target || !view.vouched_by[key].contains(*target)) continue;
+        auto& inviters = view.invited_by[key];
+        if (std::any_of(inviters.begin(), inviters.end(),
+                        [&](const core::PublicKey& k) { return k != *target; })) {
+            continue;
+        }
+        out += name + " (" + core::fingerprint(key) + ") was added by it. If you do not " +
+               "recognise it, remove it too: ghostdrive remove " + core::fingerprint(key) + "\n";
+    }
+    return out;
+}
+
 ServiceStatus Service::status() const {
     ServiceStatus out;
     out.device_name = drive_.device_name();
@@ -361,6 +407,11 @@ ServiceStatus Service::status() const {
     out.port = port();
     if (auto config = drive_.rendezvous()) out.rendezvous = config->host + ":" + std::to_string(config->port);
     out.observed = observed_;
+    auto view = drive_.membership().view();
+    if (view.removed_by) {
+        auto it = view.members.find(*view.removed_by);
+        out.removed_by = it != view.members.end() ? it->second : core::fingerprint(*view.removed_by);
+    }
     if (auto group = discovery::rendezvous_group(drive_.secret())) {
         out.rendezvous_group = core::to_hex(group.value());
     }
@@ -401,6 +452,7 @@ asio::awaitable<void> Service::accept_loop() {
 asio::awaitable<void> Service::dial_loop() {
     auto alive = alive_;
     while (*alive && !stopped_) {
+        (void)refresh_membership(false);  // vouches for members once they are due
         for (const auto& [key, text] : drive_.peer_addresses()) {
             if (live_.contains(key) || !is_member(key)) continue;
             auto address = parse_address(text);
@@ -426,12 +478,13 @@ asio::awaitable<void> Service::run_member(std::shared_ptr<transport::Connection>
     auto alive = alive_;
     auto key = conn->peer_key();
     // Both sides may dial at once, so two connections per member are normal; more is a peer
-    // multiplying its resource use.
-    if (member_connections_[key] >= kMaxConnectionsPerMember) {
+    // multiplying its resource use. A dial started before a removal can complete after it.
+    if (!is_member(key) || member_connections_[key] >= kMaxConnectionsPerMember) {
         conn->close();
         co_return;
     }
     ++member_connections_[key];
+    member_conns_.insert(conn);
     // Prefer a direct path: a relayed connection never replaces a live direct one, and a new
     // direct one retires the relayed one it upgrades.
     auto previous = live_.find(key);
@@ -445,12 +498,16 @@ asio::awaitable<void> Service::run_member(std::shared_ptr<transport::Connection>
         live_[key] = conn;
     }
     asio::co_spawn(io_, push_index(conn), asio::detached);
+    asio::co_spawn(io_, push_membership(conn), asio::detached);
     for (;;) {
         auto stream = co_await conn->accept_stream();
         if (!*alive) co_return;
         if (!stream) break;  // connection closed
+        // A device removed while connected gets nothing more.
+        if (!is_member(key)) continue;
         asio::co_spawn(io_, handle_stream(conn, std::move(stream).value()), asio::detached);
     }
+    member_conns_.erase(conn);
     if (auto it = live_.find(key); it != live_.end() && it->second == conn) live_.erase(it);
     if (--member_connections_[key] == 0) member_connections_.erase(key);
 }
@@ -459,7 +516,7 @@ asio::awaitable<void> Service::handle_stream(std::shared_ptr<transport::Connecti
                                              std::shared_ptr<transport::Stream> stream) {
     auto alive = alive_;
     auto first = co_await wire::read_frame(*stream, kMaxFirstFrame);
-    if (!*alive || !first) co_return;
+    if (!*alive || !first || !is_member(conn->peer_key())) co_return;
     switch (first.value().type) {
         case wire::FrameType::get_chunk:
             co_await vfs::answer_chunk_request(stream, first.value(), drive_.store(), disk_);
@@ -473,6 +530,9 @@ asio::awaitable<void> Service::handle_stream(std::shared_ptr<transport::Connecti
             co_await receive_index(conn, stream, hello.value());
             break;
         }
+        case wire::FrameType::membership:
+            co_await receive_membership(conn, stream, std::move(first).value());
+            break;
         default: {
             auto reply = wire::encode_error(wire::ErrorCode::bad_request);
             (void)co_await stream->write(reply, true);
@@ -499,7 +559,7 @@ asio::awaitable<void> Service::push_index(std::shared_ptr<transport::Connection>
     if (!request) co_return;
     std::uint64_t after = request.value().after;
 
-    while (*alive && conn->is_open()) {
+    while (*alive && conn->is_open() && is_member(conn->peer_key())) {
         auto batch = co_await detail::run_on(
             disk_, [drive, after]() -> core::Result<std::vector<IndexEntry>> {
                 auto records = drive->index().records_since(after, kBatchRecords);
@@ -516,7 +576,7 @@ asio::awaitable<void> Service::push_index(std::shared_ptr<transport::Connection>
                 }
                 return entries;
             });
-        if (!*alive || !batch) co_return;
+        if (!*alive || !batch || !is_member(conn->peer_key())) co_return;
         if (batch.value().empty()) {
             co_await sleep_for(options_.sync_poll);
             continue;
@@ -561,6 +621,7 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
             conn->close();
             co_return;
         }
+        if (!is_member(peer)) co_return;
         auto applied = co_await detail::run_on(
             disk_, [drive, fs, peer, hello, entries = std::move(entries).value()]() -> Status {
                 auto& index = drive->index();
@@ -650,8 +711,13 @@ asio::awaitable<void> Service::run_pairing(std::shared_ptr<transport::Connection
     auto peer = conn->peer_key();
     auto address =
         format_address(Udp::endpoint(conn->remote_endpoint().address(), join.value().listen_port));
-    if (!drive_.index().add_device(peer, join.value().name) ||
-        !drive_.set_peer_address(peer, address)) {
+    // A removed key stays removed, invite or not; the device must join with a new key.
+    bool admitted = !drive_.membership().view().removed.contains(peer) &&
+                    drive_.membership().add(drive_.key(), peer, join.value().name, true) &&
+                    refresh_membership(true);
+    if (!admitted || !is_member(peer) || !drive_.set_peer_address(peer, address)) {
+        auto reply = wire::encode_error(wire::ErrorCode::bad_request);
+        (void)co_await stream.value()->write(reply, true);
         conn->close();
         co_return;
     }
@@ -661,6 +727,7 @@ asio::awaitable<void> Service::run_pairing(std::shared_ptr<transport::Connection
     info.secret = drive_.secret();
     info.members.push_back(Member{drive_.key().public_key(), drive_.device_name(), ""});
     if (auto config = drive_.rendezvous()) info.rendezvous = config->to_string();
+    info.membership = drive_.membership().entries();
     auto addresses = drive_.peer_addresses();
     if (auto devices = drive_.index().devices()) {
         for (const auto& d : devices.value()) {
@@ -676,6 +743,116 @@ asio::awaitable<void> Service::run_pairing(std::shared_ptr<transport::Connection
     deadline.cancel();
     // The new member reconnects as a member; this connection served only the pairing.
     conn->close();
+}
+
+Status Service::refresh_membership(bool changed) {
+    auto& membership = drive_.membership();
+    auto now = std::chrono::steady_clock::now();
+    // Members and removals each wait countersign_after, counted from when they were first seen
+    // here and reset if they stop holding.
+    auto view = membership.view();
+    std::erase_if(member_since_, [&](const auto& item) { return !view.members.contains(item.first); });
+    std::erase_if(removed_since_,
+                  [&](const auto& item) { return !view.removal_pending.contains(item.first); });
+    for (const auto& [key, name] : view.members) member_since_.emplace(key, now);
+    for (const auto& key : view.removal_pending) removed_since_.emplace(key, now);
+    auto countersigned = membership.countersign(
+        drive_.key(), [&](const core::PublicKey& key, bool removal) {
+            auto& since = removal ? removed_since_ : member_since_;
+            auto it = since.find(key);
+            return it != since.end() && now - it->second >= options_.countersign_after;
+        });
+    if (!changed && (!countersigned || countersigned.value() == 0)) return {};
+    if (auto st = drive_.save_membership(); !st) return st;
+    auto unpinned = drive_.apply_membership();
+    if (!unpinned) return unpinned.error();
+    for (const auto& key : unpinned.value()) {
+        live_.erase(key);
+        member_since_.erase(key);
+        bool told = false;
+        for (const auto& conn : member_conns_) {
+            if (conn->peer_key() != key) continue;
+            if (told) {
+                conn->close();
+            } else {
+                told = true;
+                asio::co_spawn(io_, farewell(conn), asio::detached);
+            }
+        }
+    }
+    return {};
+}
+
+asio::awaitable<void> Service::farewell(std::shared_ptr<transport::Connection> conn) {
+    auto alive = alive_;
+    // Closed on time even if the removed device withholds stream credit or flow control.
+    auto deadline = std::make_shared<asio::steady_timer>(io_, std::chrono::seconds(2));
+    deadline->async_wait([conn](const std::error_code& ec) {
+        if (!ec) conn->close();
+    });
+    auto stream = co_await conn->open_stream();
+    if (*alive && stream && co_await stream.value()->write(encode_membership({}))) {
+        // Only the entries removing it: their authors are members it vouched for, so it can
+        // verify them, and it learns nothing else about the drive.
+        std::vector<MembershipEntry> removals;
+        for (auto& e : drive_.membership().entries()) {
+            if (e.kind == MembershipEntry::Kind::remove && e.subject == conn->peer_key()) {
+                removals.push_back(std::move(e));
+                if (removals.size() == kMaxMembershipBatch) break;
+            }
+        }
+        if (*alive && co_await stream.value()->write(encode_membership(removals), true)) {
+            co_await sleep_for(std::chrono::milliseconds(500));  // let it arrive before closing
+        }
+    }
+    if (*alive) conn->close();
+}
+
+asio::awaitable<void> Service::push_membership(std::shared_ptr<transport::Connection> conn) {
+    auto alive = alive_;
+    auto stream = co_await conn->open_stream();
+    if (!*alive || !stream) co_return;
+    // An empty batch first says what the stream is for, within the small first-frame limit.
+    if (!co_await stream.value()->write(encode_membership({}))) co_return;
+    std::uint64_t sent = 0;
+    while (*alive && conn->is_open() && is_member(conn->peer_key())) {
+        auto& membership = drive_.membership();
+        if (membership.last_sequence() <= sent) {
+            co_await sleep_for(options_.sync_poll);
+            continue;
+        }
+        std::uint64_t last = sent;
+        auto batch = membership.since(sent, kMaxMembershipBatch, last);
+        if (batch.empty()) {
+            sent = membership.last_sequence();
+            continue;
+        }
+        if (!co_await stream.value()->write(encode_membership(batch))) co_return;
+        if (!*alive) co_return;
+        sent = last;
+    }
+}
+
+asio::awaitable<void> Service::receive_membership(std::shared_ptr<transport::Connection> conn,
+                                                  std::shared_ptr<transport::Stream> stream,
+                                                  wire::Frame first) {
+    auto alive = alive_;
+    auto frame = core::Result<wire::Frame>(std::move(first));
+    for (;;) {
+        if (frame.value().type != wire::FrameType::membership) {
+            conn->close();
+            co_return;
+        }
+        auto entries = decode_membership(frame.value().payload);
+        if (!entries) {
+            conn->close();
+            co_return;
+        }
+        if (!is_member(conn->peer_key())) co_return;
+        if (drive_.membership().merge(entries.value()) > 0) (void)refresh_membership(true);
+        frame = co_await wire::read_frame(*stream, kMaxMembershipFrame);
+        if (!*alive || !frame) co_return;
+    }
 }
 
 asio::awaitable<core::Result<JoinResult>> request_join(transport::Endpoint& endpoint,

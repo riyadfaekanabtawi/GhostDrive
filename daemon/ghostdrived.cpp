@@ -118,6 +118,10 @@ int main(int argc, char** argv) {
                 request_stop();
                 return "stopping\n";
             }
+            if (command.rfind("remove ", 0) == 0) {
+                auto removed = service.remove_member(command.substr(7));
+                return removed ? removed.value() : "error: " + removed.error().message + "\n";
+            }
             if (command.rfind("invite", 0) == 0) {
                 long ttl = 600;
                 if (command.size() > 7) {

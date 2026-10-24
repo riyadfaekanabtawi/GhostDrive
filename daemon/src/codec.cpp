@@ -39,6 +39,8 @@ public:
         bytes(b);
     }
 
+    core::Bytes payload() const { return out_; }
+
     core::Bytes frame(wire::FrameType type) const {
         auto header = wire::encode_header(type, static_cast<std::uint32_t>(out_.size()));
         core::Bytes frame(header.begin(), header.end());
@@ -103,15 +105,6 @@ private:
     }
     std::span<const std::byte> in_;
 };
-
-// Device names are shown in terminals and passed on to other devices; drop control bytes.
-std::string printable(std::string name) {
-    for (auto& c : name) {
-        auto u = static_cast<unsigned char>(c);
-        if (u < 0x20 || u == 0x7F) c = '?';
-    }
-    return name;
-}
 
 Error malformed(const char* what) {
     return Error{Errc::protocol, std::string("malformed ") + what};
@@ -181,7 +174,94 @@ std::optional<core::FileRecord> get_record(Reader& r) {
     return rec;
 }
 
+
+constexpr std::string_view kMembershipContext = "ghostdrive-membership-v1";
+
+void put_entry_body(Writer& w, const MembershipEntry& e) {
+    w.u8(static_cast<std::uint8_t>(e.kind));
+    w.u8(e.invited ? 1 : 0);
+    w.bytes(e.author);
+    w.bytes(e.subject);
+    w.i64(e.time_ms);
+    w.str16(e.name);
+}
+
+void put_entries(Writer& w, std::span<const MembershipEntry> entries) {
+    w.u32(static_cast<std::uint32_t>(entries.size()));
+    for (const auto& e : entries) {
+        put_entry_body(w, e);
+        w.bytes(e.signature);
+    }
+}
+
+std::optional<std::vector<MembershipEntry>> get_entries(Reader& r) {
+    auto count = r.u32();
+    if (!count || *count > kMaxMembershipEntries) return std::nullopt;
+    std::vector<MembershipEntry> out;
+    // A claimed count is not trusted for the allocation; the entries must actually be there.
+    out.reserve(std::min<std::size_t>(*count, 256));
+    for (std::uint32_t i = 0; i < *count; ++i) {
+        MembershipEntry e;
+        auto kind = r.u8();
+        auto invited = r.u8();
+        if (!kind || !invited || !r.fixed(e.author) || !r.fixed(e.subject)) return std::nullopt;
+        auto time = r.i64();
+        auto name = r.str16(kMaxNameBytes);
+        if (!time || !name || !r.fixed(e.signature)) return std::nullopt;
+        if (*kind == static_cast<std::uint8_t>(MembershipEntry::Kind::add)) {
+            if (*invited > 1) return std::nullopt;
+        } else if (*kind == static_cast<std::uint8_t>(MembershipEntry::Kind::remove)) {
+            if (*invited != 0 || !name->empty()) return std::nullopt;
+        } else {
+            return std::nullopt;
+        }
+        if (e.author == e.subject) return std::nullopt;
+        e.kind = static_cast<MembershipEntry::Kind>(*kind);
+        e.invited = *invited == 1;
+        e.time_ms = *time;
+        // Not made printable here: that would change the signed bytes. Names are cleaned
+        // where they are shown or pinned.
+        e.name = std::move(*name);
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
 }  // namespace
+
+std::string printable_name(std::string_view name) {
+    std::string out;
+    out.reserve(name.size());
+    std::size_t i = 0;
+    while (i < name.size()) {
+        auto lead = static_cast<unsigned char>(name[i]);
+        std::size_t len = lead < 0x80 ? 1 : (lead >> 5) == 0x6 ? 2 : (lead >> 4) == 0xE ? 3
+                                          : (lead >> 3) == 0x1E ? 4 : 0;
+        char32_t cp = len == 1 ? lead : len == 2 ? lead & 0x1F : len == 3 ? lead & 0x0F : lead & 0x07;
+        bool valid = len != 0 && i + len <= name.size();
+        for (std::size_t k = 1; valid && k < len; ++k) {
+            auto c = static_cast<unsigned char>(name[i + k]);
+            if ((c & 0xC0) != 0x80) valid = false;
+            cp = (cp << 6) | (c & 0x3F);
+        }
+        // Overlong forms, surrogates and out-of-range values are invalid too.
+        static constexpr char32_t kMin[] = {0, 0, 0x80, 0x800, 0x10000};
+        if (valid && (cp < kMin[len] || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))) {
+            valid = false;
+        }
+        bool control = cp < 0x20 || (cp >= 0x7F && cp <= 0x9F);
+        bool bidi = cp == 0x061C || cp == 0x200E || cp == 0x200F ||
+                    (cp >= 0x202A && cp <= 0x202E) || (cp >= 0x2066 && cp <= 0x2069);
+        if (!valid || control || bidi) {
+            out.push_back('?');
+            i += valid ? len : 1;
+            continue;
+        }
+        out.append(name.substr(i, len));
+        i += len;
+    }
+    return out;
+}
 
 core::Bytes encode_hello(const Hello& hello) {
     Writer w;
@@ -253,7 +333,7 @@ core::Result<Join> decode_join(std::span<const std::byte> payload) {
     auto name = r.str16(kMaxNameBytes);
     auto port = r.u16();
     if (!name || !port || !r.done()) return malformed("Join");
-    join.name = printable(std::move(*name));
+    join.name = printable_name(*name);
     join.listen_port = *port;
     return join;
 }
@@ -270,6 +350,7 @@ core::Bytes encode_drive_info(const DriveInfo& info) {
         w.str16(m.address);
     }
     w.str16(info.rendezvous);
+    put_entries(w, info.membership);
     return w.frame(wire::FrameType::drive_info);
 }
 
@@ -285,14 +366,44 @@ core::Result<DriveInfo> decode_drive_info(std::span<const std::byte> payload) {
         auto name = r.str16(kMaxNameBytes);
         auto address = r.str16(kMaxNameBytes);
         if (!name || !address) return malformed("DriveInfo member");
-        m.name = printable(std::move(*name));
+        m.name = printable_name(*name);
         m.address = std::move(*address);
         info.members.push_back(std::move(m));
     }
     auto rendezvous = r.str16(kMaxNameBytes);
-    if (!rendezvous || !r.done()) return malformed("DriveInfo");
+    if (!rendezvous) return malformed("DriveInfo");
     info.rendezvous = std::move(*rendezvous);
+    auto entries = get_entries(r);
+    if (!entries || !r.done()) return malformed("DriveInfo membership");
+    info.membership = std::move(*entries);
     return info;
+}
+
+core::Bytes membership_signed_bytes(const DriveId& drive, const MembershipEntry& entry) {
+    Writer w;
+    w.bytes(core::as_bytes(kMembershipContext));
+    w.bytes(drive);
+    put_entry_body(w, entry);
+    return w.payload();
+}
+
+core::Bytes encode_membership(std::span<const MembershipEntry> entries) {
+    Writer w;
+    put_entries(w, entries);
+    return w.frame(wire::FrameType::membership);
+}
+
+core::Bytes encode_membership_payload(std::span<const MembershipEntry> entries) {
+    Writer w;
+    put_entries(w, entries);
+    return w.payload();
+}
+
+core::Result<std::vector<MembershipEntry>> decode_membership(std::span<const std::byte> payload) {
+    Reader r(payload);
+    auto entries = get_entries(r);
+    if (!entries || !r.done()) return malformed("Membership");
+    return std::move(*entries);
 }
 
 }  // namespace ghostdrive::daemon

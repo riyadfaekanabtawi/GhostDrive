@@ -303,8 +303,66 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   keys, but such a connection only reaches the pairing exchange: after a valid token (compared
   in constant time, consumed on use) the inviter pins the new key and sends `DriveInfo` (drive
   ID, drive secret, members). SAS comparison for pairing without a code is not built.
-- **Membership does not replicate yet.** A third device joining through A is pinned by A only;
-  B learns of it when membership replication lands.
+- **Membership** replicates as signed entries (`daemon/membership.hpp`), stored in
+  `<data>/membership` and exchanged on one stream per direction of every member connection
+  (frame type 13; an empty batch first, then new entries as they are recorded):
+  - An entry is `add` (the author vouches that the subject belongs to the drive, with its
+    name) or `remove` (the subject is out for good), Ed25519-signed by its author over a
+    context string, the drive ID, and the body. Entries are kept only when their author is
+    reachable by adds from this device; others wait in a bounded pool for their author's add.
+  - Each device computes its own view: every known device is a member, out, or in doubt,
+    settled to a fixpoint (a worklist with counters, linear per round). This device is a
+    member. A device is out if it was ever removed here, if a member removes it, if every
+    device vouching for it is out, or if no chain of vouches through devices that are not out
+    leads to it from this device. It is a member if a member vouches for it and every device
+    that removed it is out. Whatever is still in doubt is not a member. Consequences:
+    - a remove counts only when its author is a member, and a device that a removed device
+      vouches for, including keys it makes up afterwards and loops of such keys vouching for
+      each other, is out;
+    - removes of this device never count here (no member can make a device remove itself),
+      and this device's own removes always do;
+    - removal is permanent: a device that has stood removed by a member for
+      `countersign_after` (at once if this device removed it) is recorded in
+      `<data>/membership` for good and this device signs its own remove for it, so removing
+      the remover later cannot bring it back, here or on a device that hears of both at once.
+      The wait means a remove that a removed device gets to a device before news of its own
+      removal does is undone when that news arrives, instead of becoming permanent;
+    - a contest nobody settled (two devices removing each other, both seen at once) leaves
+      both in doubt; `ghostdrive remove` accepts any known device, so the user settles it.
+  - Pairing makes the first link both ways (inviter adds the new device, the new device adds
+    the inviter, whose key the invite pinned). Each device then vouches for every member that
+    has been one for `countersign_after` (60 s; a new device too, after joining), so members
+    stay members when the device that invited them is removed, and a key that a just-removed
+    device adds gets no vouch from a device that hears of the removal within that time.
+  - The pinned devices in the index follow the view. A device that drops out of it is unpinned,
+    its holdings are forgotten, it gets one last stream with the entries removing it (closed
+    after 2 s whatever it does), and all its connections close. Membership is checked when a
+    member connection starts, on every stream, after every index query, and on every frame
+    received.
+  - Names: this device's own vouch, else an inviting vouch by a member, else any vouch by a
+    member. `ghostdrive status` shows device IDs; `ghostdrive remove` lists the devices the
+    removed one vouched for that no other device invited (advice only: devices it made up can
+    invite each other to hide from the list).
+  - Drives from before this change vouch for their pinned devices when first opened.
+  - Limits: 64 devices that are not out at once (counted for every add that would make a
+    device live, not only new keys), 256 known keys not removed for good, names of at most 64
+    bytes, and 32768 entries: 512 for this device's own, and 126 per other author, so the
+    entries of all authors that are not out always fit. A full log is compacted at most once
+    per change: entries by authors that are out and entries about devices removed for good are
+    dropped (they affect no view), keeping this device's newest 256 removes so others still
+    hear of them. Entries are stored only from authors that are not out here, a remove only
+    for a known device, and the first entry for a statement wins; verified entries are not
+    verified again. Entries that cannot be placed are dropped (the next connection resends
+    everything).
+  - Still open: the drive secret is not rotated after a removal (section 7). Any member can
+    remove any other, and a malicious member can use up device slots (freed when it is
+    removed); both deny service but never keep a removed device in. A malicious member that
+    removes others more than `countersign_after` before its own removal reaches a device wins
+    there, as any member's remove would. A member that churns through hundreds of removals
+    can push old removes out of every device's log, so a device offline throughout may not
+    hear of them. Log compaction is not covered by a test yet (filling the log takes tens of
+    thousands of signatures). Devices a member vouched for while still trusted
+    stay until removed by hand.
 - **Index exchange** follows section 6. Each side opens one stream per connection and sends
   `Hello{index_id, max_sequence}`; the receiver answers `IndexRequest{after}` from its stored
   progress (0 if the index_id changed), and `IndexBatch` frames of up to 256 records follow,
@@ -321,8 +379,7 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   than a day ahead or whose version counters near 2^62 are rejected, so neither can be wrapped;
   a member's claim to hold chunks counts only for the version actually stored; a holder that
   does not answer a GetChunk within 10 s is passed over. Still open: records are not signed, so
-  a member can attribute a change to another device (`modified_by`), and membership changes do
-  not replicate.
+  a member can attribute a change to another device (`modified_by`).
 - **FUSE-T caching**: the macOS NFS client caches attributes and negative lookups, and FUSE-T
   cannot invalidate them (notifications are unsupported on its NFS backend). Mounts use
   `-o noattrcache`, and a directory's mtime is the time its entries last changed on this
@@ -447,9 +504,11 @@ Out of scope for the MVP:
 - friends' devices storing data (needs per-chunk encryption and an encrypted index; section 9).
 
 Revocation:
-1. A member removes a device's key from the membership list. The change replicates and the key
-   is unpinned everywhere.
-2. The drive secret is rotated and redistributed to the remaining members.
+1. A member removes a device's key (`ghostdrive remove`). The signed entry replicates and the
+   key is unpinned everywhere (built; section 3.6).
+2. The drive secret is rotated and redistributed to the remaining members (not built yet).
+   Until then a removed device cannot connect or read anything new, but it can still match
+   members' LAN announcements and register its group with the rendezvous server.
 3. Chunks keyed by the old secret stay valid until they are rewritten.
 
 ## 8. Failure modes

@@ -3,6 +3,7 @@ add_library(ghostdrive_daemon
     src/control.cpp
     src/drive.cpp
     src/invite.cpp
+    src/membership.cpp
     src/service.cpp
 )
 add_library(ghostdrive::daemon ALIAS ghostdrive_daemon)

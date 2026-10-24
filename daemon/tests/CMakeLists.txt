@@ -2,6 +2,7 @@ add_executable(ghostdrive_daemon_tests
     codec_test.cpp
     drive_test.cpp
     invite_test.cpp
+    membership_test.cpp
 )
 target_include_directories(ghostdrive_daemon_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/tests)
 target_link_libraries(ghostdrive_daemon_tests

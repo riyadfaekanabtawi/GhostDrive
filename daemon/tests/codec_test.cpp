@@ -128,6 +128,61 @@ TEST(Codec, JoinAndDriveInfoRoundTrip) {
     ASSERT_EQ(d.value().members.size(), 1u);
     EXPECT_EQ(d.value().members[0].key, m.key);
     EXPECT_EQ(d.value().members[0].address, m.address);
+    EXPECT_TRUE(d.value().membership.empty());
+
+    MembershipEntry e;
+    e.kind = MembershipEntry::Kind::add;
+    e.invited = true;
+    e.author.fill(std::byte{4});
+    e.subject.fill(std::byte{5});
+    e.time_ms = 1'700'000'000'000;
+    e.name = "phone";
+    e.signature.fill(std::byte{6});
+    MembershipEntry r = e;
+    r.kind = MembershipEntry::Kind::remove;
+    r.invited = false;
+    r.name.clear();
+    info.membership = {e, r};
+    auto with = encode_drive_info(info);
+    auto dm = decode_drive_info(payload_of(with, wire::FrameType::drive_info));
+    ASSERT_TRUE(dm);
+    EXPECT_EQ(dm.value().membership, info.membership);
+    auto batch = encode_membership(info.membership);
+    auto b = decode_membership(payload_of(batch, wire::FrameType::membership));
+    ASSERT_TRUE(b);
+    EXPECT_EQ(b.value(), info.membership);
+}
+
+TEST(Codec, PrintableNameKeepsTextAndReplacesControls) {
+    EXPECT_EQ(printable_name("Riyad's MacBook"), "Riyad's MacBook");
+    EXPECT_EQ(printable_name("caf\xC3\xA9"), "caf\xC3\xA9");  // UTF-8 kept
+    EXPECT_EQ(printable_name("a\x1b[2Jb"), "a?[2Jb");
+    EXPECT_EQ(printable_name("a\x9b" "1mb"), "a?1mb");  // raw 8-bit CSI
+    EXPECT_EQ(printable_name("a\xC2\x9B" "b"), "a?b");  // C1 control as UTF-8
+    EXPECT_EQ(printable_name("a\xE2\x80\xAE" "b"), "a?b");  // right-to-left override
+    EXPECT_EQ(printable_name("a\xC0\xAF" "b"), "a??b");  // overlong encoding
+    EXPECT_EQ(printable_name("a\xE2\x80"), "a??");  // truncated sequence
+}
+
+TEST(Codec, MalformedMembershipEntriesAreRejected) {
+    MembershipEntry e;
+    e.author.fill(std::byte{4});
+    e.subject.fill(std::byte{5});
+    e.name = "phone";
+    auto self_add = e;
+    self_add.subject = self_add.author;
+    auto named_remove = e;
+    named_remove.kind = MembershipEntry::Kind::remove;
+    auto unknown_kind = e;
+    unknown_kind.kind = static_cast<MembershipEntry::Kind>(9);
+    for (const auto& bad : {self_add, named_remove, unknown_kind}) {
+        auto frame = encode_membership(std::span(&bad, 1));
+        EXPECT_FALSE(decode_membership(payload_of(frame, wire::FrameType::membership)));
+    }
+    auto good = encode_membership(std::span(&e, 1));
+    auto payload = payload_of(good, wire::FrameType::membership);
+    EXPECT_TRUE(decode_membership(payload));
+    EXPECT_FALSE(decode_membership(payload.first(payload.size() - 1)));
 }
 
 

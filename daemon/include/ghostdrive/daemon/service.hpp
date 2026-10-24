@@ -18,6 +18,7 @@
 #include "ghostdrive/daemon/drive.hpp"
 #include "ghostdrive/daemon/invite.hpp"
 #include "ghostdrive/transport/endpoint.hpp"
+#include "ghostdrive/transport/frame.hpp"
 #include "ghostdrive/vfs/fetcher.hpp"
 #include "ghostdrive/vfs/filesystem.hpp"
 #include "ghostdrive/vfs/tree.hpp"
@@ -48,6 +49,11 @@ struct ServiceOptions {
     std::chrono::milliseconds relay_after{3'000};
     // Testing: skip direct attempts and go straight to the relay.
     bool relay_only = false;
+    // How long a device must have been a member before this device vouches for it too, and
+    // how long a removal must have stood before this device makes it permanent. A removed
+    // device that adds a key, or removes another device, gets neither from a device that
+    // learns of its removal within this time.
+    std::chrono::milliseconds countersign_after{60'000};
 };
 
 struct PeerStatus {
@@ -65,6 +71,7 @@ struct ServiceStatus {
     std::string rendezvous;  // configured server, empty if none
     std::string rendezvous_group;  // hex, for the server's --allow-group
     std::optional<asio::ip::udp::endpoint> observed;  // public address the server sees
+    std::string removed_by;  // set when a member has removed this device from the drive
     std::vector<PeerStatus> peers;
 };
 
@@ -89,6 +96,9 @@ public:
 
     // A one-time invite code valid for `ttl`.
     core::Result<std::string> create_invite(std::chrono::seconds ttl);
+    // Takes a member out of the drive for good, by name or fingerprint. Returns the text for
+    // `ghostdrive remove`.
+    core::Result<std::string> remove_member(const std::string& name_or_id);
     ServiceStatus status() const;
     bool connected_to(const core::PublicKey& key) const { return live_.contains(key); }
 
@@ -111,6 +121,15 @@ private:
     asio::awaitable<void> receive_index(std::shared_ptr<transport::Connection> conn,
                                         std::shared_ptr<transport::Stream> stream, Hello hello);
     asio::awaitable<void> run_pairing(std::shared_ptr<transport::Connection> conn);
+    asio::awaitable<void> push_membership(std::shared_ptr<transport::Connection> conn);
+    asio::awaitable<void> receive_membership(std::shared_ptr<transport::Connection> conn,
+                                             std::shared_ptr<transport::Stream> stream,
+                                             transport::wire::Frame first);
+    // Countersigns members that are due, then, if anything changed, saves, re-pins, and
+    // closes the connections of devices that are no longer members.
+    core::Status refresh_membership(bool changed);
+    // Tells a device just removed why it is being disconnected, then closes the connection.
+    asio::awaitable<void> farewell(std::shared_ptr<transport::Connection> conn);
     void on_lan_sighting(const discovery::LanSighting& sighting);
     asio::awaitable<void> rendezvous_loop();
     asio::awaitable<void> request_peers(std::shared_ptr<transport::Connection> conn,
@@ -145,6 +164,12 @@ private:
     std::set<std::pair<core::PublicKey, asio::ip::udp::endpoint>> dialing_;
     std::vector<PendingInvite> invites_;
     std::map<core::PublicKey, int> member_connections_;
+    // Every open member connection, including the second one when both sides dialed.
+    std::set<std::shared_ptr<transport::Connection>> member_conns_;
+    // When each member was first seen as one, for countersign_after.
+    std::map<core::PublicKey, std::chrono::steady_clock::time_point> member_since_;
+    // When each device was first seen removed by a member, for the same delay.
+    std::map<core::PublicKey, std::chrono::steady_clock::time_point> removed_since_;
     std::size_t pairing_connections_ = 0;
     bool stopped_ = false;
     // Set when the Service goes away; coroutines check it after every suspension.

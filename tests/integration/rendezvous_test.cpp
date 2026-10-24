@@ -106,7 +106,8 @@ protected:
         ASSERT_TRUE(drain([&] { return joined.has_value(); }));
         endpoint->close();
         ASSERT_TRUE(*joined) << joined->error().message;
-        auto b = Drive::join(dir_.path() / "b", "laptop", joined->value().info);
+        auto b = Drive::join(dir_.path() / "b", "laptop", joined->value().info,
+                             drive_a_->key().public_key());
         ASSERT_TRUE(b);
         drive_b_ = std::move(b).value();
         ASSERT_TRUE(drive_b_->rendezvous()) << "the invite should carry the rendezvous setting";

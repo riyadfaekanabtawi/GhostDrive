@@ -39,6 +39,20 @@ The invite code contains the inviting device's full key, so the new device canno
 into joining an impostor; anyone holding the code can join until it is used or expires (10
 minutes by default), so send it privately.
 
+Any device can invite, and a device invited by one is accepted by all the others.
+
+### Removing a device
+
+If a device is lost or stolen, remove it from any other device:
+
+```
+ghostdrive remove old-laptop   # by name, or by its ID (`ghostdrive id` on that device)
+```
+
+The other devices learn of it and stop accepting that device for good; to use it again, give
+it a new identity (delete its data directory) and invite it afresh. If the removed device had
+added devices you do not recognise, the command names them so you can remove those too.
+
 ### Devices on different networks
 
 Run the rendezvous server on any machine with a public IP that accepts UDP (a small VPS is
@@ -65,6 +79,9 @@ works and otherwise through the server's relay, which forwards only encrypted pa
 - A remote file is only readable while a device holding it is online.
 - Streaming speed is bounded by the upload bandwidth of the device serving the data.
 - MVP platforms are Linux and macOS. Windows is phase 2; iOS and Android are phase 3.
+- A removed device still knows the drive's secret until secret rotation lands. It cannot
+  connect or read anything new, but it can still recognise the drive's devices on a LAN and
+  look up their addresses on the rendezvous server.
 - MVP consistency is single writer per file. Concurrent edits from two devices produce a
   conflict copy rather than a merge.
 

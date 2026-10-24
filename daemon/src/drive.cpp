@@ -122,8 +122,10 @@ core::Result<std::unique_ptr<Drive>> assemble(const DrivePaths& paths, core::Dev
     if (!index) return index.error();
     auto store = core::ChunkStore::open(paths.chunks, core::ChunkHasher(secret));
     if (!store) return store.error();
+    Membership membership(id, key.public_key());
     return std::make_unique<Drive>(paths, std::move(key), id, secret, std::move(name),
-                                   std::move(index).value(), std::move(store).value());
+                                   std::move(index).value(), std::move(store).value(),
+                                   std::move(membership));
 }
 
 // Unix socket paths are limited to about 104 bytes (sun_path). A data directory deep enough to
@@ -167,7 +169,8 @@ DrivePaths::DrivePaths(std::filesystem::path r)
       staging(root / "staging"),
       peers(root / "peers"),
       control(control_socket_for(root)),
-      rendezvous(root / "rendezvous") {}
+      rendezvous(root / "rendezvous"),
+      membership(root / "membership") {}
 
 std::filesystem::path default_data_dir() {
     const char* home = std::getenv("HOME");
@@ -188,14 +191,16 @@ std::filesystem::path default_mountpoint() {
 }
 
 Drive::Drive(DrivePaths paths, core::DeviceKey key, DriveId drive_id, core::DriveSecret secret,
-             std::string device_name, core::MetadataIndex index, core::ChunkStore store)
+             std::string device_name, core::MetadataIndex index, core::ChunkStore store,
+             Membership membership)
     : paths_(std::move(paths)),
       key_(std::move(key)),
       drive_id_(drive_id),
       secret_(secret),
       device_name_(std::move(device_name)),
       index_(std::move(index)),
-      store_(std::move(store)) {}
+      store_(std::move(store)),
+      membership_(std::move(membership)) {}
 
 Drive::~Drive() {
     core::secure_zero(secret_);
@@ -235,12 +240,16 @@ core::Result<std::unique_ptr<Drive>> Drive::create(const std::filesystem::path& 
     auto secret = core::generate_drive_secret();
     if (!secret) return secret.error();
     if (auto st = save_drive_file(paths, id, secret.value(), device_name); !st) return st.error();
-    return assemble(paths, std::move(key).value(), id, secret.value(), device_name);
+    auto drive = assemble(paths, std::move(key).value(), id, secret.value(), device_name);
+    if (!drive) return drive.error();
+    if (auto st = drive.value()->save_membership(); !st) return st.error();
+    return drive;
 }
 
 core::Result<std::unique_ptr<Drive>> Drive::join(const std::filesystem::path& root,
                                                  const std::string& device_name,
-                                                 const DriveInfo& info) {
+                                                 const DriveInfo& info,
+                                                 const core::PublicKey& inviter) {
     DrivePaths paths(root);
     if (exists(root))
         return Error{Errc::already_exists, "a drive already exists at " + root.string()};
@@ -254,13 +263,24 @@ core::Result<std::unique_ptr<Drive>> Drive::join(const std::filesystem::path& ro
     if (auto config = RendezvousConfig::parse(info.rendezvous)) {
         (void)drive.value()->set_rendezvous(*config);
     }
+    // The invite code pinned the inviter, so this device vouches for it; the inviter's entries
+    // then vouch for everyone else.
+    auto& d = *drive.value();
+    std::string inviter_name = "device";
     for (const auto& member : info.members) {
-        if (member.key == drive.value()->key().public_key()) continue;
-        if (auto st = drive.value()->index().add_device(member.key, member.name); !st) {
-            return st.error();
-        }
+        if (member.key == inviter) inviter_name = member.name;
+    }
+    if (auto st = d.membership().add(d.key(), inviter, inviter_name, false); !st) return st.error();
+    // It vouches for the others itself only once the daemon has seen them as members for a
+    // while (ServiceOptions::countersign_after).
+    d.membership().merge(info.membership);
+    if (auto st = d.save_membership(); !st) return st.error();
+    if (auto applied = d.apply_membership(); !applied) return applied.error();
+    for (const auto& member : info.members) {
+        auto pinned = d.index().is_pinned(member.key);
+        if (!pinned || !pinned.value()) continue;
         // A bad address from the inviter is not fatal; the member can still dial us.
-        if (!member.address.empty()) (void)drive.value()->set_peer_address(member.key, member.address);
+        if (!member.address.empty()) (void)d.set_peer_address(member.key, member.address);
     }
     return drive;
 }
@@ -295,7 +315,52 @@ core::Result<std::unique_ptr<Drive>> Drive::open(const std::filesystem::path& ro
     if (!key) return key.error();
     auto drive = assemble(paths, std::move(key).value(), id, secret, std::move(name));
     core::secure_zero(secret);
+    if (!drive) return drive.error();
+    auto& opened = *drive.value();
+    auto stored = read_private_file(paths.membership);
+    if (stored) {
+        auto parsed = Membership::parse(stored.value(), id, opened.key().public_key());
+        if (!parsed) return parsed.error();
+        opened.membership_ = std::move(parsed).value();
+    } else if (stored.error().code == Errc::not_found) {
+        // A drive from before membership entries: vouch for the devices pinned so far.
+        auto devices = opened.index().devices();
+        if (!devices) return devices.error();
+        for (const auto& device : devices.value()) {
+            if (auto st = opened.membership_.add(opened.key(), device.key, device.name, false); !st) {
+                return st.error();
+            }
+        }
+        if (auto st = opened.save_membership(); !st) return st.error();
+    } else {
+        return stored.error();
+    }
     return drive;
+}
+
+Status Drive::save_membership() {
+    return write_private_file(paths_.membership, membership_.serialize());
+}
+
+core::Result<std::vector<core::PublicKey>> Drive::apply_membership() {
+    auto view = membership_.view();
+    auto devices = index_.devices();
+    if (!devices) return devices.error();
+    std::vector<core::PublicKey> unpinned;
+    for (const auto& device : devices.value()) {
+        if (view.members.contains(device.key)) continue;
+        if (auto st = index_.remove_device(device.key); !st) return st.error();
+        unpinned.push_back(device.key);
+    }
+    for (const auto& [key, name] : view.members) {
+        auto pinned = index_.is_pinned(key);
+        if (!pinned) return pinned.error();
+        if (pinned.value()) continue;
+        auto st = index_.add_device(key, name);
+        // Another key with the same 64-bit short ID cannot be told apart in version vectors.
+        if (!st && st.error().code != Errc::already_exists) return st.error();
+    }
+    return unpinned;
 }
 
 std::map<core::PublicKey, std::string> Drive::peer_addresses() const {

@@ -14,6 +14,7 @@
 #include "ghostdrive/core/metadata_index.hpp"
 #include "ghostdrive/core/result.hpp"
 #include "ghostdrive/daemon/codec.hpp"
+#include "ghostdrive/daemon/membership.hpp"
 
 namespace ghostdrive::daemon {
 
@@ -30,6 +31,7 @@ struct DrivePaths {
     std::filesystem::path peers;    // last known address of each member device
     std::filesystem::path control;  // Unix socket of the running daemon
     std::filesystem::path rendezvous;  // "host:port FINGERPRINT" of the rendezvous server
+    std::filesystem::path membership;  // signed membership entries, 0600
 };
 
 // Default data directory: ~/Library/Application Support/GhostDrive on macOS,
@@ -53,10 +55,11 @@ public:
     // A new drive with this device as its only member.
     static core::Result<std::unique_ptr<Drive>> create(const std::filesystem::path& root,
                                                        const std::string& device_name);
-    // Joins the drive described by `info`, received from a member during pairing.
+    // Joins the drive described by `info`, received from `inviter` during pairing.
     static core::Result<std::unique_ptr<Drive>> join(const std::filesystem::path& root,
                                                      const std::string& device_name,
-                                                     const DriveInfo& info);
+                                                     const DriveInfo& info,
+                                                     const core::PublicKey& inviter);
     static core::Result<std::unique_ptr<Drive>> open(const std::filesystem::path& root);
     // The device key, created on first use. Joining needs it before the drive exists.
     static core::Result<core::DeviceKey> load_or_create_key(const std::filesystem::path& root);
@@ -71,6 +74,13 @@ public:
     core::ChunkStore& store() noexcept { return store_; }
     core::HybridClock& clock() noexcept { return clock_; }
 
+    // Not thread-safe; the daemon uses it from its I/O executor only.
+    Membership& membership() noexcept { return membership_; }
+    core::Status save_membership();
+    // Brings the pinned devices in the index in line with the membership view. Returns the
+    // devices that were unpinned.
+    core::Result<std::vector<core::PublicKey>> apply_membership();
+
     // Thread-safe.
     std::map<core::PublicKey, std::string> peer_addresses() const;
     core::Status set_peer_address(const core::PublicKey& key, const std::string& address);
@@ -81,7 +91,8 @@ public:
     core::Status set_rendezvous(const RendezvousConfig& config);
 
     Drive(DrivePaths paths, core::DeviceKey key, DriveId drive_id, core::DriveSecret secret,
-          std::string device_name, core::MetadataIndex index, core::ChunkStore store);
+          std::string device_name, core::MetadataIndex index, core::ChunkStore store,
+          Membership membership);
     ~Drive();
 
 private:
@@ -93,6 +104,7 @@ private:
     core::MetadataIndex index_;
     core::ChunkStore store_;
     core::HybridClock clock_;
+    Membership membership_;
     mutable std::mutex peers_mutex_;
 };
 

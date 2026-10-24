@@ -40,9 +40,11 @@ ServiceOptions loopback_options() {
 class TwoDevices : public ::testing::Test {
 protected:
     ~TwoDevices() override {
+        if (c_) c_->stop();
         if (b_) b_->stop();
         if (a_) a_->stop();
         drain([] { return false; }, 300ms);
+        c_.reset();
         b_.reset();
         a_.reset();
         disk_.join();
@@ -94,7 +96,8 @@ protected:
         ASSERT_TRUE(code);
         auto joined = join_with(code.value(), "b");
         ASSERT_TRUE(joined) << joined.error().message;
-        auto drive = Drive::join(dir_.path() / "b", "laptop", joined.value().info);
+        auto drive = Drive::join(dir_.path() / "b", "laptop", joined.value().info,
+                                 drive_a_->key().public_key());
         ASSERT_TRUE(drive) << drive.error().message;
         auto addr = joined.value().inviter_address;
         ASSERT_TRUE(drive.value()->set_peer_address(
@@ -108,6 +111,26 @@ protected:
             return a_->connected_to(drive_b_->key().public_key()) &&
                    b_->connected_to(drive_a_->key().public_key());
         })) << "devices did not connect";
+    }
+
+    // A third device, invited by A. It is given B's address, so the test is about membership
+    // reaching B, not about finding B.
+    void start_c() {
+        auto code = a_->create_invite(60s);
+        ASSERT_TRUE(code);
+        auto joined = join_with(code.value(), "c");
+        ASSERT_TRUE(joined) << joined.error().message;
+        auto drive = Drive::join(dir_.path() / "c", "c", joined.value().info,
+                                 drive_a_->key().public_key());
+        ASSERT_TRUE(drive) << drive.error().message;
+        ASSERT_TRUE(drive.value()->set_peer_address(drive_a_->key().public_key(),
+                                                    "127.0.0.1:" + std::to_string(a_->port())));
+        ASSERT_TRUE(drive.value()->set_peer_address(drive_b_->key().public_key(),
+                                                    "127.0.0.1:" + std::to_string(b_->port())));
+        drive_c_ = std::move(drive).value();
+        c_ = std::make_unique<Service>(io_.get_executor(), disk_.get_executor(), *drive_c_,
+                                       loopback_options());
+        ASSERT_TRUE(c_->start());
     }
 
     // Writes a file in the root of `fs`.
@@ -149,8 +172,10 @@ protected:
     asio::thread_pool disk_{4};
     std::unique_ptr<Drive> drive_a_;
     std::unique_ptr<Drive> drive_b_;
+    std::unique_ptr<Drive> drive_c_;
     std::unique_ptr<Service> a_;
     std::unique_ptr<Service> b_;
+    std::unique_ptr<Service> c_;
 };
 
 TEST_F(TwoDevices, JoinedDeviceSharesTheDriveSecret) {
@@ -269,7 +294,8 @@ TEST_F(TwoDevices, DevicesFindEachOtherOnTheLanWithoutStoredAddresses) {
     ASSERT_TRUE(code);
     auto joined = join_with(code.value(), "b");
     ASSERT_TRUE(joined) << joined.error().message;
-    auto drive = Drive::join(dir_.path() / "b", "laptop", joined.value().info);
+    auto drive = Drive::join(dir_.path() / "b", "laptop", joined.value().info,
+                                 drive_a_->key().public_key());
     ASSERT_TRUE(drive);
     // Both sides know only addresses that lead nowhere.
     ASSERT_TRUE(drive.value()->set_peer_address(drive_a_->key().public_key(), "127.0.0.1:9"));
@@ -288,6 +314,68 @@ TEST_F(TwoDevices, DevicesFindEachOtherOnTheLanWithoutStoredAddresses) {
     // The address found on the LAN replaced the dead one.
     EXPECT_NE(drive_b_->peer_addresses().at(drive_a_->key().public_key()), "127.0.0.1:9");
 #endif
+}
+
+TEST_F(TwoDevices, ADeviceInvitedByOneMemberIsAcceptedByTheOthers) {
+    start_a();
+    start_b();
+    start_c();
+    auto c = drive_c_->key().public_key();
+    ASSERT_TRUE(drain([&] {
+        return b_->connected_to(c) && c_->connected_to(drive_b_->key().public_key());
+    })) << "B never accepted C";
+    auto status = b_->status();
+    auto it = std::find_if(status.peers.begin(), status.peers.end(),
+                           [&](const PeerStatus& p) { return p.key == c; });
+    ASSERT_NE(it, status.peers.end());
+    EXPECT_EQ(it->name, "c");
+
+    // Files flow between the two devices that were never paired directly.
+    auto data = random_bytes(300'000, 9);
+    write_file(c_->filesystem(), "from-c.bin", data);
+    ASSERT_TRUE(drain([&] {
+        auto ino = b_->filesystem().lookup(vfs::kRootIno, "from-c.bin");
+        return ino && b_->filesystem().getattr(*ino)->size == data.size();
+    }));
+    auto got = read_file(b_->filesystem(), "from-c.bin");
+    ASSERT_TRUE(got);
+    EXPECT_TRUE(*got == data);
+}
+
+TEST_F(TwoDevices, ARemovedDeviceIsCutOffEverywhere) {
+    start_a();
+    start_b();
+    start_c();
+    auto b = drive_b_->key().public_key();
+    auto c = drive_c_->key().public_key();
+    ASSERT_TRUE(drain([&] { return b_->connected_to(c) && a_->connected_to(c); }));
+
+    EXPECT_FALSE(a_->remove_member("desk")) << "a device cannot remove itself";
+    EXPECT_FALSE(a_->remove_member("nobody"));
+    auto removed = a_->remove_member("c");
+    ASSERT_TRUE(removed) << removed.error().message;
+    EXPECT_NE(removed.value().find("Removed c"), std::string::npos) << removed.value();
+
+    ASSERT_TRUE(drain([&] {
+        return !a_->connected_to(c) && !b_->connected_to(c) &&
+               !drive_b_->index().is_pinned(c).value();
+    })) << "B still accepts C";
+    EXPECT_TRUE(drive_b_->membership().view().removed.contains(c));
+    // A tells C why it is being cut off.
+    EXPECT_TRUE(drain([&] { return c_->status().removed_by == "desk"; }));
+
+    // C keeps trying its stored addresses; nobody lets it back in.
+    drain([] { return false; }, 1500ms);
+    EXPECT_FALSE(a_->connected_to(c));
+    EXPECT_FALSE(b_->connected_to(c));
+    EXPECT_TRUE(a_->connected_to(b));
+
+    // Its key stays out even with a fresh invite.
+    auto code = a_->create_invite(60s);
+    ASSERT_TRUE(code);
+    c_->stop();
+    auto rejoin = join_with(code.value(), "c");
+    EXPECT_FALSE(rejoin);
 }
 
 }  // namespace

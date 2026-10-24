@@ -57,24 +57,65 @@ TEST(Drive, CreateRefusesToReplaceAnExistingDrive) {
     EXPECT_FALSE(Drive::open(dir.path() / "missing"));
 }
 
-TEST(Drive, JoinPinsTheMembersItWasGiven) {
+TEST(Drive, JoinPinsTheMembersTheInviterVouchesFor) {
     test::TempDir dir;
     auto inviter = Drive::create(dir.path() / "a", "desk");
     ASSERT_TRUE(inviter);
-    DriveInfo info;
-    info.drive_id = inviter.value()->drive_id();
-    info.secret = inviter.value()->secret();
-    info.members.push_back(Member{inviter.value()->key().public_key(), "desk", ""});
-    core::PublicKey other{};
-    other.fill(std::byte{9});
-    info.members.push_back(Member{other, "phone", "10.0.0.9:7373"});
+    auto& a = *inviter.value();
+    auto phone = core::DeviceKey::generate();
+    ASSERT_TRUE(phone);
+    ASSERT_TRUE(a.membership().add(a.key(), phone.value().public_key(), "phone", true));
+    core::PublicKey stranger{};
+    stranger.fill(std::byte{9});
 
-    auto joined = Drive::join(dir.path() / "b", "laptop", info);
+    DriveInfo info;
+    info.drive_id = a.drive_id();
+    info.secret = a.secret();
+    info.members.push_back(Member{a.key().public_key(), "desk", ""});
+    info.members.push_back(Member{phone.value().public_key(), "phone", "10.0.0.9:7373"});
+    // Listed, but no member vouches for it.
+    info.members.push_back(Member{stranger, "stranger", "10.0.0.10:7373"});
+    info.membership = a.membership().entries();
+
+    auto joined = Drive::join(dir.path() / "b", "laptop", info, a.key().public_key());
     ASSERT_TRUE(joined) << joined.error().message;
-    EXPECT_EQ(joined.value()->drive_id(), info.drive_id);
-    EXPECT_TRUE(joined.value()->index().is_pinned(inviter.value()->key().public_key()).value());
-    EXPECT_TRUE(joined.value()->index().is_pinned(other).value());
-    EXPECT_EQ(joined.value()->peer_addresses().at(other), "10.0.0.9:7373");
+    auto& b = *joined.value();
+    EXPECT_EQ(b.drive_id(), info.drive_id);
+    EXPECT_TRUE(b.index().is_pinned(a.key().public_key()).value());
+    EXPECT_TRUE(b.index().is_pinned(phone.value().public_key()).value());
+    EXPECT_FALSE(b.index().is_pinned(stranger).value());
+    EXPECT_EQ(b.peer_addresses().at(phone.value().public_key()), "10.0.0.9:7373");
+    EXPECT_FALSE(b.peer_addresses().contains(stranger));
+
+    // The membership is stored and survives reopening.
+    auto key_b = b.key().public_key();
+    joined.value().reset();
+    auto reopened = Drive::open(dir.path() / "b");
+    ASSERT_TRUE(reopened) << reopened.error().message;
+    auto view = reopened.value()->membership().view();
+    EXPECT_TRUE(view.members.contains(a.key().public_key()));
+    EXPECT_TRUE(view.members.contains(phone.value().public_key()));
+    EXPECT_EQ(view.members.size(), 2u);
+    EXPECT_EQ(reopened.value()->key().public_key(), key_b);
+}
+
+TEST(Drive, OpeningAnOlderDriveVouchesForItsPinnedDevices) {
+    test::TempDir dir;
+    auto root = dir.path() / "a";
+    core::PublicKey other{};
+    other.fill(std::byte{5});
+    {
+        auto created = Drive::create(root, "desk");
+        ASSERT_TRUE(created);
+        ASSERT_TRUE(created.value()->index().add_device(other, "phone"));
+    }
+    std::filesystem::remove(DrivePaths(root).membership);
+    auto opened = Drive::open(root);
+    ASSERT_TRUE(opened) << opened.error().message;
+    auto view = opened.value()->membership().view();
+    ASSERT_TRUE(view.members.contains(other));
+    EXPECT_EQ(view.members.at(other), "phone");
+    EXPECT_TRUE(std::filesystem::exists(DrivePaths(root).membership));
 }
 
 TEST(Drive, PeerAddressesPersist) {
