@@ -1,5 +1,6 @@
 add_executable(ghostdrive_core_tests
     bytes_test.cpp
+    chunk_cache_test.cpp
     chunk_id_test.cpp
     chunk_store_test.cpp
     chunking_test.cpp

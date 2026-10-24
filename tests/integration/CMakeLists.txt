@@ -1,10 +1,12 @@
 add_executable(ghostdrive_integration_tests
     transport_loopback_test.cpp
+    vfs_remote_read_test.cpp
 )
 target_include_directories(ghostdrive_integration_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/tests)
 target_link_libraries(ghostdrive_integration_tests
     PRIVATE
         ghostdrive::transport
+        ghostdrive::vfs
         GTest::gtest_main
         ghostdrive_warnings
 )

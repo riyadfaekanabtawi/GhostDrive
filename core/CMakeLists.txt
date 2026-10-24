@@ -1,5 +1,6 @@
 add_library(ghostdrive_core
     src/bytes.cpp
+    src/chunk_cache.cpp
     src/chunk_id.cpp
     src/chunk_store.cpp
     src/chunking.cpp

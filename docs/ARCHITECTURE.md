@@ -122,7 +122,8 @@ document assumes the corrected version.
 - **Fetcher.** Resolves a chunk ID to candidate peers: online devices whose index advertises that
   chunk as held. It ranks them LAN first, then by RTT, then by load. It requests the chunk, verifies
   its hash, retries another peer on mismatch or timeout, and coalesces concurrent requests for the
-  same chunk.
+  same chunk. Because it talks to peers it lives in `vfs/` (core has no networking); the chunk
+  cache stays in core. Ranking is not implemented yet: holders are tried in device key order.
 
 ### 3.2 transport/
 - ngtcp2 (sans-IO) driven by our own event loop. One UDP socket per address family, shared by
@@ -158,8 +159,11 @@ document assumes the corrected version.
 ### 3.3 vfs/
 - libfuse3 **low-level** API (`fuse_lowlevel_ops`) on both Linux and macOS (FUSE-T). The
   low-level API is inode-based and allows replying to a `fuse_req_t` later from another thread,
-  which is how async fetches complete without blocking a FUSE thread per read. FUSE-T's
-  low-level API coverage is unverified and is the first thing to check in step (c).
+  which is how async fetches complete without blocking a FUSE thread per read. Checked in step (c)
+  against the FUSE-T 1.2.6 package: it ships libfuse 3.19 headers (an LGPL fork of osxfuse/libfuse)
+  and `libfuse3.4.dylib` exports the whole low-level surface (`fuse_session_new_versioned`,
+  `fuse_session_loop_mt`, `fuse_reply_iov`, `fuse_reply_data`, `fuse_lowlevel_notify_*`). The
+  adapter uses `FUSE_USE_VERSION 35`, which Linux libfuse 3.5+ shares.
 - `open` pins a file version (version vector plus chunk list) into the file handle, so a remote
   edit during streaming cannot mix versions. The next `open` sees the new version.
 - MVP is read-mostly: writes go to a local staging file and are chunked and committed to the
