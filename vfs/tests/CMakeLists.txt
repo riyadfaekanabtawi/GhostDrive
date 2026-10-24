@@ -1,6 +1,7 @@
 add_executable(ghostdrive_vfs_tests
     file_view_test.cpp
     tree_test.cpp
+    write_test.cpp
 )
 target_include_directories(ghostdrive_vfs_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/tests)
 target_link_libraries(ghostdrive_vfs_tests

@@ -74,10 +74,29 @@ protected:
         disk_.join();
     }
 
-    void start(ConnectionLookup peers = nullptr) {
+    void remount() {
+        mount_.reset();
+        auto mounted = FuseMount::mount(*fs_, mountpoint_);
+        ASSERT_TRUE(mounted) << mounted.error().message;
+        mount_ = std::move(mounted).value();
+    }
+
+    std::optional<core::FileRecord> indexed(const std::string& path) {
+        auto r = index_.get(path);
+        if (!r || !r.value() || r.value()->deleted) return std::nullopt;
+        return *r.value();
+    }
+
+    void start(ConnectionLookup peers = nullptr, bool writable = false) {
         fetcher_ = std::make_unique<Fetcher>(io_.get_executor(), disk_.get_executor(), store_,
                                              index_, cache_, std::move(peers));
-        fs_ = std::make_unique<Filesystem>(io_.get_executor(), tree_, *fetcher_);
+        std::optional<WriteSupport> writes;
+        if (writable) {
+            writes.emplace(WriteSupport{store_, index_, clock_, disk_.get_executor(),
+                                        dir_.path() / "staging"});
+        }
+        fs_ = std::make_unique<Filesystem>(io_.get_executor(), tree_, *fetcher_,
+                                           FilesystemOptions{}, std::move(writes));
         io_thread_ = std::thread([this] { io_.run(); });
         auto mounted = FuseMount::mount(*fs_, mountpoint_);
         ASSERT_TRUE(mounted) << mounted.error().message;
@@ -237,6 +256,80 @@ TEST_F(Mount, ReadsAFileWhoseChunksAreOnlyOnAPeer) {
     auto s = stats.get_future().get();
     EXPECT_EQ(s.remote_fetches, record.chunks.size());
     EXPECT_EQ(s.hash_mismatches, 0u);
+}
+
+TEST_F(Mount, WritesThroughTheMountReachTheIndex) {
+    start(nullptr, true);
+    auto file = mountpoint_ / "hello.txt";
+    { std::ofstream(file) << "hello"; }
+    { std::ofstream(file, std::ios::app) << ", world\n"; }
+    EXPECT_EQ(read_whole(file).size(), 13u);
+    auto record = indexed("hello.txt");
+    ASSERT_TRUE(record);
+    EXPECT_EQ(record->size, 13u);
+
+    // A multi-block file, then an in-place patch in the middle.
+    auto big = random_bytes(3 * core::kMinBlockSize + 4321, 7);
+    {
+        std::ofstream out(mountpoint_ / "big.bin", std::ios::binary);
+        out.write(reinterpret_cast<const char*>(big.data()), static_cast<std::streamsize>(big.size()));
+    }
+    auto before = indexed("big.bin");
+    ASSERT_TRUE(before);
+    EXPECT_EQ(before->size, big.size());
+    int fd = ::open((mountpoint_ / "big.bin").c_str(), O_RDWR);
+    ASSERT_GE(fd, 0) << std::strerror(errno);
+    auto patch = random_bytes(64, 8);
+    off_t offset = static_cast<off_t>(core::kMinBlockSize) + 100;
+    ASSERT_EQ(::pwrite(fd, patch.data(), patch.size(), offset), static_cast<ssize_t>(patch.size()));
+    ASSERT_EQ(::close(fd), 0) << std::strerror(errno);
+    std::copy(patch.begin(), patch.end(), big.begin() + offset);
+    EXPECT_TRUE(read_whole(mountpoint_ / "big.bin") == big);
+    auto after = indexed("big.bin");
+    ASSERT_TRUE(after);
+    ASSERT_EQ(after->chunks.size(), before->chunks.size());
+    EXPECT_EQ(after->chunks[0], before->chunks[0]);
+    EXPECT_NE(after->chunks[1], before->chunks[1]);
+    EXPECT_EQ(after->chunks[2], before->chunks[2]);
+
+    ASSERT_EQ(::truncate((mountpoint_ / "big.bin").c_str(), 1000), 0) << std::strerror(errno);
+    EXPECT_EQ(std::filesystem::file_size(mountpoint_ / "big.bin"), 1000u);
+    EXPECT_EQ(indexed("big.bin")->size, 1000u);
+}
+
+TEST_F(Mount, DirectoryOperationsThroughTheMount) {
+    start(nullptr, true);
+    std::filesystem::create_directory(mountpoint_ / "docs");
+    { std::ofstream(mountpoint_ / "docs" / "a.txt") << "a"; }
+    std::filesystem::create_directories(mountpoint_ / "empty" / "nested");
+    EXPECT_TRUE(std::filesystem::is_directory(mountpoint_ / "empty" / "nested"));
+
+    std::filesystem::rename(mountpoint_ / "docs" / "a.txt", mountpoint_ / "docs" / "b.txt");
+    EXPECT_FALSE(std::filesystem::exists(mountpoint_ / "docs" / "a.txt"));
+    EXPECT_EQ(read_whole(mountpoint_ / "docs" / "b.txt").size(), 1u);
+
+    std::filesystem::rename(mountpoint_ / "docs", mountpoint_ / "papers");
+    EXPECT_TRUE(std::filesystem::exists(mountpoint_ / "papers" / "b.txt"));
+    EXPECT_TRUE(indexed("papers/b.txt"));
+    EXPECT_FALSE(indexed("docs/b.txt"));
+
+    std::error_code ec;
+    EXPECT_FALSE(std::filesystem::remove(mountpoint_ / "papers", ec));  // not empty
+    EXPECT_TRUE(std::filesystem::remove(mountpoint_ / "papers" / "b.txt"));
+    EXPECT_TRUE(std::filesystem::remove(mountpoint_ / "papers"));
+    EXPECT_FALSE(std::filesystem::exists(mountpoint_ / "papers"));
+    EXPECT_FALSE(indexed("papers/b.txt"));
+}
+
+TEST_F(Mount, WrittenFilesSurviveARemount) {
+    start(nullptr, true);
+    auto data = random_bytes(200'000, 9);
+    {
+        std::ofstream out(mountpoint_ / "keep.bin", std::ios::binary);
+        out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    }
+    remount();
+    EXPECT_TRUE(read_whole(mountpoint_ / "keep.bin") == data);
 }
 
 }  // namespace

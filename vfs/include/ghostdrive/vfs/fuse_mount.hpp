@@ -19,7 +19,8 @@ struct FuseMountOptions {
     std::vector<std::string> extra_options;
 };
 
-// A read-only libfuse3 low-level mount of a Filesystem (Linux libfuse3, macOS FUSE-T). The
+// A libfuse3 low-level mount of a Filesystem (Linux libfuse3, macOS FUSE-T),
+// read-only unless the Filesystem has WriteSupport. The
 // session loop runs on its own threads; reads are answered from the Filesystem's executor.
 // mount() returns once the mount is visible, and sets SIGPIPE to ignored for the process.
 class FuseMount {

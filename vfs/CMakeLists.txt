@@ -4,6 +4,7 @@ add_library(ghostdrive_vfs
     src/file_view.cpp
     src/filesystem.cpp
     src/tree.cpp
+    src/write_handle.cpp
 )
 add_library(ghostdrive::vfs ALIAS ghostdrive_vfs)
 

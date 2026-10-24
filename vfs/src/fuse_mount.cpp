@@ -16,6 +16,7 @@
 #include <csignal>
 #include <cstring>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -73,6 +74,20 @@ struct stat to_stat(const Attr& attr) {
     return st;
 }
 
+fuse_entry_param entry_for(const FuseMount::Impl& self, const Attr& attr) {
+    fuse_entry_param entry{};
+    entry.ino = attr.ino;
+    entry.generation = 0;  // inode numbers are never reused
+    entry.attr = to_stat(attr);
+    entry.attr_timeout = self.options.attr_timeout_s;
+    entry.entry_timeout = self.options.entry_timeout_s;
+    return entry;
+}
+
+void reply_status(fuse_req_t req, const core::Status& st) {
+    fuse_reply_err(req, st ? 0 : to_errno(st.error()));
+}
+
 void op_lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
     auto& self = impl_of(req);
     auto ino = self.fs.lookup(parent, name);
@@ -81,12 +96,7 @@ void op_lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-    fuse_entry_param entry{};
-    entry.ino = attr->ino;
-    entry.generation = 0;  // inode numbers are never reused
-    entry.attr = to_stat(*attr);
-    entry.attr_timeout = self.options.attr_timeout_s;
-    entry.entry_timeout = self.options.entry_timeout_s;
+    auto entry = entry_for(self, *attr);
     fuse_reply_entry(req, &entry);
 }
 
@@ -163,13 +173,11 @@ void op_releasedir(fuse_req_t req, fuse_ino_t, fuse_file_info* fi) {
 
 void op_open(fuse_req_t req, fuse_ino_t ino, fuse_file_info* fi) {
     auto& self = impl_of(req);
-    if ((fi->flags & O_ACCMODE) != O_RDONLY || (fi->flags & O_TRUNC) != 0) {
-        fuse_reply_err(req, EROFS);
-        return;
-    }
-    auto handle = self.fs.open(ino);
+    bool write = (fi->flags & O_ACCMODE) != O_RDONLY;
+    bool truncate = (fi->flags & O_TRUNC) != 0;
+    auto handle = self.fs.open(ino, write, write && truncate);
     if (!handle) {
-        fuse_reply_err(req, self.fs.getattr(ino) ? EISDIR : ENOENT);
+        fuse_reply_err(req, to_errno(handle.error()));
         return;
     }
     fi->fh = handle.value();
@@ -233,6 +241,123 @@ bool wait_until_mounted(const std::filesystem::path& mountpoint, std::chrono::mi
     return false;
 }
 
+void op_create(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode,
+               fuse_file_info* fi) {
+    auto& self = impl_of(req);
+    auto created = self.fs.create(parent, name, static_cast<std::uint32_t>(mode) & 07777);
+    if (!created) {
+        fuse_reply_err(req, to_errno(created.error()));
+        return;
+    }
+    auto entry = entry_for(self, created.value().first);
+    fi->fh = created.value().second;
+    fi->keep_cache = 0;
+    fuse_reply_create(req, &entry, fi);
+}
+
+void op_mkdir(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode) {
+    auto& self = impl_of(req);
+    auto attr = self.fs.mkdir(parent, name, static_cast<std::uint32_t>(mode) & 07777);
+    if (!attr) {
+        fuse_reply_err(req, to_errno(attr.error()));
+        return;
+    }
+    auto entry = entry_for(self, attr.value());
+    fuse_reply_entry(req, &entry);
+}
+
+void op_unlink(fuse_req_t req, fuse_ino_t parent, const char* name) {
+    reply_status(req, impl_of(req).fs.unlink(parent, name));
+}
+
+void op_rmdir(fuse_req_t req, fuse_ino_t parent, const char* name) {
+    reply_status(req, impl_of(req).fs.rmdir(parent, name));
+}
+
+void op_rename(fuse_req_t req, fuse_ino_t parent, const char* name, fuse_ino_t new_parent,
+               const char* new_name, unsigned int flags) {
+    // Only "fail if the target exists" (Linux RENAME_NOREPLACE, value 1) is supported; an
+    // atomic exchange is not.
+    constexpr unsigned int kNoReplace = 1;
+    if ((flags & ~kNoReplace) != 0) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    reply_status(req, impl_of(req).fs.rename(parent, name, new_parent, new_name,
+                                             (flags & kNoReplace) != 0));
+}
+
+void op_write(fuse_req_t req, fuse_ino_t, const char* buf, size_t size, off_t off,
+              fuse_file_info* fi) {
+    if (off < 0) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    // COPY: the kernel's write buffer is only valid during this call, and the write completes
+    // later on the filesystem's executor.
+    auto bytes = std::as_bytes(std::span(buf, size));
+    core::Bytes data(bytes.begin(), bytes.end());
+    impl_of(req).fs.write(fi->fh, static_cast<std::uint64_t>(off), std::move(data),
+                          [req, size](core::Status st) {
+                              if (!st) {
+                                  fuse_reply_err(req, to_errno(st.error()));
+                                  return;
+                              }
+                              fuse_reply_write(req, size);
+                          });
+}
+
+void op_flush(fuse_req_t req, fuse_ino_t, fuse_file_info* fi) {
+    impl_of(req).fs.flush(fi->fh, [req](core::Status st) { reply_status(req, st); });
+}
+
+void op_fsync(fuse_req_t req, fuse_ino_t, int, fuse_file_info* fi) {
+    impl_of(req).fs.flush(fi->fh, [req](core::Status st) { reply_status(req, st); });
+}
+
+std::int64_t to_ns(const timespec& ts) {
+    return static_cast<std::int64_t>(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
+}
+
+void op_setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
+                fuse_file_info* fi) {
+    auto& self = impl_of(req);
+    SetAttr changes;
+    if ((to_set & FUSE_SET_ATTR_SIZE) != 0) {
+        if (attr->st_size < 0) {
+            fuse_reply_err(req, EINVAL);
+            return;
+        }
+        changes.size = static_cast<std::uint64_t>(attr->st_size);
+    }
+    if ((to_set & FUSE_SET_ATTR_MODE) != 0) {
+        changes.perm = static_cast<std::uint32_t>(attr->st_mode) & 07777;
+    }
+    if ((to_set & FUSE_SET_ATTR_MTIME_NOW) != 0) {
+        changes.mtime_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+    } else if ((to_set & FUSE_SET_ATTR_MTIME) != 0) {
+#ifdef __APPLE__
+        changes.mtime_ns = to_ns(attr->st_mtimespec);
+#else
+        changes.mtime_ns = to_ns(attr->st_mtim);
+#endif
+    }
+    // Ownership and access times are not stored; accept them without effect.
+    std::optional<std::uint64_t> handle;
+    if (fi != nullptr) handle = fi->fh;
+    double timeout = self.options.attr_timeout_s;
+    self.fs.setattr(ino, changes, handle, [req, timeout](core::Result<Attr> result) {
+        if (!result) {
+            fuse_reply_err(req, to_errno(result.error()));
+            return;
+        }
+        auto st = to_stat(result.value());
+        fuse_reply_attr(req, &st, timeout);
+    });
+}
+
 const fuse_lowlevel_ops kOps = [] {
     fuse_lowlevel_ops ops{};
     ops.lookup = op_lookup;
@@ -245,6 +370,15 @@ const fuse_lowlevel_ops kOps = [] {
     ops.readdir = op_readdir;
     ops.releasedir = op_releasedir;
     ops.statfs = op_statfs;
+    ops.create = op_create;
+    ops.mkdir = op_mkdir;
+    ops.unlink = op_unlink;
+    ops.rmdir = op_rmdir;
+    ops.rename = op_rename;
+    ops.write = op_write;
+    ops.flush = op_flush;
+    ops.fsync = op_fsync;
+    ops.setattr = op_setattr;
     return ops;
 }();
 
@@ -268,7 +402,8 @@ core::Result<std::unique_ptr<FuseMount>> FuseMount::mount(Filesystem& fs,
     // to it after the server side closes must fail with EPIPE instead of killing the process.
     std::signal(SIGPIPE, SIG_IGN);
 
-    std::vector<std::string> args{"ghostdrive", "-o", "ro", "-o", "fsname=ghostdrive"};
+    std::vector<std::string> args{"ghostdrive", "-o", "fsname=ghostdrive"};
+    if (!fs.writable()) args.insert(args.end(), {"-o", "ro"});
 #ifdef __APPLE__
     args.insert(args.end(), {"-o", "volname=" + options.volume_name});
 #endif

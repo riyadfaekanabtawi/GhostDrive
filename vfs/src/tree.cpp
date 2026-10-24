@@ -1,5 +1,6 @@
 #include "ghostdrive/vfs/tree.hpp"
 
+#include <algorithm>
 #include <mutex>
 
 namespace ghostdrive::vfs {
@@ -19,6 +20,11 @@ std::vector<std::string_view> split(std::string_view path) {
         path.remove_prefix(slash + 1);
     }
     return parts;
+}
+
+std::string_view last_component(std::string_view path) {
+    auto slash = path.rfind('/');
+    return slash == std::string_view::npos ? path : path.substr(slash + 1);
 }
 
 }  // namespace
@@ -56,57 +62,143 @@ void Tree::apply(const core::FileRecord& record) {
     applied_sequence_ = std::max(applied_sequence_, record.sequence);
 }
 
-void Tree::upsert_locked(const core::FileRecord& record) {
-    // The index only holds validated paths; this is a second line of defence for the kernel.
-    if (!core::is_valid_drive_path(record.path)) return;
-    auto parts = split(record.path);
-
-    // Check the whole path first so a rejected record leaves no new directories behind.
+std::optional<Ino> Tree::parent_for_locked(std::string_view path, bool create) {
+    auto parts = split(path);
+    if (parts.empty()) return std::nullopt;
+    // Check the whole way first so a rejected path leaves no new directories behind.
     Ino cursor = kRootIno;
     std::size_t existing = 0;
-    for (; existing < parts.size(); ++existing) {
+    for (; existing + 1 < parts.size(); ++existing) {
         const auto& node = nodes_.at(cursor);
         auto it = node.children.find(parts[existing]);
         if (it == node.children.end()) break;
-        const auto& child = nodes_.at(it->second);
-        bool last = existing + 1 == parts.size();
-        if (last ? child.type != NodeType::file : child.type != NodeType::directory) return;
+        if (nodes_.at(it->second).type != NodeType::directory) return std::nullopt;
         cursor = it->second;
     }
-
-    for (std::size_t i = existing; i < parts.size(); ++i) {
-        bool last = i + 1 == parts.size();
+    if (existing + 1 < parts.size() && !create) return std::nullopt;
+    for (std::size_t i = existing; i + 1 < parts.size(); ++i) {
         Ino ino = next_ino_++;
-        nodes_[ino] = Node{.parent = cursor,
-                           .name = std::string(parts[i]),
-                           .type = last ? NodeType::file : NodeType::directory};
+        nodes_[ino] =
+            Node{.parent = cursor, .name = std::string(parts[i]), .type = NodeType::directory};
         nodes_.at(cursor).children.emplace(std::string(parts[i]), ino);
         cursor = ino;
     }
+    return cursor;
+}
 
-    auto& file = nodes_.at(cursor);
-    file.record = record;
-    file.mtime_ns = record.mtime_ns;
-    for (Ino dir = file.parent;; dir = nodes_.at(dir).parent) {
+void Tree::upsert_locked(const core::FileRecord& record) {
+    // The index only holds validated paths; this is a second line of defence for the kernel.
+    if (!core::is_valid_drive_path(record.path)) return;
+    NodeType type = is_directory_record(record) ? NodeType::directory : NodeType::file;
+    auto name = last_component(record.path);
+
+    // Reject a type collision before parent_for_locked creates anything.
+    if (auto existing = resolve_locked(record.path)) {
+        if (nodes_.at(*existing).type != type) return;
+    }
+    auto parent = parent_for_locked(record.path, true);
+    if (!parent) return;
+
+    auto& siblings = nodes_.at(*parent).children;
+    Ino ino;
+    if (auto it = siblings.find(name); it != siblings.end()) {
+        ino = it->second;
+    } else {
+        ino = next_ino_++;
+        nodes_[ino] = Node{.parent = *parent, .name = std::string(name), .type = type};
+        siblings.emplace(std::string(name), ino);
+    }
+    auto& node = nodes_.at(ino);
+    node.record = record;
+    node.mtime_ns = std::max(node.mtime_ns, record.mtime_ns);
+    if (type == NodeType::file) node.mtime_ns = record.mtime_ns;
+    touch_ancestors_locked(*parent, record.mtime_ns);
+}
+
+void Tree::touch_ancestors_locked(Ino dir, std::int64_t mtime_ns) {
+    for (;; dir = nodes_.at(dir).parent) {
         auto& node = nodes_.at(dir);
-        node.mtime_ns = std::max(node.mtime_ns, record.mtime_ns);
+        node.mtime_ns = std::max(node.mtime_ns, mtime_ns);
         if (dir == kRootIno) break;
     }
 }
 
 void Tree::remove_locked(std::string_view path) {
     auto ino = resolve_locked(path);
-    if (!ino || nodes_.at(*ino).type != NodeType::file) return;
-    Ino parent = nodes_.at(*ino).parent;
-    nodes_.at(parent).children.erase(nodes_.at(*ino).name);
-    nodes_.erase(*ino);
-    // Directories exist only to hold files, so drop the ones this leaves empty.
-    while (parent != kRootIno && nodes_.at(parent).children.empty()) {
-        Ino grandparent = nodes_.at(parent).parent;
-        nodes_.at(grandparent).children.erase(nodes_.at(parent).name);
-        nodes_.erase(parent);
-        parent = grandparent;
+    if (!ino || *ino == kRootIno) return;
+    auto& node = nodes_.at(*ino);
+    Ino parent = node.parent;
+    if (node.type == NodeType::directory) {
+        // The directory record is gone; it stays while entries still imply it.
+        node.record.reset();
+        prune_locked(*ino);
+        return;
     }
+    nodes_.at(parent).children.erase(node.name);
+    nodes_.erase(*ino);
+    prune_locked(parent);
+}
+
+void Tree::prune_locked(Ino dir) {
+    // Implied directories exist only to hold entries, so drop the ones left empty.
+    while (dir != kRootIno) {
+        auto& node = nodes_.at(dir);
+        if (!node.children.empty() || node.record) return;
+        Ino parent = node.parent;
+        nodes_.at(parent).children.erase(node.name);
+        nodes_.erase(dir);
+        dir = parent;
+    }
+}
+
+void Tree::erase_subtree_locked(Ino ino) {
+    std::vector<Ino> stack{ino};
+    while (!stack.empty()) {
+        Ino current = stack.back();
+        stack.pop_back();
+        for (const auto& [name, child] : nodes_.at(current).children) stack.push_back(child);
+        nodes_.erase(current);
+    }
+}
+
+bool Tree::move(std::string_view from, std::string_view to) {
+    std::unique_lock lock(mutex_);
+    if (!core::is_valid_drive_path(from) || !core::is_valid_drive_path(to)) return false;
+    auto src = resolve_locked(from);
+    if (!src || *src == kRootIno) return false;
+    if (from == to) return true;
+    // A directory cannot move into itself.
+    if (to.size() > from.size() && to.substr(0, from.size()) == from && to[from.size()] == '/') {
+        return false;
+    }
+    if (auto dst = resolve_locked(to)) {
+        if (nodes_.at(*dst).type == NodeType::directory) return false;
+        if (nodes_.at(*src).type == NodeType::directory) return false;
+        Ino dst_parent = nodes_.at(*dst).parent;
+        nodes_.at(dst_parent).children.erase(nodes_.at(*dst).name);
+        erase_subtree_locked(*dst);
+    }
+    auto new_parent = parent_for_locked(to, true);
+    if (!new_parent) return false;
+
+    auto& node = nodes_.at(*src);
+    Ino old_parent = node.parent;
+    nodes_.at(old_parent).children.erase(node.name);
+    node.parent = *new_parent;
+    node.name = std::string(last_component(to));
+    nodes_.at(*new_parent).children.emplace(node.name, *src);
+    prune_locked(old_parent);
+
+    // Keep the stored records' paths in step with where they now live.
+    std::vector<Ino> stack{*src};
+    while (!stack.empty()) {
+        Ino current = stack.back();
+        stack.pop_back();
+        auto& n = nodes_.at(current);
+        if (n.record) n.record->path = path_locked(current);
+        for (const auto& [name, child] : n.children) stack.push_back(child);
+    }
+    return true;
 }
 
 std::optional<Ino> Tree::resolve_locked(std::string_view path) const {
@@ -121,13 +213,27 @@ std::optional<Ino> Tree::resolve_locked(std::string_view path) const {
     return cursor;
 }
 
+std::string Tree::path_locked(Ino ino) const {
+    std::vector<const std::string*> names;
+    for (Ino cursor = ino; cursor != kRootIno; cursor = nodes_.at(cursor).parent) {
+        names.push_back(&nodes_.at(cursor).name);
+    }
+    std::string path;
+    for (auto it = names.rbegin(); it != names.rend(); ++it) {
+        if (!path.empty()) path += '/';
+        path += **it;
+    }
+    return path;
+}
+
 Attr Tree::attr_locked(Ino ino, const Node& node) const {
     Attr attr;
     attr.ino = ino;
     attr.type = node.type;
     attr.mtime_ns = node.mtime_ns;
     if (node.type == NodeType::directory) {
-        attr.perm = kDirPerm;
+        attr.perm = node.record ? (node.record->mode & 07777) : kDirPerm;
+        if (attr.perm == 0) attr.perm = kDirPerm;
         std::uint32_t subdirs = 0;
         for (const auto& [name, child] : node.children) {
             if (nodes_.at(child).type == NodeType::directory) ++subdirs;
@@ -156,6 +262,12 @@ std::optional<Ino> Tree::resolve(std::string_view path) const {
     return resolve_locked(path);
 }
 
+std::optional<std::string> Tree::path_of(Ino ino) const {
+    std::shared_lock lock(mutex_);
+    if (!nodes_.contains(ino)) return std::nullopt;
+    return path_locked(ino);
+}
+
 std::optional<Attr> Tree::getattr(Ino ino) const {
     std::shared_lock lock(mutex_);
     auto it = nodes_.find(ino);
@@ -178,8 +290,23 @@ std::optional<std::vector<DirEntry>> Tree::readdir(Ino ino) const {
 std::optional<core::FileRecord> Tree::file_record(Ino ino) const {
     std::shared_lock lock(mutex_);
     auto it = nodes_.find(ino);
-    if (it == nodes_.end() || it->second.type != NodeType::file) return std::nullopt;
+    if (it == nodes_.end()) return std::nullopt;
     return it->second.record;
+}
+
+std::vector<std::string> Tree::record_paths_under(Ino ino) const {
+    std::shared_lock lock(mutex_);
+    std::vector<std::string> paths;
+    if (!nodes_.contains(ino)) return paths;
+    std::vector<Ino> stack{ino};
+    while (!stack.empty()) {
+        Ino current = stack.back();
+        stack.pop_back();
+        const auto& node = nodes_.at(current);
+        if (node.record) paths.push_back(path_locked(current));
+        for (const auto& [name, child] : node.children) stack.push_back(child);
+    }
+    return paths;
 }
 
 std::uint64_t Tree::applied_sequence() const {

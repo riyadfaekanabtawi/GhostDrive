@@ -167,7 +167,23 @@ document assumes the corrected version.
 - `open` pins a file version (version vector plus chunk list) into the file handle, so a remote
   edit during streaming cannot mix versions. The next `open` sees the new version.
 - MVP is read-mostly: writes go to a local staging file and are chunked and committed to the
-  index on `release`/`fsync`. Single writer is advisory; see section 2.1.
+  index on `flush` (every `close`), `fsync`, and the last `release`. Single writer is advisory;
+  see section 2.1. As built in step (c):
+  - The staging file is sparse and holds written bytes at their real offsets. A file's block
+    size stays fixed once chosen, so a commit rehashes only the blocks a write touched; every
+    other block keeps its chunk ID. A partial write to an untouched block first copies that
+    block in, fetching it from a peer if needed, so editing a remote file moves one chunk.
+    Truncating to zero lets the next commit choose the block size afresh.
+  - Operations on one open file run in order on the io executor. While a file is open for
+    writing, `stat` reports the size being written.
+  - Empty directories are directory records (`mode` type bits `S_IFDIR`, no chunks); other
+    directories are implied by file paths.
+  - Rename keeps inode numbers, which FUSE-T's NFS client needs for open files. It commits the
+    records at the new paths, then tombstones the old ones. That is not atomic across records:
+    a crash in between leaves both copies, which loses nothing.
+  - Unlinking an open file keeps its descriptor working, but nothing it writes is committed.
+  - Not handled yet: macOS creates `._*` AppleDouble files and `.DS_Store` on network volumes,
+    and these would replicate like any other file.
 
 ### 3.4 discovery/
 - **LAN.** mDNS/DNS-SD service `_ghostdrive._udp`. The TXT record holds the port and a rotating ID

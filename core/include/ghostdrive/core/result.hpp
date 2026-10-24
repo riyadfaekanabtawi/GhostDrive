@@ -20,6 +20,11 @@ enum class Errc {
     closed,
     timeout,
     protocol,
+    // Filesystem-shaped failures, so front ends can report the matching errno.
+    not_empty,
+    is_directory,
+    not_directory,
+    read_only,
 };
 
 struct Error {

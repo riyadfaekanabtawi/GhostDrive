@@ -353,5 +353,51 @@ TEST_F(RemoteRead, StalledPeerHitsTheRequestDeadline) {
     EXPECT_EQ(got.error().code, core::Errc::timeout) << got.error().message;
 }
 
+TEST_F(RemoteRead, PartialWriteToARemoteFileFetchesOnlyTheTouchedBlock) {
+    start_client();
+    auto& server = add_server(Behavior::honest);
+    connect(server);
+    auto data = random_bytes(6 * core::kMinBlockSize, 7);
+    auto before = publish("remote.bin", data, {&server}, {&server});
+
+    Filesystem writable(io_.get_executor(), tree_, *fetcher_, {},
+                        WriteSupport{client_store_, index_, clock_, disk_.get_executor(),
+                                     dir_.path() / "staging"});
+    auto ino = tree_.resolve("remote.bin");
+    ASSERT_TRUE(ino);
+    auto handle = writable.open(*ino, true);
+    ASSERT_TRUE(handle) << handle.error().message;
+
+    auto patch = random_bytes(10, 8);
+    std::uint64_t offset = 4 * std::uint64_t{core::kMinBlockSize} + 50;
+    std::optional<core::Status> wrote;
+    writable.write(handle.value(), offset, patch, [&](core::Status st) { wrote = st; });
+    drain([&] { return wrote.has_value(); }, 20s);
+    ASSERT_TRUE(wrote && *wrote);
+    std::optional<core::Status> flushed;
+    writable.flush(handle.value(), [&](core::Status st) { flushed = st; });
+    drain([&] { return flushed.has_value(); }, 20s);
+    ASSERT_TRUE(flushed && *flushed) << (flushed ? flushed->error().message : "timeout");
+    writable.release(handle.value());
+
+    // Only block 4 crossed the network (to be patched); the rest kept their remote chunk IDs.
+    EXPECT_EQ(fetcher_->stats().remote_fetches, 1u);
+    auto after = index_.get("remote.bin").value().value();
+    ASSERT_EQ(after.chunks.size(), before.chunks.size());
+    for (std::size_t i = 0; i < after.chunks.size(); ++i) {
+        if (i == 4) {
+            EXPECT_NE(after.chunks[i], before.chunks[i]);
+            EXPECT_TRUE(client_store_.contains(after.chunks[i]));
+        } else {
+            EXPECT_EQ(after.chunks[i], before.chunks[i]);
+            EXPECT_FALSE(client_store_.contains(after.chunks[i]));
+        }
+    }
+    std::copy(patch.begin(), patch.end(), data.begin() + static_cast<std::ptrdiff_t>(offset));
+    auto got = read_file("remote.bin", 64 * 1024);
+    ASSERT_TRUE(got) << got.error().message;
+    EXPECT_TRUE(got.value() == data);
+}
+
 }  // namespace
 }  // namespace ghostdrive::vfs
