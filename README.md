@@ -6,7 +6,8 @@ being read, directly from that device over QUIC, end-to-end encrypted. There is 
 server. The only server component is a rendezvous/relay you can host yourself; it forwards
 encrypted packets and never stores file data.
 
-Status: design stage. Nothing is usable yet. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Status: early implementation. The core library (identity, chunk store, metadata index) exists;
+networking and the mount do not. Nothing is usable yet. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How you use it
 
@@ -28,16 +29,25 @@ Status: design stage. Nothing is usable yet. See [docs/ARCHITECTURE.md](docs/ARC
 
 ## Building
 
-Requirements are fixed after the design checkpoint. Expected:
+Requirements: CMake 3.25+, Ninja, a C++20 compiler (Apple clang 17 or GCC 13+ / clang 17+),
+git. Dependencies (OpenSSL, BLAKE3, SQLite, GoogleTest) are built by vcpkg, which is pinned as a
+git submodule.
 
 ```
+git clone --recurse-submodules https://github.com/riyadfaekanabtawi/GhostDrive.git
+cd GhostDrive
+./external/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 cmake --preset default
 cmake --build --preset default
 ctest --preset default
 ```
 
-Linux needs libfuse3 development headers. macOS needs FUSE-T.
+Other presets: `release`, `asan` (AddressSanitizer + UBSan), `ubsan`. On macOS 26.5 with
+Apple clang 17, every AddressSanitizer binary hangs at startup inside the sanitizer runtime;
+use `ubsan` there.
+
+Later steps will need libfuse3 development headers on Linux and FUSE-T on macOS.
 
 ## License
 
-To be decided; see docs/ARCHITECTURE.md.
+Apache-2.0. See [LICENSE](LICENSE).

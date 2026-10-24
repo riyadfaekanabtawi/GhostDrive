@@ -1,7 +1,6 @@
 # GhostDrive Architecture
 
-Status: draft for the design checkpoint (2026-10-24). Sections marked "Open decision" are not
-final. Claims tagged "(unverified)" were not confirmed against primary sources during research
+Status: decisions in section 11 accepted on 2026-10-24 (all recommendations taken). Claims tagged "(unverified)" were not confirmed against primary sources during research
 and must be checked before code depends on them.
 
 ## 1. Goals and non-goals
@@ -371,7 +370,7 @@ exists so this does not need a format break.
   - migration from relay to direct.
 - FUSE mount tests run where FUSE is available and are labelled so CI can skip them.
 
-## 11. Open decisions (checkpoint)
+## 11. Decisions (accepted 2026-10-24)
 
 The six decisions requested, each with a recommendation.
 
