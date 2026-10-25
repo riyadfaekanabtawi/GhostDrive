@@ -9,6 +9,10 @@ if(NOT WIN32)
 endif()
 
 add_executable(ghostdrive ghostdrive.cpp)
+if(WIN32)
+    # UTF-8 as the process code page, so arguments and the environment keep any file name.
+    target_sources(ghostdrive PRIVATE ${PROJECT_SOURCE_DIR}/cmake/utf8.manifest)
+endif()
 target_link_libraries(ghostdrive
     PRIVATE ghostdrive::daemon ghostdrive_version ghostdrive_warnings)
 if(TARGET ghostdrive_autostart)

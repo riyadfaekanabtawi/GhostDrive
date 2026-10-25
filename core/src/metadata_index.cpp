@@ -9,6 +9,7 @@
 #include <tuple>
 
 #include "ghostdrive/core/bytes.hpp"
+#include "ghostdrive/core/file.hpp"
 
 namespace ghostdrive::core {
 
@@ -616,13 +617,14 @@ Result<MetadataIndex> MetadataIndex::open(const std::filesystem::path& db_path,
     const std::uint64_t local_device = short_id(key.public_key());
     sqlite3* raw = nullptr;
     // SQLite takes UTF-8 file names on every platform, including Windows.
-    const std::u8string name = db_path.u8string();
+    auto name = exact_utf8(db_path);
+    if (!name) return name.error();
     const int rc =
-        sqlite3_open_v2(reinterpret_cast<const char*>(name.c_str()), &raw,
+        sqlite3_open_v2(name.value().c_str(), &raw,
                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX, nullptr);
     Db db(raw);
     if (rc != SQLITE_OK) {
-        return Error{Errc::database, "open " + db_path.string() + ": " +
+        return Error{Errc::database, "open " + path_utf8(db_path) + ": " +
                                          (raw ? sqlite3_errmsg(raw) : "out of memory")};
     }
     if (auto st = exec(db.get(),
@@ -655,7 +657,7 @@ Result<MetadataIndex> MetadataIndex::open(const std::filesystem::path& db_path,
         if (!stored_device) return stored_device.error();
         if (stored_device.value() != local_device) {
             return Error{Errc::invalid_argument,
-                         "index " + db_path.string() + " belongs to a different device"};
+                         "index " + path_utf8(db_path) + " belongs to a different device"};
         }
         return {};
     };

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <span>
+#include <string>
 
 #include "ghostdrive/core/bytes.hpp"
 #include "ghostdrive/core/result.hpp"
@@ -69,6 +70,14 @@ Status write_private_file(const std::filesystem::path& path, std::span<const std
 Result<Bytes> read_private_file(const std::filesystem::path& path);
 // Renames `from` to `to`, replacing `to` if it exists.
 Status replace_file(const std::filesystem::path& from, const std::filesystem::path& to);
+
+// `path` in UTF-8, for messages and for interfaces that take UTF-8 names (SQLite, AF_UNIX on
+// Windows). Unlike path::string(), which on Windows converts to the ANSI code page and throws
+// for a character outside it, this does not throw. POSIX paths are returned as they are.
+// path_utf8 replaces what UTF-8 cannot hold (an unpaired UTF-16 surrogate, Windows only) with
+// U+FFFD; exact_utf8 refuses such a path with Errc::invalid_argument.
+std::string path_utf8(const std::filesystem::path& path);
+Result<std::string> exact_utf8(const std::filesystem::path& path);
 
 // Creates `dir` (and its parents) if needed and makes it private.
 Status make_private_dir(const std::filesystem::path& dir);

@@ -304,5 +304,25 @@ TEST(Drive, OpeningRetiresDevicesRemovedBeforeACrash) {
     EXPECT_TRUE(opened.value()->index().is_retired_signer(core::short_id(y)));
 }
 
+// A data directory name no single ANSI code page holds, as under a non-ASCII Windows profile.
+TEST(Drive, LivesUnderANonAsciiDirectory) {
+    test::TempDir dir;
+    const auto root = dir.path() / std::filesystem::path(u8"d\u00e9j\u00e0-\u65e5\u672c");
+    auto missing = Drive::open(root);
+    ASSERT_FALSE(missing);
+    EXPECT_NE(missing.error().message.find("d\xc3\xa9j\xc3\xa0-\xe6\x97\xa5\xe6\x9c\xac"),
+              std::string::npos)
+        << missing.error().message;
+
+    auto created = Drive::create(root, "desk");
+    ASSERT_TRUE(created) << created.error().message;
+    const auto id = created.value()->drive_id();
+    created.value().reset();
+    auto opened = Drive::open(root);
+    ASSERT_TRUE(opened) << opened.error().message;
+    EXPECT_EQ(opened.value()->drive_id(), id);
+    EXPECT_TRUE(test::has_private_mode(DrivePaths(root).key, 0600));
+}
+
 }  // namespace
 }  // namespace ghostdrive::daemon

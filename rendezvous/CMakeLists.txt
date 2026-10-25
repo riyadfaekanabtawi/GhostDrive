@@ -7,3 +7,6 @@ target_link_libraries(ghostdrive_rendezvous
 
 add_executable(ghostdrive-rendezvous ghostdrive-rendezvous.cpp)
 target_link_libraries(ghostdrive-rendezvous PRIVATE ghostdrive::rendezvous ghostdrive_warnings)
+if(WIN32)
+    target_sources(ghostdrive-rendezvous PRIVATE ${PROJECT_SOURCE_DIR}/cmake/utf8.manifest)
+endif()

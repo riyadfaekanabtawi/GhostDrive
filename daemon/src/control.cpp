@@ -20,9 +20,9 @@
 #ifdef _WIN32
 // After Asio, which includes winsock2.h, a prerequisite of afunix.h.
 #include <afunix.h>
+#endif
 
 #include "ghostdrive/core/file.hpp"
-#endif
 
 namespace ghostdrive::daemon {
 
@@ -61,9 +61,15 @@ bool same_user(Local::socket::native_handle_type fd) {
 #endif
 }
 
-// Constructing an endpoint from a longer path throws; check first.
-bool fits(const std::filesystem::path& socket) {
-    return socket.string().size() < sizeof(sockaddr_un::sun_path);
+// The name to bind or connect to: UTF-8, which Windows AF_UNIX also takes. Constructing an
+// endpoint from a longer name throws; check first.
+core::Result<std::string> socket_name(const std::filesystem::path& socket) {
+    auto name = core::exact_utf8(socket);
+    if (!name) return name.error();
+    if (name.value().size() >= sizeof(sockaddr_un::sun_path)) {
+        return Error{Errc::invalid_argument, "control socket path is too long"};
+    }
+    return name;
 }
 
 asio::awaitable<void> serve(Local::socket socket, ControlServer::Handler handler,
@@ -98,7 +104,8 @@ core::Result<std::unique_ptr<ControlServer>> ControlServer::start(
     asio::any_io_executor executor, const std::filesystem::path& socket, Handler handler) {
     // A socket file left by a daemon that did not exit cleanly blocks bind; a live daemon still
     // answering on it means another one is already running.
-    if (!fits(socket)) return Error{Errc::invalid_argument, "control socket path is too long"};
+    auto name = socket_name(socket);
+    if (!name) return name.error();
     std::error_code ec;
     // symlink_status: on Windows the socket file is a reparse point that status() cannot open.
     if (std::filesystem::exists(std::filesystem::symlink_status(socket, ec))) {
@@ -111,13 +118,13 @@ core::Result<std::unique_ptr<ControlServer>> ControlServer::start(
     ec.clear();
     auto& acceptor = server->acceptor_;
     acceptor.open(Local(), ec);
-    if (!ec) acceptor.bind(Local::endpoint(socket.string()), ec);
+    if (!ec) acceptor.bind(Local::endpoint(name.value()), ec);
 #ifndef _WIN32
     // On Windows the socket file inherits the private directory's owner-only access list.
     if (!ec) ::chmod(socket.c_str(), 0600);
 #endif
     if (!ec) acceptor.listen(asio::socket_base::max_listen_connections, ec);
-    if (ec) return Error{Errc::io, "control socket " + socket.string() + ": " + ec.message()};
+    if (ec) return Error{Errc::io, "control socket " + name.value() + ": " + ec.message()};
     server->accept_next();
     return server;
 }
@@ -142,11 +149,12 @@ void ControlServer::stop() {
 
 core::Result<std::string> control_request(const std::filesystem::path& socket,
                                           const std::string& command) {
-    if (!fits(socket)) return Error{Errc::invalid_argument, "control socket path is too long"};
+    auto name = socket_name(socket);
+    if (!name) return name.error();
     asio::io_context io;
     Local::socket s(io);
     std::error_code ec;
-    s.connect(Local::endpoint(socket.string()), ec);
+    s.connect(Local::endpoint(name.value()), ec);
     if (ec) {
         return Error{Errc::closed, "the GhostDrive daemon is not running (" + ec.message() + ")"};
     }

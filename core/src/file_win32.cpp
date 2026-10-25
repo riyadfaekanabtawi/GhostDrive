@@ -5,7 +5,10 @@
 // clang-format on
 
 #include <algorithm>
+#include <climits>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -16,6 +19,24 @@ namespace ghostdrive::core {
 namespace {
 
 constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+// Null if `wide` is not valid UTF-16 and `strict` is set; otherwise the UTF-8 text, with
+// U+FFFD for each unpaired surrogate.
+std::optional<std::string> to_utf8(std::wstring_view wide, bool strict) {
+    if (wide.empty()) return std::string();
+    if (wide.size() > static_cast<std::size_t>(INT_MAX)) return std::nullopt;
+    const DWORD flags = strict ? WC_ERR_INVALID_CHARS : 0;
+    const int in = static_cast<int>(wide.size());
+    const int n =
+        ::WideCharToMultiByte(CP_UTF8, flags, wide.data(), in, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::nullopt;
+    std::string out(static_cast<std::size_t>(n), '\0');
+    if (::WideCharToMultiByte(CP_UTF8, flags, wide.data(), in, out.data(), n, nullptr, nullptr) !=
+        n) {
+        return std::nullopt;
+    }
+    return out;
+}
 
 Error win32_error(std::string_view what, const std::filesystem::path& path,
                   DWORD err = ::GetLastError()) {
@@ -35,7 +56,7 @@ Error win32_error(std::string_view what, const std::filesystem::path& path,
         default:
             break;
     }
-    return Error{code, std::string(what) + " " + path.string() + ": " +
+    return Error{code, std::string(what) + " " + path_utf8(path) + ": " +
                            std::system_category().message(static_cast<int>(err))};
 }
 
@@ -143,6 +164,22 @@ Result<File::Native> create(const std::filesystem::path& path, DWORD access, DWO
     return h;
 }
 
+// The directory itself, never what a junction or symbolic link there points to. Directories
+// need FILE_FLAG_BACKUP_SEMANTICS to be opened at all.
+HANDLE open_dir(const std::filesystem::path& dir, DWORD access) {
+    return ::CreateFileW(dir.c_str(), access | FILE_READ_ATTRIBUTES, kShareAll, nullptr,
+                         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                         nullptr);
+}
+
+// A directory and not a reparse point (junction, symbolic link, mount point).
+bool is_plain_dir(HANDLE h) {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!::GetFileInformationByHandle(h, &info)) return false;
+    return (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+           (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+}
+
 OVERLAPPED at(std::uint64_t offset) {
     OVERLAPPED ov{};
     ov.Offset = static_cast<DWORD>(offset & 0xffffffffu);
@@ -195,7 +232,13 @@ Result<File> File::create_private(const std::filesystem::path& path) {
 }
 
 Result<File> File::open_scratch(const std::filesystem::path& path) {
-    auto h = create(path, GENERIC_READ | GENERIC_WRITE, CREATE_ALWAYS);
+    // CREATE_ALWAYS would keep an existing file's security descriptor, so whatever is there is
+    // deleted and the file is created anew with the private one.
+    if (!::DeleteFileW(path.c_str())) {
+        const DWORD err = ::GetLastError();
+        if (err != ERROR_FILE_NOT_FOUND) return win32_error("delete", path, err);
+    }
+    auto h = create(path, GENERIC_READ | GENERIC_WRITE, CREATE_NEW);
     if (!h) return h.error();
     File file(h.value(), path);
     // Without this, extending the file allocates every byte up to the new end. Volumes without
@@ -218,7 +261,7 @@ Result<File> File::open_private(const std::filesystem::path& path) {
 }
 
 Status File::check_private() const {
-    const Error refused{Errc::permission, path_.string() +
+    const Error refused{Errc::permission, path_utf8(path_) +
                                               " must be a regular file owned by you that only "
                                               "you can access"};
     BY_HANDLE_FILE_INFORMATION info{};
@@ -309,35 +352,47 @@ Status replace_file(const std::filesystem::path& from, const std::filesystem::pa
 Status make_private_dir(const std::filesystem::path& dir) {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    if (ec) return Error{Errc::io, "create_directories " + dir.string() + ": " + ec.message()};
+    if (ec) return Error{Errc::io, "create_directories " + path_utf8(dir) + ": " + ec.message()};
     PrivateAcl acl;
     if (!make_private_acl(acl, true)) return win32_error("access list for", dir);
-    std::wstring name = dir.wstring();
+    Handle h{open_dir(dir, READ_CONTROL | WRITE_DAC | WRITE_OWNER)};
+    if (h.h == INVALID_HANDLE_VALUE) return win32_error("open", dir);
+    if (!is_plain_dir(h.h)) {
+        return Error{Errc::permission,
+                     path_utf8(dir) + " must be a directory, not a junction or link"};
+    }
     // Protected: the parent's inheritable entries no longer apply. Existing children that
     // inherit pick up the new entry; files created with their own protected DACL keep it.
-    const DWORD err =
-        ::SetNamedSecurityInfoW(name.data(), SE_FILE_OBJECT,
-                                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
-                                    PROTECTED_DACL_SECURITY_INFORMATION,
-                                current_user(), nullptr, acl.acl(), nullptr);
-    if (err != ERROR_SUCCESS) return win32_error("SetNamedSecurityInfo", dir, err);
+    const DWORD err = ::SetSecurityInfo(h.h, SE_FILE_OBJECT,
+                                        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
+                                            PROTECTED_DACL_SECURITY_INFORMATION,
+                                        current_user(), nullptr, acl.acl(), nullptr);
+    if (err != ERROR_SUCCESS) return win32_error("SetSecurityInfo", dir, err);
     return {};
 }
 
 bool is_private_dir(const std::filesystem::path& dir) {
-    const DWORD attributes = ::GetFileAttributesW(dir.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-        return false;
-    }
+    Handle h{open_dir(dir, READ_CONTROL)};
+    if (h.h == INVALID_HANDLE_VALUE || !is_plain_dir(h.h)) return false;
     PSID owner = nullptr;
     PACL dacl = nullptr;
     LocalMemory sd;
-    if (::GetNamedSecurityInfoW(dir.c_str(), SE_FILE_OBJECT,
-                                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner,
-                                nullptr, &dacl, nullptr, &sd.p) != ERROR_SUCCESS) {
+    if (::GetSecurityInfo(h.h, SE_FILE_OBJECT,
+                          OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr,
+                          &dacl, nullptr, &sd.p) != ERROR_SUCCESS) {
         return false;
     }
     return owner_only(owner, dacl);
+}
+
+std::string path_utf8(const std::filesystem::path& path) {
+    return to_utf8(path.native(), false).value_or(std::string());
+}
+
+Result<std::string> exact_utf8(const std::filesystem::path& path) {
+    auto out = to_utf8(path.native(), true);
+    if (!out) return Error{Errc::invalid_argument, "the path is not valid Unicode"};
+    return std::move(*out);
 }
 
 bool process_is_current_user(unsigned long pid) {

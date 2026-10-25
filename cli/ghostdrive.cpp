@@ -28,6 +28,7 @@
 #ifndef _WIN32
 #include "autostart.hpp"
 #endif
+#include "ghostdrive/core/file.hpp"
 #include "ghostdrive/daemon/control.hpp"
 #include "ghostdrive/daemon/drive.hpp"
 #include "ghostdrive/daemon/invite.hpp"
@@ -137,7 +138,7 @@ int cmd_init(const Args& args) {
     if (!drive) return fail(drive.error().message);
     std::cout << "Created a new drive on " << drive.value()->device_name() << ".\n"
               << "  device ID: " << core::fingerprint(drive.value()->key().public_key()) << "\n"
-              << "  data:      " << args.data.string() << "\n\n"
+              << "  data:      " << core::path_utf8(args.data) << "\n\n"
               << "Start it with `ghostdrived`, then add devices with `ghostdrive invite`.\n";
     return 0;
 }
@@ -192,7 +193,7 @@ int cmd_rendezvous(const Args& args) {
 int cmd_join(const Args& args) {
     if (args.positional.size() != 1) return fail("join needs the invite code");
     if (daemon::Drive::exists(args.data)) {
-        return fail("this device already belongs to a drive (" + args.data.string() + ")");
+        return fail("this device already belongs to a drive (" + core::path_utf8(args.data) + ")");
     }
     auto invite = daemon::decode_invite(args.positional[0]);
     if (!invite) return fail(invite.error().message);
