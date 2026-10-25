@@ -269,27 +269,6 @@ jobs:
         working-directory: windows/GhostDriveApp
         run: dotnet test GhostDriveApp.Core.Tests -c Release
 
-      - name: Measure publish variants (temporary)
-        continue-on-error: true
-        working-directory: windows/GhostDriveApp
-        run: |
-          $variants = [ordered]@{
-            'untrimmed, all languages' = @('-p:PublishTrimmed=false', '-p:SatelliteResourceLanguages=')
-            'untrimmed, en' = @('-p:PublishTrimmed=false')
-            'trimmed, en' = @()
-            'trimmed, en, ReadyToRun' = @('-p:PublishReadyToRun=true')
-          }
-          $i = 0
-          foreach ($v in $variants.GetEnumerator()) {
-            $out = "$env:RUNNER_TEMP\variant$i"; $i++
-            dotnet publish GhostDriveApp -c Release -o $out @($v.Value) | Out-Null
-            if ($LASTEXITCODE) { "$($v.Key): publish failed"; continue }
-            $files = Get-ChildItem -Recurse -File $out
-            Compress-Archive -Path "$out\*" -DestinationPath "$out.zip"
-            "{0}: {1} files, {2:N1} MB, zipped {3:N1} MB" -f $v.Key, $files.Count,
-              (($files | Measure-Object Length -Sum).Sum / 1MB), ((Get-Item "$out.zip").Length / 1MB)
-          }
-
       - name: Build the app
         working-directory: windows/GhostDriveApp
         run: |

@@ -150,7 +150,8 @@ is also usable from scripts.
 `windows/GhostDriveApp` is a desktop app for Windows 10 (1809) or later on x64, in WinUI 3
 (Windows App SDK 2.5.1, C# on .NET 10, supported until November 2028). It is unpackaged and
 self-contained: the built folder runs as it is, with no MSIX, Windows App SDK runtime or .NET
-install, and is meant to sit next to `ghostdrive.exe` or in a subfolder beside it.
+install, and is meant to sit next to `ghostdrive.exe` or in a subfolder beside it. Published
+trimmed, it is about 140 MB (55 MB zipped), most of it the bundled runtimes.
 
 - First run: when the data folder has no drive, it offers "Create a new drive"
   (`ghostdrive init`) and "Join with an invite code" (`ghostdrive join`).

@@ -23,10 +23,15 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <Product>GhostDrive</Product>
-    <!-- Size of the published folder. The app is English only, so other languages' resource
-         assemblies are left out. Trimming removes unused managed code (C#/WinRT projections
-         support it since Windows App SDK 1.6); the app uses no {Binding} and no reflection,
-         and with TreatWarningsAsErrors any trim warning fails the build. -->
+    <!-- Size of the published folder (measured in CI on 2026-10-25: 520 files and 228 MB
+         untrimmed, 343 files and 137 MB trimmed; zipped 91 MB and 56 MB). Trimming removes
+         unused managed code (C#/WinRT projections support it since Windows App SDK 1.6); the
+         app uses no {Binding} and no reflection. Every trim warning is reported on its own
+         (TrimmerSingleWarn) and fails the build (TreatWarningsAsErrors). The .NET 10 SDK's
+         default Windows SDK projection, 10.0.19041.57 from 2024, produces trim warnings in
+         WinRT.Runtime and Microsoft.Windows.SDK.NET; 10.0.19041.87 (2026-07) produces none.
+         ReadyToRun is off: it added 7 MB. The app is English only; SatelliteResourceLanguages
+         keeps other languages' resource assemblies out (none are in the output today). -->
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <PublishTrimmed>true</PublishTrimmed>
     <TrimmerSingleWarn>false</TrimmerSingleWarn>
