@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
 #include <asio/executor_work_guard.hpp>
@@ -687,6 +688,16 @@ TEST_F(TwoDevices, ANewMemberReadsTheFilesOfARemovedDevice) {
         auto ino = d_->filesystem().lookup(vfs::kRootIno, "from-c.bin");
         return ino && d_->filesystem().getattr(*ino)->size == data.size();
     })) << "D never got the removed device's file";
+    // Only A holds the chunks. B's adopted copy can reach D first, and B does not hold them,
+    // so D can read once A's index has told it so.
+    ASSERT_TRUE(drain([&] {
+        auto r = drive_d_->index().get("from-c.bin");
+        if (!r || !r.value()) return false;
+        return std::all_of(r.value()->chunks.begin(), r.value()->chunks.end(), [&](auto& id) {
+            auto h = drive_d_->index().holders(id);
+            return h && !h.value().empty();
+        });
+    })) << "D never learned that A holds the chunks";
     auto got = read_file(d_->filesystem(), "from-c.bin");
     ASSERT_TRUE(got);
     EXPECT_TRUE(*got == data);
