@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=GhostDrive
+GenericName=Personal Drive
+Comment=A drive made of your own devices
+Exec=ghostdrive-app
+Icon=org.ghostdrive.GhostDrive
+Terminal=false
+Categories=Utility;FileTools;Network;
+Keywords=drive;sync;files;devices;peer;
+StartupNotify=true

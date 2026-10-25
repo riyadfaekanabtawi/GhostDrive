@@ -183,6 +183,66 @@ jobs:
       - name: Test
         run: swift test
 
+  # The GTK 4 desktop app for Linux (linux/ghostdrive-app), built with the rest of the project
+  # so the screenshots can run real daemons. Its logic tests also run in the other jobs.
+  linux-app:
+    name: linux-app
+    runs-on: ubuntu-latest
+    env:
+      VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libfuse3-dev libavahi-client-dev \
+            libgtk-4-dev libadwaita-1-dev desktop-file-utils \
+            xvfb x11-utils xdotool imagemagick dbus
+
+      - name: Bootstrap vcpkg
+        id: vcpkg
+        run: |
+          ./external/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          echo "commit=$(git rev-parse HEAD:external/vcpkg)" >> "$GITHUB_OUTPUT"
+
+      # The linux job's dependency tree (same runner, preset and manifest); only restored here.
+      - name: Restore vcpkg installed tree
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.VCPKG_INSTALLED_DIR }}
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-default-${{ hashFiles('vcpkg.json') }}-${{ steps.vcpkg.outputs.commit }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-default-
+
+      - name: Configure
+        run: cmake --preset default -DVCPKG_INSTALLED_DIR="$VCPKG_INSTALLED_DIR" -DGHOSTDRIVE_BUILD_LINUX_APP=ON
+
+      - name: Build
+        run: >-
+          cmake --build --preset default --target ghostdrive-app ghostdrive_app_logic_tests
+          ghostdrive_app_contract_tests ghostdrive ghostdrived
+
+      # Only the tests defined in linux/ghostdrive-app: logic, contract and the desktop file.
+      - name: Test
+        run: ctest --test-dir build/default/linux/ghostdrive-app --output-on-failure
+
+      # The app on a virtual display against throwaway daemons (--no-mount), one shot per page.
+      - name: Screenshots
+        run: >-
+          dbus-run-session -- bash linux/ghostdrive-app/scripts/screenshots.sh build/default
+          "$RUNNER_TEMP/screenshots"
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-app-screenshots
+          path: ${{ runner.temp }}/screenshots
+          if-no-files-found: ignore
+
   # The WinUI 3 desktop app (windows/GhostDriveApp), separate from the windows job: the
   # GhostDriveApp.Core tests, a self-contained build of the app, and a UI check that starts it
   # against throwaway daemons (--no-mount) and uploads screenshots of its pages.

@@ -187,6 +187,30 @@ Then copy `ghostdrive.exe` and `ghostdrived.exe` from the `windows-release` buil
 (`build\windows-release\cli` and `build\windows-release\daemon`) into `out`, and run
 `out\GhostDriveApp.exe`. The `windows` (Debug) build's programs need the vcpkg DLLs beside
 them, so for those set `build\windows\cli\ghostdrive.exe` as the tool in Settings instead.
+### Linux desktop app
+
+`linux/ghostdrive-app` is a GTK 4 and libadwaita app. On first run it creates a drive or joins
+one with an invite code; then it shows this device and whether GhostDrive is running (Home),
+the other devices with Remove (Devices), a large invite code with its remaining validity (Add
+device), and the data folder, mount location, rendezvous server, Start at login and Start/Stop
+(Settings). It polls `ghostdrive status --json` every three seconds.
+
+```
+sudo apt install libgtk-4-dev libadwaita-1-dev     # GTK 4.10+, libadwaita 1.5+
+cmake --preset default -DGHOSTDRIVE_BUILD_LINUX_APP=ON
+cmake --build --preset default --target ghostdrive-app
+PATH="$PWD/build/default/cli:$PATH" build/default/linux/ghostdrive-app/ghostdrive-app
+```
+
+Like the menu-bar app it does everything by running `ghostdrive` (next to the app, else on
+PATH) with an argument vector, never a shell, and it never reads key files. Start runs the
+`ghostdrived` next to the CLI with `--data` and `--mount`, logging to `ghostdrived.log` in the
+data folder. Its settings are in `~/.config/ghostdrive/app.conf` (an empty value means the
+CLI's default); `--data DIR` overrides the data folder for one session. Text from the daemon
+is shown with control, bidirectional and invisible characters replaced by `?`. The command
+building and parsing live in a library without GTK (`linux/ghostdrive-app/logic`), whose
+tests run in the normal `ctest` on Linux and macOS. `cmake --install` also installs
+`org.ghostdrive.GhostDrive.desktop` and its icon.
 
 ## Limitations
 

@@ -49,6 +49,32 @@ start_daemon_any_port() {
     return $started
 }
 
+# A run killed by a timeout can leave its mounts behind with nothing serving them, and every
+# later run would then hang on `rm -rf "$WORK"`. Force such mounts under WORK off first. Mount
+# lines are "<dev> on <path> (<opts>)" on macOS and "<dev> on <path> type <fs> (<opts>)" on Linux.
+unmount_stale() {
+    local line path
+    mount 2>/dev/null | while IFS= read -r line; do
+        path=${line#* on }
+        path=${path% (*}
+        path=${path% type *}
+        case "$path" in
+            "$WORK"/*)
+                echo "unmounting a stale mount at $path"
+                if [ "$(uname -s)" = Darwin ]; then
+                    umount -f "$path" 2>/dev/null || diskutil unmount force "$path" >/dev/null 2>&1
+                else
+                    fusermount3 -uz "$path" 2>/dev/null || umount -l "$path" 2>/dev/null
+                fi
+                ;;
+        esac
+    done
+    return 0
+}
+case "$(uname -s)" in
+    Darwin | Linux) unmount_stale ;;
+esac
+
 # On Windows the mountpoints go in the user's temp folder: mounting refuses parent folders that
 # other users could change, and the build tree may lie below one (on CI runners, D:\ lets all
 # users modify its folders). Only empty folders are created there; WinFsp removes each

@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(GHOSTDRIVE_SANITIZERS "" CACHE STRING "Comma-separated -fsanitize= list, e.g. address,undefined")
 option(GHOSTDRIVE_WERROR "Treat warnings as errors" OFF)
 option(GHOSTDRIVE_BUILD_TESTS "Build tests" ON)
+option(GHOSTDRIVE_BUILD_LINUX_APP "Build the GTK 4 desktop app (needs gtk4 and libadwaita-1)" OFF)
 
 include(GNUInstallDirs)
 # FUSE-T's libfuse3 has the install name @rpath/libfuse3.4.dylib, so installed programs need
@@ -60,6 +61,10 @@ add_subdirectory(discovery)
 add_subdirectory(rendezvous)
 add_subdirectory(daemon)
 add_subdirectory(cli)
+# The Linux app's logic library and tests need no GTK; the app itself is behind the option.
+if(NOT WIN32)
+    add_subdirectory(linux/ghostdrive-app)
+endif()
 if(GHOSTDRIVE_BUILD_TESTS)
     add_subdirectory(tests/integration)
 endif()

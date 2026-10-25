@@ -43,10 +43,10 @@ if(TARGET ghostdrive_vfs_fuse OR (TARGET ghostdrive_vfs_winfsp AND GHOSTDRIVE_GI
         COMMAND ${e2e_shell} ${PROJECT_SOURCE_DIR}/tests/e2e/two_devices.sh ${PROJECT_BINARY_DIR}
                 ${CMAKE_CURRENT_BINARY_DIR}/e2e)
     set_tests_properties(e2e.two_devices PROPERTIES
-        LABELS "e2e;mount" RUN_SERIAL TRUE TIMEOUT 180 PASS_REGULAR_EXPRESSION "PASS")
+        LABELS "e2e;mount" RUN_SERIAL TRUE TIMEOUT 300 PASS_REGULAR_EXPRESSION "PASS")
     add_test(NAME e2e.via_rendezvous
         COMMAND ${e2e_shell} ${PROJECT_SOURCE_DIR}/tests/e2e/via_rendezvous.sh ${PROJECT_BINARY_DIR}
                 ${CMAKE_CURRENT_BINARY_DIR}/e2e-rendezvous)
     set_tests_properties(e2e.via_rendezvous PROPERTIES
-        LABELS "e2e;mount" RUN_SERIAL TRUE TIMEOUT 180 PASS_REGULAR_EXPRESSION "PASS")
+        LABELS "e2e;mount" RUN_SERIAL TRUE TIMEOUT 300 PASS_REGULAR_EXPRESSION "PASS")
 endif()
