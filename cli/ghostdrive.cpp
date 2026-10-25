@@ -126,7 +126,7 @@ int fail(const std::string& message) {
 int cmd_init(const Args& args) {
     auto drive = daemon::Drive::create(args.data, args.name);
     if (!drive) return fail(drive.error().message);
-    std::cout << "Created a new drive on " << args.name << ".\n"
+    std::cout << "Created a new drive on " << drive.value()->device_name() << ".\n"
               << "  device ID: " << core::fingerprint(drive.value()->key().public_key()) << "\n"
               << "  data:      " << args.data.string() << "\n\n"
               << "Start it with `ghostdrived`, then add devices with `ghostdrive invite`.\n";
@@ -228,7 +228,7 @@ int cmd_join(const Args& args) {
     if (auto st = drive.value()->set_peer_address(invite.value().inviter, text); !st) {
         return fail(st.error().message);
     }
-    std::cout << "Joined the drive as " << args.name << ".\n"
+    std::cout << "Joined the drive as " << drive.value()->device_name() << ".\n"
               << "Start it with `ghostdrived`; files appear in ~/GhostDrive.\n";
     return 0;
 }
