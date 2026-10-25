@@ -601,33 +601,40 @@ TEST_F(Loopback, AFloodOfDatagramsDoesNotStarveStreams) {
     endpoints_.push_back(server.get());
 
     auto payload = random_payload(512 * 1024, 8);
-    auto frame = random_payload(Connection::kMaxDatagram, 9);
-    std::chrono::steady_clock::duration took{};
+    // Shared with the flooding coroutine, which may outlive this test if the echo stalls.
+    struct Flood {
+        core::Bytes frame = random_payload(Connection::kMaxDatagram, 9);
+        std::size_t queued = 0;
+        bool done = false;
+    };
+    auto flood = std::make_shared<Flood>();
+    bool echoed = false;
     run({[&]() -> awaitable<void> { co_await echo_server(server, 1); },
          [&]() -> awaitable<void> {
              auto conn = co_await client->connect(server->local_endpoint(),
                                                   server_key.public_key(), {.datagrams = true});
              CO_ASSERT_OK(conn);
-             bool done = false;
              // Keeps the frame queue full for as long as the echo runs.
              asio::co_spawn(
                  co_await asio::this_coro::executor,
-                 [&, c = conn.value()]() -> awaitable<void> {
-                     while (!done) {
-                         while (c->send_datagram(frame)) {
-                         }
+                 [flood, c = conn.value()]() -> awaitable<void> {
+                     while (!flood->done) {
+                         while (c->send_datagram(flood->frame)) ++flood->queued;
                          co_await sleep_for(1ms);
                      }
                  },
                  asio::detached);
-             auto start = std::chrono::steady_clock::now();
              co_await echo_once(conn.value(), payload);
-             took = std::chrono::steady_clock::now() - start;
-             done = true;
+             echoed = true;
+             flood->done = true;
              co_await sleep_for(5ms);
          }},
         30s);
-    EXPECT_LT(took, 10s) << "the stream starved behind DATAGRAM frames";
+    flood->done = true;
+    EXPECT_TRUE(echoed) << "the stream starved behind DATAGRAM frames";
+    // The queue was refilled throughout, so frames really competed with the stream: more were
+    // queued than the 64 the queue holds at once, and more than the echo's own packets.
+    EXPECT_GT(flood->queued, 2 * payload.size() / Connection::kMaxDatagram) << "the flood was too thin";
 }
 
 // A relayed connection must authenticate the key behind its virtual address. A malicious

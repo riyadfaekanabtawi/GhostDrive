@@ -334,9 +334,9 @@ document assumes the corrected version.
     of queueing, a second one per receiving client (8 MiB/s, 2 MiB burst) so many senders,
     such as throwaway clients in an earlier group, cannot flood one member together, and at
     most 64 frames waiting on each connection for congestion control (more are dropped).
-    While a connection also has stream data to send, queued frames get at most half of each
-    sending round before the streams and only what they leave after, so relayed traffic
-    cannot starve the control stream. `--allow-group HEX`
+    While a connection also has stream data to send, packets alternate strictly between
+    frames and stream data, with the turn kept across sending rounds, so relayed traffic
+    cannot starve the control stream even when congestion control allows one packet a round. `--allow-group HEX`
     restricts the server to the operator's own drives; `ghostdrive status` shows the group.
   - Daemons act on a `PeerAt` for one peer at most every 2 s and run at most 32 dials at once,
     so even a malicious server cannot turn them into amplifiers. Probes carry no key. Active
