@@ -187,6 +187,7 @@ Then copy `ghostdrive.exe` and `ghostdrived.exe` from the `windows-release` buil
 (`build\windows-release\cli` and `build\windows-release\daemon`) into `out`, and run
 `out\GhostDriveApp.exe`. The `windows` (Debug) build's programs need the vcpkg DLLs beside
 them, so for those set `build\windows\cli\ghostdrive.exe` as the tool in Settings instead.
+
 ### Linux desktop app
 
 `linux/ghostdrive-app` is a GTK 4 and libadwaita app. On first run it creates a drive or joins
