@@ -41,7 +41,8 @@ struct ServiceOptions {
     // Addresses put in invite codes. Empty: this host's non-loopback IPv4 addresses, then
     // 127.0.0.1.
     std::vector<asio::ip::address> invite_addresses;
-    // Advertise this device and find the others on the LAN (mDNS), when built with DNS-SD.
+    // Advertise this device and find the others on the LAN (mDNS), when built with DNS-SD or
+    // avahi-client.
     bool lan_discovery = true;
     // Rendezvous: how often to ask the server for members that are offline or only relayed,
     // and how long hole punching gets before the relay is tried.

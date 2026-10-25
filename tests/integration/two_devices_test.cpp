@@ -15,6 +15,7 @@
 #include "ghostdrive/daemon/drive.hpp"
 #include "ghostdrive/daemon/invite.hpp"
 #include "ghostdrive/daemon/service.hpp"
+#include "ghostdrive/discovery/lan_discovery.hpp"
 #include "ghostdrive/transport/frame.hpp"
 #include "temp_dir.hpp"
 
@@ -305,9 +306,15 @@ TEST_F(TwoDevices, UnpairedDevicesCannotConnectWithoutAnInvite) {
 }
 
 TEST_F(TwoDevices, DevicesFindEachOtherOnTheLanWithoutStoredAddresses) {
-#ifndef GHOSTDRIVE_HAVE_DNSSD
-    GTEST_SKIP() << "built without DNS-SD";
+#ifndef GHOSTDRIVE_HAVE_LAN_DISCOVERY
+    GTEST_SKIP() << "built without LAN discovery";
 #else
+    // Built with it, but the responder may be missing (avahi-daemon on CI runners).
+    if (auto probe = discovery::LanDiscovery::start(io_.get_executor(), 9,
+                                                    [] { return std::string("probe"); }, {});
+        !probe) {
+        GTEST_SKIP() << "no mDNS responder: " << probe.error().message;
+    }
     // Bound to every interface, since mDNS hands out the host's LAN address.
     ServiceOptions lan;
     lan.listen = asio::ip::udp::endpoint(asio::ip::address_v4::any(), 0);

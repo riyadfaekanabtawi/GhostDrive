@@ -143,7 +143,7 @@ Status Service::start() {
     asio::co_spawn(io_, accept_loop(), asio::detached);
     asio::co_spawn(io_, dial_loop(), asio::detached);
     asio::co_spawn(io_, rendezvous_loop(), asio::detached);
-#ifdef GHOSTDRIVE_HAVE_DNSSD
+#ifdef GHOSTDRIVE_HAVE_LAN_DISCOVERY
     if (options_.lan_discovery) {
         auto lan = discovery::LanDiscovery::start(
             io_, port(),
@@ -987,7 +987,7 @@ Status Service::refresh_membership(bool changed) {
 
 void Service::on_discovery_key_changed() {
     // request_peers registers again with the rendezvous server.
-#ifdef GHOSTDRIVE_HAVE_DNSSD
+#ifdef GHOSTDRIVE_HAVE_LAN_DISCOVERY
     if (lan_) lan_->refresh();
 #endif
 }

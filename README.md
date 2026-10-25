@@ -165,6 +165,10 @@ macOS (`brew install --cask macos-fuse-t/homebrew-cask/fuse-t`; free for non-com
 Without them it is skipped and everything else still builds. Mount tests carry the `mount` label;
 skip them with `ctest --preset default -LE mount` where mounting is not possible.
 
+LAN discovery on Linux needs the avahi-client development files (`libavahi-client-dev`) at build
+time and a running avahi-daemon. Without them the daemon still runs and reaches devices by stored
+addresses and the rendezvous server; the LAN tests skip when no avahi-daemon is reachable.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
