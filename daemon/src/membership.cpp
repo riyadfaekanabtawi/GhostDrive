@@ -47,8 +47,15 @@ core::Result<Membership> Membership::parse(std::span<const std::byte> data, cons
     }
     auto entries = decode_membership(data.subspan(pos));
     if (!entries) return corrupt();
-    for (auto& e : entries.value()) {
+    // A compacted log keeps entries about keys whose introducing add it dropped (such as this
+    // device's removes of devices removed for good), so every key mentioned is known, as
+    // compact() leaves it.
+    for (const auto& e : entries.value()) {
         if (!out.well_formed(e)) return corrupt();
+        out.known_.insert(e.author);
+        out.known_.insert(e.subject);
+    }
+    for (auto& e : entries.value()) {
         std::size_t live = 0;
         out.insert(std::move(e), nullptr, live);
     }

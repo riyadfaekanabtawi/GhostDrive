@@ -3,7 +3,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <random>
+#include <thread>
 
 namespace ghostdrive::daemon {
 namespace {
@@ -588,6 +590,278 @@ TEST(Membership, ReaddingDevicesThatAreOutCountsAgainstTheLiveLimit) {
     h.membership.merge(attack);
     auto view = h.membership.view();
     EXPECT_LE(view.members.size() + view.in_doubt.size() + 1, kMaxDevices);
+}
+
+// Keys from a counter, so the many keys the compaction tests need are the same on every run.
+core::DeviceKey seeded_key(std::uint32_t n) {
+    std::array<std::byte, core::kSeedSize> seed{};
+    for (std::size_t i = 0; i < 4; ++i) seed[i] = static_cast<std::byte>(n >> (8 * i));
+    return core::DeviceKey::from_seed(seed).value();
+}
+
+// Signed directly rather than through the author's own Membership, which would settle its
+// whole log for every entry.
+MembershipEntry signed_entry(const DriveId& drive, const core::DeviceKey& author,
+                             MembershipEntry::Kind kind, const core::PublicKey& subject) {
+    MembershipEntry e;
+    e.kind = kind;
+    e.author = author.public_key();
+    e.subject = subject;
+    if (kind == MembershipEntry::Kind::add) e.name = "k";
+    e.signature = author.sign(membership_signed_bytes(drive, e)).value();
+    return e;
+}
+
+std::size_t own_entries(const Device& d) {
+    auto all = d.membership.entries();
+    return static_cast<std::size_t>(std::count_if(
+        all.begin(), all.end(), [&](const MembershipEntry& e) { return e.author == d.id(); }));
+}
+
+// With h, m and the voucher, a wave takes every device slot.
+constexpr std::size_t kWaveSize = kMaxDevices - 3;
+
+// A voucher's devices: the voucher and m vouch, and each device vouches for everyone else in
+// the wave and removes the other devices, so each signs close to kMaxEntriesPerAuthor entries.
+// Each device's entries are signed on one of several threads; the result is the same.
+std::vector<MembershipEntry> wave_entries(const DriveId& drive, const core::DeviceKey& voucher,
+                                          const std::vector<core::DeviceKey>& devices,
+                                          const Device& h, const Device& m) {
+    using Kind = MembershipEntry::Kind;
+    std::vector<MembershipEntry> out;
+    for (const auto& d : devices)
+        out.push_back(signed_entry(drive, voucher, Kind::add, d.public_key()));
+    out.push_back(signed_entry(drive, m.key, Kind::add, voucher.public_key()));
+    const std::size_t head = out.size();
+    const std::size_t per_device = 3 + 2 * (devices.size() - 1);
+    out.resize(head + devices.size() * per_device);
+    auto sign_device = [&](std::size_t i) {
+        const auto& d = devices[i];
+        auto* next = &out[head + i * per_device];
+        *next++ = signed_entry(drive, d, Kind::add, voucher.public_key());
+        *next++ = signed_entry(drive, d, Kind::add, h.id());
+        *next++ = signed_entry(drive, d, Kind::add, m.id());
+        for (const auto& other : devices) {
+            if (&other == &d) continue;
+            *next++ = signed_entry(drive, d, Kind::add, other.public_key());
+            *next++ = signed_entry(drive, d, Kind::remove, other.public_key());
+        }
+    };
+    const std::size_t threads = std::clamp<std::size_t>(std::thread::hardware_concurrency(), 1, 8);
+    std::vector<std::thread> workers;
+    for (std::size_t t = 0; t < threads; ++t) {
+        workers.emplace_back([&, t] {
+            for (std::size_t i = t; i < devices.size(); i += threads) sign_device(i);
+        });
+    }
+    for (auto& w : workers) w.join();
+    return out;
+}
+
+// Fills h's log up to the limit for other authors' entries, without compacting. Waves of
+// devices come in until the log is full; h removes every wave but the last for good, so all
+// their entries (and m's vouches for their vouchers) no longer count. Those devices are `gone`.
+void fill_log(const DriveId& drive, Device& h, Device& m, std::set<core::PublicKey>& gone) {
+    pair(h, m);
+    h.sync_from(m);
+    const std::size_t room = kMaxMembershipEntries - kMaxOwnEntries;
+    std::uint32_t seed = 1;
+    for (;;) {
+        auto voucher = seeded_key(seed++);
+        std::vector<core::DeviceKey> devices;
+        for (std::size_t i = 0; i < kWaveSize; ++i) devices.push_back(seeded_key(seed++));
+        ASSERT_TRUE(h.membership.add(h.key, voucher.public_key(), "voucher", true));
+        auto entries = wave_entries(drive, voucher, devices, h, m);
+        auto left = room - h.membership.entries().size();
+        bool last = entries.size() >= left;
+        if (last) entries.resize(left);
+        ASSERT_EQ(h.membership.merge(entries), entries.size());
+        if (last) return;
+        std::vector<MembershipEntry> removes;
+        for (const auto& d : devices) {
+            removes.push_back(
+                signed_entry(drive, h.key, MembershipEntry::Kind::remove, d.public_key()));
+            gone.insert(d.public_key());
+        }
+        removes.push_back(
+            signed_entry(drive, h.key, MembershipEntry::Kind::remove, voucher.public_key()));
+        gone.insert(voucher.public_key());
+        ASSERT_EQ(h.membership.merge(removes), removes.size());
+        ASSERT_TRUE(h.membership.countersign(h.key));
+    }
+}
+
+TEST(Membership, AFullLogIsCompactedAndTakesEntriesAgain) {
+    auto id = drive_id(std::byte{1});
+    Device h(id, "desk");
+    Device m(id, "laptop");
+    std::set<core::PublicKey> gone;
+    fill_log(id, h, m, gone);
+    ASSERT_FALSE(HasFatalFailure());
+    auto full = h.membership.entries().size();
+    ASSERT_EQ(full, kMaxMembershipEntries - kMaxOwnEntries);
+    auto before = h.membership.view();
+
+    // A remove of this device never counts here, so this entry by m changes neither list.
+    auto e = signed_entry(id, m.key, MembershipEntry::Kind::remove, h.id());
+    EXPECT_EQ(h.membership.merge(std::span(&e, 1)), 1u);
+    auto stored = h.membership.entries();
+    EXPECT_LT(stored.size(), full / 2);
+    EXPECT_EQ(stored.back(), e);
+    auto after = h.membership.view();
+    EXPECT_EQ(after.members, before.members);
+    EXPECT_EQ(after.removed, before.removed);
+    EXPECT_EQ(after.in_doubt, before.in_doubt);
+    EXPECT_TRUE(after.members.contains(m.id()));
+
+    // And entries keep coming in, from m and from h itself. (Every device slot is taken, so
+    // they are about a device already known.)
+    ASSERT_FALSE(before.in_doubt.empty());
+    auto doubted = *before.in_doubt.begin();
+    auto vouch = signed_entry(id, m.key, MembershipEntry::Kind::add, doubted);
+    EXPECT_EQ(h.membership.merge(std::span(&vouch, 1)), 1u);
+    EXPECT_TRUE(h.membership.add(h.key, doubted, "k", false));
+    EXPECT_EQ(h.membership.entries().size(), stored.size() + 2);
+}
+
+TEST(Membership, CompactionDropsEntriesThatNoLongerCount) {
+    auto id = drive_id(std::byte{1});
+    Device h(id, "desk");
+    Device m(id, "laptop");
+    std::set<core::PublicKey> gone;
+    fill_log(id, h, m, gone);
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_FALSE(gone.empty());
+    auto e = signed_entry(id, m.key, MembershipEntry::Kind::remove, h.id());
+    ASSERT_EQ(h.membership.merge(std::span(&e, 1)), 1u);
+
+    // Counted rather than checked one by one: a broken compaction leaves tens of thousands.
+    std::size_t by_gone = 0, about_gone = 0, own_adds_of_gone = 0, own_removes_of_gone = 0;
+    for (const auto& s : h.membership.entries()) {
+        if (s.author == h.id()) {
+            if (!gone.contains(s.subject)) continue;
+            if (s.kind == MembershipEntry::Kind::add) ++own_adds_of_gone;
+            if (s.kind == MembershipEntry::Kind::remove) ++own_removes_of_gone;
+            continue;
+        }
+        if (gone.contains(s.author)) ++by_gone;
+        if (gone.contains(s.subject)) ++about_gone;
+    }
+    EXPECT_EQ(by_gone, 0u);
+    EXPECT_EQ(about_gone, 0u);
+    EXPECT_EQ(own_adds_of_gone, 0u);
+    // Fewer than kMaxKnownKeys, so this device's removes all stay to tell the others.
+    ASSERT_LE(gone.size(), kMaxKnownKeys);
+    EXPECT_EQ(own_removes_of_gone, gone.size());
+
+    auto parsed = Membership::parse(h.membership.serialize(), id, h.id());
+    ASSERT_TRUE(parsed) << parsed.error().message;
+    EXPECT_EQ(parsed.value().entries(), h.membership.entries());
+    EXPECT_EQ(parsed.value().view().members, h.membership.view().members);
+    EXPECT_EQ(parsed.value().view().removed, h.membership.view().removed);
+}
+
+TEST(Membership, CompactionKeepsOnlyTheNewestOwnRemoves) {
+    auto id = drive_id(std::byte{1});
+    Device h(id, "desk");
+    std::vector<core::PublicKey> removed;  // in the order h removed them
+    std::uint32_t seed = 1;
+    // Each round h adds a voucher, which vouches for as many devices as fit, and h removes them
+    // all for good: one add and kMaxDevices - 1 removes, until h's own entries are full.
+    for (std::size_t round = 0; round < kMaxOwnEntries / kMaxDevices; ++round) {
+        auto voucher = seeded_key(seed++);
+        ASSERT_TRUE(h.membership.add(h.key, voucher.public_key(), "voucher", true));
+        std::vector<MembershipEntry> adds;
+        for (std::size_t i = 0; i < kMaxDevices - 2; ++i) {
+            adds.push_back(signed_entry(id, voucher, MembershipEntry::Kind::add,
+                                        seeded_key(seed++).public_key()));
+        }
+        ASSERT_EQ(h.membership.merge(adds), adds.size());
+        for (const auto& a : adds) {
+            ASSERT_TRUE(h.membership.remove(h.key, a.subject));
+            removed.push_back(a.subject);
+        }
+        ASSERT_TRUE(h.membership.remove(h.key, voucher.public_key()));
+        removed.push_back(voucher.public_key());
+        ASSERT_TRUE(h.membership.countersign(h.key));
+    }
+    ASSERT_EQ(own_entries(h), kMaxOwnEntries);
+    ASSERT_GT(removed.size(), kMaxKnownKeys);
+
+    Device newcomer(id, "phone");
+    ASSERT_TRUE(h.membership.add(h.key, newcomer.id(), "phone", true));
+    std::vector<core::PublicKey> kept;
+    for (const auto& e : h.membership.entries()) {
+        if (e.author == h.id() && e.kind == MembershipEntry::Kind::remove)
+            kept.push_back(e.subject);
+    }
+    std::vector<core::PublicKey> newest(removed.end() - kMaxKnownKeys, removed.end());
+    EXPECT_EQ(kept, newest);
+    EXPECT_TRUE(h.has(newcomer));
+    for (const auto& key : removed) EXPECT_TRUE(h.membership.view().removed.contains(key));
+}
+
+TEST(Membership, AFullLogThatFreesNothingIsNotCompactedOnEveryTry) {
+    auto id = drive_id(std::byte{1});
+    Device h(id, "desk");
+    std::uint32_t seed = 1;
+    // h's own entries, none of which compaction may drop: kMaxKnownKeys removes of devices
+    // removed for good (their vouchers stay members), then adds and removes of devices that
+    // are not removed for good, since h never countersigns those.
+    constexpr std::size_t kRounds = 8;
+    for (std::size_t round = 0; round < kRounds; ++round) {
+        auto voucher = seeded_key(seed++);
+        ASSERT_TRUE(h.membership.add(h.key, voucher.public_key(), "voucher", true));
+        std::vector<MembershipEntry> adds;
+        for (std::size_t i = 0; i < kMaxKnownKeys / kRounds; ++i) {
+            adds.push_back(signed_entry(id, voucher, MembershipEntry::Kind::add,
+                                        seeded_key(seed++).public_key()));
+        }
+        ASSERT_EQ(h.membership.merge(adds), adds.size());
+        for (const auto& a : adds) ASSERT_TRUE(h.membership.remove(h.key, a.subject));
+        ASSERT_TRUE(h.membership.countersign(h.key));
+    }
+    while (own_entries(h) < kMaxOwnEntries) {
+        std::vector<core::PublicKey> batch;
+        for (std::size_t i = 0; i < 31 && own_entries(h) < kMaxOwnEntries; ++i) {
+            batch.push_back(seeded_key(seed++).public_key());
+            ASSERT_TRUE(h.membership.add(h.key, batch.back(), "k", false));
+        }
+        for (const auto& key : batch) {
+            if (own_entries(h) == kMaxOwnEntries) break;
+            ASSERT_TRUE(h.membership.remove(h.key, key));
+        }
+    }
+    ASSERT_EQ(own_entries(h), kMaxOwnEntries);
+    // This try compacts, frees none of h's own entries, and fails.
+    EXPECT_FALSE(h.membership.add(h.key, seeded_key(seed++).public_key(), "k", false));
+    ASSERT_EQ(own_entries(h), kMaxOwnEntries);
+
+    // Own entries that cannot be placed, offered twice: the second time they are already
+    // verified, so the merge costs one settle (a view) plus cheap lookups, unless every try
+    // compacts again, which costs at least a settle each.
+    constexpr std::size_t kTries = 2000;
+    std::vector<MembershipEntry> extra;
+    for (std::size_t i = 0; i < kTries; ++i) {
+        extra.push_back(
+            signed_entry(id, h.key, MembershipEntry::Kind::add, seeded_key(seed++).public_key()));
+    }
+    ASSERT_EQ(h.membership.merge(extra), 0u);
+    using Clock = std::chrono::steady_clock;
+    std::vector<Clock::duration> views;
+    for (int i = 0; i < 5; ++i) {
+        auto start = Clock::now();
+        (void)h.membership.view();
+        views.push_back(Clock::now() - start);
+    }
+    std::sort(views.begin(), views.end());
+    auto start = Clock::now();
+    EXPECT_EQ(h.membership.merge(extra), 0u);
+    auto merge = Clock::now() - start;
+    EXPECT_LT(merge, views[views.size() / 2] * (kTries / 10))
+        << "merge took " << std::chrono::duration<double, std::milli>(merge).count()
+        << " ms, a view "
+        << std::chrono::duration<double, std::milli>(views[views.size() / 2]).count() << " ms";
 }
 
 }  // namespace

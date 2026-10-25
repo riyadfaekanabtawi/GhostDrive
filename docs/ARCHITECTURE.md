@@ -375,8 +375,7 @@ As built after step (c), before discovery (ahead of the planned order so the dri
     removes others more than `countersign_after` before its own removal reaches a device wins
     there, as any member's remove would. A member that churns through hundreds of removals
     can push old removes out of every device's log, so a device offline throughout may not
-    hear of them. Log compaction is not covered by a test yet (filling the log takes tens of
-    thousands of signatures). Devices a member vouched for while still trusted
+    hear of them. Devices a member vouched for while still trusted
     stay until removed by hand.
 - **Index exchange** follows section 6. Each side opens one stream per connection and sends
   `Hello{index_id, max_sequence}`; the receiver answers `IndexRequest{after}` from its stored
