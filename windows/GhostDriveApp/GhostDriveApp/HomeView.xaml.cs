@@ -76,7 +76,7 @@ public sealed partial class HomeView : UserControl, IPage
             RendezvousDot.Fill = Ui.Brush("SystemFillColorNeutralBrush");
             RendezvousText.Text = "No rendezvous server set.";
             RendezvousDetail.Text =
-                "Devices are reached at the addresses they were last seen at. Set a server in Settings to reach devices on other networks.";
+                "Devices on this network are found directly. Set a server in Settings to reach devices on other networks.";
         }
         else if (rv.Connected)
         {
