@@ -41,7 +41,7 @@ void Endpoint::SslCtxDeleter::operator()(ssl_ctx_st* ctx) const noexcept {
 Endpoint::Endpoint(Private, asio::any_io_executor executor, EndpointOptions options)
     : executor_(std::move(executor)),
       options_(std::move(options)),
-      rx_buffer_(kReceiveBufferSize),
+      rx_(std::make_shared<Receive>(Receive{std::vector<std::uint8_t>(kReceiveBufferSize), {}})),
       socket_(executor_) {
     if (options_.impairment.active()) impairer_.emplace(options_.impairment);
 }
@@ -162,8 +162,8 @@ void Endpoint::on_established(const std::shared_ptr<Connection>& conn) {
 
 void Endpoint::start_receive() {
     socket_.async_receive_from(
-        asio::buffer(rx_buffer_), rx_from_,
-        [weak = weak_from_this()](const std::error_code& ec, std::size_t length) {
+        asio::buffer(rx_->buffer), rx_->from,
+        [weak = weak_from_this(), rx = rx_](const std::error_code& ec, std::size_t length) {
             auto self = weak.lock();
             if (!self || self->closed_ || ec == asio::error::operation_aborted) return;
             // Other errors (for example ICMP port unreachable reported on the socket) only
@@ -174,13 +174,13 @@ void Endpoint::start_receive() {
 }
 
 void Endpoint::on_receive(std::size_t length) {
-    auto packet = std::span<const std::uint8_t>(rx_buffer_.data(), length);
+    auto packet = std::span<const std::uint8_t>(rx_->buffer.data(), length);
     switch (classify_packet(std::as_bytes(packet))) {
         case PacketKind::quic:
-            route_quic(packet, rx_from_);
+            route_quic(packet, rx_->from);
             break;
         case PacketKind::ghostdrive:
-            if (datagram_handler_) datagram_handler_(std::as_bytes(packet), rx_from_);
+            if (datagram_handler_) datagram_handler_(std::as_bytes(packet), rx_->from);
             break;
         case PacketKind::unknown:
             break;
