@@ -34,6 +34,7 @@ public sealed partial class HomeView : UserControl, IPage
                 : "Start GhostDrive to mount the drive and reach your other devices.";
         RunningDetail.Visibility = Ui.Visible(RunningDetail.Text.Length > 0);
         StartButton.Visibility = Ui.Visible(model.CheckedOnce && s is null);
+        StartRow.Visibility = Ui.Visible(busy || StartButton.Visibility == Visibility.Visible);
         StartButton.IsEnabled = !busy && model.Cli.Path is not null;
 
         var mounted = s?.Mountpoint;

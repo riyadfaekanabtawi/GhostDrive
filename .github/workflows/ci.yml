@@ -211,7 +211,11 @@ jobs:
 
       - name: Build the app
         working-directory: windows/GhostDriveApp
-        run: dotnet publish GhostDriveApp -c Release -o "$env:RUNNER_TEMP\GhostDriveApp"
+        run: |
+          dotnet publish GhostDriveApp -c Release -o "$env:RUNNER_TEMP\GhostDriveApp"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $files = Get-ChildItem -Recurse -File "$env:RUNNER_TEMP\GhostDriveApp"
+          "{0} files, {1:N1} MB" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB)
 
       # ghostdrive.exe and ghostdrived.exe for the UI check, from the windows preset with the
       # vcpkg tree the windows job caches (restored only; that job saves it).

@@ -34,7 +34,7 @@
                 </StackPanel>
                 <TextBlock x:Name="RunningDetail" TextWrapping="Wrap"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                <StackPanel Orientation="Horizontal" Spacing="8">
+                <StackPanel x:Name="StartRow" Orientation="Horizontal" Spacing="8">
                     <Button x:Name="StartButton" Content="Start GhostDrive" Style="{StaticResource AccentButtonStyle}"
                             Click="OnStart" />
                     <ProgressRing x:Name="Busy" IsActive="False" Width="20" Height="20" />
