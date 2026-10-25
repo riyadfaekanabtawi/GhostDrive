@@ -155,6 +155,10 @@ is also usable from scripts.
   or `CON`) are not shown there, and of names that differ only in case only one is shown (the
   one whose name sorts first, so `Report.txt` before `report.txt`); the others stay on the
   drive but cannot be reached from Windows.
+- Saving on Windows to the exact name of such a hidden variant writes to the visible one:
+  saving `report.txt` overwrites what Linux and macOS devices see as `Report.txt`. A folder
+  mountpoint (`--mount C:\M\X`) is refused if another user could rename or change one of its
+  existing parent folders; mount inside your user profile or at a drive letter instead.
 - A device that stays offline while more than three devices are removed may not find the
   others through the rendezvous server when it comes back; it reconnects once it sees one of
   them on the local network or reaches an address it has stored.

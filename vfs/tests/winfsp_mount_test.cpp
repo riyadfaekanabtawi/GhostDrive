@@ -30,6 +30,7 @@
 #include "ghostdrive/core/hlc.hpp"
 #include "ghostdrive/vfs/chunk_exchange.hpp"
 #include "temp_dir.hpp"
+#include "winfsp_names.hpp"
 
 namespace ghostdrive::vfs {
 namespace {
@@ -70,6 +71,35 @@ struct Handle {
     }
 };
 
+// Where a test's mountpoints go: a private directory in the user's temp folder. Mounting refuses
+// parents that other users could change, and the build tree may lie below one (on CI runners,
+// D:\ lets all users modify its folders). Only empty directories are created here; WinFsp
+// removes each mountpoint on unmount.
+class MountDir {
+public:
+    MountDir() {
+        wchar_t temp[MAX_PATH + 1] = {};
+        const DWORD n = ::GetTempPathW(MAX_PATH + 1, temp);
+        const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+        path_ = std::filesystem::path(std::wstring(temp, n)) / "ghostdrive-tests" /
+                (std::string(info->test_suite_name()) + "." + info->name());
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+        EXPECT_TRUE(core::make_private_dir(path_));
+    }
+    MountDir(const MountDir&) = delete;
+    MountDir& operator=(const MountDir&) = delete;
+    ~MountDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    }
+
+    const std::filesystem::path& path() const noexcept { return path_; }
+
+private:
+    std::filesystem::path path_;
+};
+
 class WinFsp : public ::testing::Test {
 protected:
     WinFsp()
@@ -78,7 +108,7 @@ protected:
           index_(
               core::MetadataIndex::open(dir_.path() / "index.db", core::DriveId{}, key_).value()),
           cache_(128 * 1024 * 1024) {
-        mountpoint_ = dir_.path() / "mnt";  // WinFsp creates it
+        mountpoint_ = mounts_.path() / "mnt";  // WinFsp creates it
     }
 
     ~WinFsp() override {
@@ -214,6 +244,7 @@ protected:
     }
 
     test::TempDir dir_;
+    MountDir mounts_;
     asio::io_context io_;
     std::optional<asio::executor_work_guard<asio::io_context::executor_type>> work_{
         io_.get_executor()};
@@ -426,12 +457,98 @@ TEST_F(WinFsp, OnlyTheCurrentUserHasAccess) {
 TEST_F(WinFsp, DirectoryMountpointComesAndGoes) {
     add("f.txt", random_bytes(10, 13));
     // Missing parents are created private to this user.
-    ASSERT_NO_FATAL_FAILURE(start(false, dir_.path() / "a" / "b" / "mnt"));
-    EXPECT_TRUE(core::is_private_dir(dir_.path() / "a"));
-    EXPECT_TRUE(core::is_private_dir(dir_.path() / "a" / "b"));
+    ASSERT_NO_FATAL_FAILURE(start(false, mounts_.path() / "a" / "b" / "mnt"));
+    EXPECT_TRUE(core::is_private_dir(mounts_.path() / "a"));
+    EXPECT_TRUE(core::is_private_dir(mounts_.path() / "a" / "b"));
     EXPECT_TRUE(std::filesystem::exists(mountpoint_ / "f.txt"));
     mount_->unmount();
     EXPECT_FALSE(std::filesystem::exists(mountpoint_));
+}
+
+std::wstring my_sid() {
+    HANDLE token = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token)) return {};
+    DWORD len = 0;
+    ::GetTokenInformation(token, TokenUser, nullptr, 0, &len);
+    std::vector<BYTE> user(len);
+    const bool got = len != 0 && ::GetTokenInformation(token, TokenUser, user.data(), len, &len);
+    ::CloseHandle(token);
+    LPWSTR text = nullptr;
+    if (!got ||
+        !::ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid, &text)) {
+        return {};
+    }
+    std::wstring out(text);
+    ::LocalFree(text);
+    return out;
+}
+
+// Gives `dir` a protected DACL: full access for this user plus `extra` ACEs in SDDL.
+bool set_dacl(const std::filesystem::path& dir, const std::wstring& extra) {
+    const std::wstring sddl = L"D:P(A;OICI;FA;;;" + my_sid() + L")" + extra;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd,
+                                                                nullptr)) {
+        return false;
+    }
+    const bool ok =
+        ::SetFileSecurityW(dir.c_str(),
+                           DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                           sd) != FALSE;
+    ::LocalFree(sd);
+    return ok;
+}
+
+// An existing parent that someone else could rename, replace or change makes the mount fail,
+// and nothing is created below it. Only adding entries is allowed, as C:\ allows everyone.
+TEST_F(WinFsp, RefusesParentsOthersCanChange) {
+    ASSERT_NO_FATAL_FAILURE(prepare());
+    const auto shared = mounts_.path() / "shared";
+    std::filesystem::create_directories(shared / "mine");
+    ASSERT_TRUE(core::make_private_dir(shared / "mine"));
+    // Everyone (WD) may delete entries in it (FILE_DELETE_CHILD, 0x40) or rename it (DELETE).
+    for (const wchar_t* ace : {L"(A;;0x40;;;WD)", L"(A;;0x10000;;;WD)", L"(A;;WD;;;WD)"}) {
+        ASSERT_TRUE(set_dacl(shared, ace)) << ::GetLastError();
+        // Directly above the mountpoint, above a missing parent, and above an existing private
+        // parent.
+        for (const auto& at : {shared / "mnt", shared / "new" / "mnt", shared / "mine" / "mnt"}) {
+            auto mounted = try_mount(at);
+            ASSERT_FALSE(mounted);
+            EXPECT_EQ(mounted.error().code, core::Errc::permission) << mounted.error().message;
+            EXPECT_NE(mounted.error().message.find("S-1-1-0"), std::string::npos)
+                << mounted.error().message;
+        }
+        EXPECT_FALSE(std::filesystem::exists(shared / "new"));
+    }
+    // Deny entries, inherit-only entries and the right to add entries are not a problem.
+    ASSERT_TRUE(set_dacl(shared,
+                         L"(A;;0x1200a9;;;WD)(A;;0x4;;;WD)(A;OICIIO;FA;;;WD)"
+                         L"(D;;FA;;;AN)"));
+    auto mounted = try_mount(shared / "new" / "mnt");
+    ASSERT_TRUE(mounted) << mounted.error().message;
+    EXPECT_TRUE(core::is_private_dir(shared / "new"));
+    mounted.value()->unmount();
+
+    // A junction or directory link above the mountpoint is refused rather than followed.
+    const auto target = mounts_.path() / "target";
+    std::filesystem::create_directories(target);
+    const auto link = mounts_.path() / "link";
+    std::error_code ec;
+    std::filesystem::create_directory_symlink(target, link, ec);
+    if (!ec) {
+        auto through_link = try_mount(link / "mnt");
+        ASSERT_FALSE(through_link);
+        EXPECT_EQ(through_link.error().code, core::Errc::permission);
+        EXPECT_FALSE(std::filesystem::exists(target / "mnt"));
+    }
+}
+
+TEST(WinFspNames, AFailedFoldMatchesNothing) {
+    EXPECT_EQ(detail::fold_name(L"Report.txt", LOCALE_NAME_INVARIANT), std::wstring(L"REPORT.TXT"));
+    EXPECT_EQ(detail::fold_name(L"", LOCALE_NAME_INVARIANT), std::wstring());
+    // A malformed locale name makes LCMapStringEx fail; the result is no key at all, not the raw
+    // name, which would not compare the way the kernel's uppercasing does.
+    EXPECT_FALSE(detail::fold_name(L"report.txt", L"not a locale!").has_value());
 }
 
 TEST_F(WinFsp, LeavesWhatIsAlreadyAtTheMountpointAlone) {
@@ -444,9 +561,9 @@ TEST_F(WinFsp, LeavesWhatIsAlreadyAtTheMountpointAlone) {
     EXPECT_TRUE(std::filesystem::is_directory(mountpoint_));
 
     // So is a junction or directory link, which is not followed or removed.
-    const auto target = dir_.path() / "target";
+    const auto target = mounts_.path() / "target";
     std::filesystem::create_directories(target);
-    const auto link = dir_.path() / "link";
+    const auto link = mounts_.path() / "link";
     std::error_code ec;
     std::filesystem::create_directory_symlink(target, link, ec);
     if (!ec) {
@@ -456,10 +573,10 @@ TEST_F(WinFsp, LeavesWhatIsAlreadyAtTheMountpointAlone) {
     }
 
     // A data directory inside the mount is refused.
-    auto around_data = try_mount(dir_.path() / "outer", dir_.path() / "outer" / "data");
+    auto around_data = try_mount(mounts_.path() / "outer", mounts_.path() / "outer" / "data");
     ASSERT_FALSE(around_data);
     EXPECT_EQ(around_data.error().code, core::Errc::invalid_argument);
-    EXPECT_FALSE(std::filesystem::exists(dir_.path() / "outer"));
+    EXPECT_FALSE(std::filesystem::exists(mounts_.path() / "outer"));
 }
 
 // WinFsp keeps one kernel file node per name compared without case, so of names that differ
@@ -540,9 +657,9 @@ TEST_F(WinFsp, UnmountingWithASlowReadInFlightIsSafe) {
 
     // The process is intact and a new mount reads the file.
     mount_.reset();
-    auto again = try_mount(dir_.path() / "mnt2");
+    auto again = try_mount(mounts_.path() / "mnt2");
     ASSERT_TRUE(again) << again.error().message;
-    EXPECT_TRUE(read_whole(dir_.path() / "mnt2" / "remote.bin") == remote);
+    EXPECT_TRUE(read_whole(mounts_.path() / "mnt2" / "remote.bin") == remote);
 }
 
 TEST_F(WinFsp, WritesOnHandlesStillOpenAtUnmountAreCommitted) {

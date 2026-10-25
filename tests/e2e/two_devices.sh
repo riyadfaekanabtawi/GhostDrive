@@ -18,6 +18,7 @@ cleanup() {
         for _ in $(seq 150); do kill -0 "$p" 2>/dev/null || break; sleep 0.1; done
         kill "$p" 2>/dev/null
     done
+    cleanup_mount_parent
 }
 trap cleanup EXIT
 

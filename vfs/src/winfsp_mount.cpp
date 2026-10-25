@@ -16,14 +16,14 @@
 typedef NTSTATUS* PNTSTATUS;
 #include <winfsp/winfsp.h>
 #include <sddl.h>
+#include <aclapi.h>
 // clang-format on
 
 #include "ghostdrive/vfs/winfsp_mount.hpp"
 
-#include "ghostdrive/core/file.hpp"
-
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdio>
@@ -31,6 +31,7 @@ typedef NTSTATUS* PNTSTATUS;
 #include <cwchar>
 #include <cwctype>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -41,10 +42,27 @@ typedef NTSTATUS* PNTSTATUS;
 #include <utility>
 #include <vector>
 
+#include "winfsp_names.hpp"
+
 namespace ghostdrive::vfs {
 
 using core::Errc;
 using core::Error;
+
+std::optional<std::wstring> detail::fold_name(std::wstring_view name, const wchar_t* locale) {
+    if (name.empty()) return std::wstring();
+    if (name.size() > static_cast<std::size_t>(INT_MAX)) return std::nullopt;
+    const int in = static_cast<int>(name.size());
+    const int n =
+        ::LCMapStringEx(locale, LCMAP_UPPERCASE, name.data(), in, nullptr, 0, nullptr, nullptr, 0);
+    if (n <= 0) return std::nullopt;
+    std::wstring out(static_cast<std::size_t>(n), L'\0');
+    if (::LCMapStringEx(locale, LCMAP_UPPERCASE, name.data(), in, out.data(), n, nullptr, nullptr,
+                        0) != n) {
+        return std::nullopt;
+    }
+    return out;
+}
 
 namespace {
 
@@ -89,20 +107,8 @@ bool equal_ignoring_case(std::wstring_view a, std::wstring_view b) {
                                   static_cast<int>(b.size()), TRUE) == CSTR_EQUAL;
 }
 
-// The key two names share when Windows treats them as the same name: uppercase by file system
-// rules (LCMapStringEx without LCMAP_LINGUISTIC_CASING, documented as the file system casing).
-std::wstring fold(std::wstring_view name) {
-    if (name.empty()) return {};
-    const int in = static_cast<int>(name.size());
-    const int n = ::LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, name.data(), in, nullptr,
-                                  0, nullptr, nullptr, 0);
-    if (n <= 0) return std::wstring(name);
-    std::wstring out(static_cast<std::size_t>(n), L'\0');
-    if (::LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, name.data(), in, out.data(), n,
-                        nullptr, nullptr, 0) != n) {
-        return std::wstring(name);
-    }
-    return out;
+std::optional<std::wstring> fold(std::wstring_view name) {
+    return detail::fold_name(name, LOCALE_NAME_INVARIANT);
 }
 
 // A name Windows can create and open: no control or reserved characters, no trailing dot or
@@ -292,14 +298,19 @@ struct Child {
 // compared that way. So of the entries in a directory whose names differ only in case (possible
 // from POSIX devices), exactly one is visible: the first in the Tree's order, which sorts names
 // by their UTF-8 bytes ("Report.txt" before "report.txt"). Every spelling resolves to it, even
-// the exact name of a hidden one, and listings show only it.
+// the exact name of a hidden one, and listings show only it. A name that cannot be folded matches
+// nothing, and an entry whose name cannot be folded is neither found nor listed.
 std::optional<Child> find_child(const Filesystem& fs, Ino parent, std::wstring_view name) {
+    const auto key = fold(name);
+    if (!key) return std::nullopt;
     auto entries = fs.readdir(parent);
     if (!entries) return std::nullopt;
-    const std::wstring key = fold(name);
     for (auto& e : *entries) {
         auto wide = to_wide(e.name);
-        if (wide && fold(*wide) == key) return Child{e.ino, std::move(e.name)};
+        if (!wide) continue;
+        if (auto folded = fold(*wide); folded && *folded == *key) {
+            return Child{e.ino, std::move(e.name)};
+        }
     }
     return std::nullopt;
 }
@@ -420,7 +431,8 @@ NTSTATUS op_create(FSP_FILE_SYSTEM* fsp, PWSTR name, UINT32 create_options, UINT
             return STATUS_OBJECT_PATH_NOT_FOUND;
         }
         auto utf8 = to_utf8(leaf);
-        if (!windows_name_ok(leaf) || !utf8) return STATUS_OBJECT_NAME_INVALID;
+        // Without its folded form, an existing entry of the same name could not be detected.
+        if (!windows_name_ok(leaf) || !utf8 || !fold(leaf)) return STATUS_OBJECT_NAME_INVALID;
         if (find_child(self.fs, parent.ino, leaf)) return STATUS_OBJECT_NAME_COLLISION;
 
         auto node = std::make_unique<Node>();
@@ -795,7 +807,9 @@ NTSTATUS op_rename(FSP_FILE_SYSTEM* fsp, PVOID context, PWSTR name, PWSTR new_na
         auto source = find_child(self.fs, from_parent.ino, from_leaf);
         if (!source || source->ino != node.ino) return STATUS_OBJECT_NAME_NOT_FOUND;
         auto target = to_utf8(to_leaf);
-        if (!windows_name_ok(to_leaf) || !target) return STATUS_OBJECT_NAME_INVALID;
+        if (!windows_name_ok(to_leaf) || !target || !fold(to_leaf)) {
+            return STATUS_OBJECT_NAME_INVALID;
+        }
         if (auto existing = find_child(self.fs, to_parent.ino, to_leaf);
             existing && existing->ino != source->ino) {
             // A name that differs only in case is the same name here.
@@ -845,7 +859,9 @@ NTSTATUS op_read_directory(FSP_FILE_SYSTEM* fsp, PVOID context, PWSTR, PWSTR mar
             std::unordered_set<std::wstring> seen;
             for (const auto& e : *entries) {
                 auto wide = to_wide(e.name);
-                if (!wide || !seen.insert(fold(*wide)).second) continue;
+                if (!wide) continue;
+                auto folded = fold(*wide);
+                if (!folded || !seen.insert(std::move(*folded)).second) continue;
                 if (windows_name_ok(*wide)) listing.emplace_back(std::move(*wide), e.ino);
             }
             std::sort(listing.begin(), listing.end());
@@ -917,60 +933,227 @@ std::string status_text(NTSTATUS st) {
     return text;
 }
 
-// O:user G:user D:P(A;;FA;;;user): the current user owns everything and is the only one let
-// in. Self-relative, as WinFsp requires.
-bool make_owner_only(Impl& self) {
+// The current user's SID from the process token; empty if it cannot be read.
+std::vector<BYTE> current_user_sid() {
     HANDLE token = nullptr;
-    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token)) return {};
     DWORD len = 0;
     ::GetTokenInformation(token, TokenUser, nullptr, 0, &len);
     std::vector<BYTE> buffer(len);
     const bool got = len != 0 && ::GetTokenInformation(token, TokenUser, buffer.data(), len, &len);
     ::CloseHandle(token);
-    if (!got) return false;
-    LPWSTR sid = nullptr;
-    if (!::ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid, &sid)) {
-        return false;
+    if (!got) return {};
+    PSID sid = reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid;
+    std::vector<BYTE> out(::GetLengthSid(sid));
+    if (!::CopySid(static_cast<DWORD>(out.size()), out.data(), sid)) return {};
+    return out;
+}
+
+std::optional<std::wstring> sid_text(PSID sid) {
+    LPWSTR text = nullptr;
+    if (sid == nullptr || !::ConvertSidToStringSidW(sid, &text)) return std::nullopt;
+    std::wstring out(text);
+    ::LocalFree(text);
+    return out;
+}
+
+std::string sid_name(PSID sid) {
+    auto text = sid_text(sid);
+    return text ? to_utf8(*text).value_or("?") : "?";
+}
+
+using LocalPtr = std::unique_ptr<void, decltype(&::LocalFree)>;
+
+// O:user G:user D:P(A;<inherit>;FA;;;user): the current user owns it and is the only one let in.
+// Self-relative. `inherit` holds the ACE flags, "OICI" for a directory whose contents inherit it.
+LocalPtr owner_only_sd(const std::wstring& user, const wchar_t* inherit, ULONG* size) {
+    const std::wstring sddl =
+        L"O:" + user + L"G:" + user + L"D:P(A;" + inherit + L";FA;;;" + user + L")";
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd,
+                                                                size)) {
+        sd = nullptr;
     }
-    const std::wstring user(sid);
-    ::LocalFree(sid);
-    const std::wstring sddl = L"O:" + user + L"G:" + user + L"D:P(A;;FA;;;" + user + L")";
-    return ::ConvertStringSecurityDescriptorToSecurityDescriptorW(
-               sddl.c_str(), SDDL_REVISION_1, &self.security, &self.security_size) != FALSE;
+    return LocalPtr(sd, &::LocalFree);
+}
+
+// The descriptor returned for every file and directory, as WinFsp requires.
+bool make_owner_only(Impl& self) {
+    auto sid = current_user_sid();
+    auto user = sid.empty() ? std::nullopt : sid_text(sid.data());
+    if (!user) return false;
+    self.security = owner_only_sd(*user, L"", &self.security_size).release();
+    return self.security != nullptr;
 }
 
 bool is_drive_letter(const std::wstring& point) {
     return point.size() == 2 && std::iswalpha(point[0]) && point[1] == L':';
 }
 
-// Creates the missing directories of `dir` owner-only, from the top down, so no one else can
-// replace one of them (with a junction to elsewhere, say) before the mount exists. Existing
-// ones are left as they are.
-core::Status make_parents_private(const std::filesystem::path& dir) {
-    std::vector<std::filesystem::path> missing;
-    std::error_code ec;
-    for (auto p = dir;
-         !p.empty() && !std::filesystem::exists(std::filesystem::symlink_status(p, ec));
-         p = p.parent_path()) {
-        missing.push_back(p);
-        if (p == p.parent_path()) break;
+// Rights over a directory that let their holder rename or remove it or an entry in it, turn it
+// into a junction (FSCTL_SET_REPARSE_POINT needs write access to the directory), or give
+// themselves those rights. Adding an entry (FILE_ADD_SUBDIRECTORY, which C:\ grants to all
+// authenticated users) is not among them: a component that appears before the mount makes it
+// fail, since prepare_parents creates each missing one with CreateDirectoryW, which fails if it
+// exists, and WinFsp refuses an existing mountpoint.
+constexpr ACCESS_MASK kChangeRights = DELETE | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER |
+                                      FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA |
+                                      GENERIC_WRITE | GENERIC_ALL;
+
+// TrustedInstaller, which owns system directories.
+constexpr const wchar_t* kTrustedInstaller =
+    L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+// The user, and the accounts that can change any file anyway: SYSTEM, Administrators and
+// TrustedInstaller.
+bool trusted(PSID sid, PSID user) {
+    if (::EqualSid(sid, user) || ::IsWellKnownSid(sid, WinLocalSystemSid) ||
+        ::IsWellKnownSid(sid, WinBuiltinAdministratorsSid)) {
+        return true;
     }
-    for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
-        if (auto st = core::make_private_dir(*it); !st) return st;
+    auto text = sid_text(sid);
+    return text && *text == kTrustedInstaller;
+}
+
+struct OwnedHandle {
+    HANDLE h = INVALID_HANDLE_VALUE;
+    ~OwnedHandle() {
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+};
+
+// An existing ancestor of a directory mountpoint must be a plain directory (opened without
+// following a junction or link) that only trusted accounts can change. Otherwise someone else
+// could swap it, or an entry in it, for one of their own while the missing parents are created
+// or between mounts, and so decide where the drive appears and where files saved to that path
+// go while it is not mounted. Deny entries are not credited, and other kinds of allow entries
+// (object, callback) are refused rather than interpreted.
+core::Status check_ancestor(const std::filesystem::path& dir, PSID user) {
+    const auto refuse = [&](const std::string& why) {
+        return Error{Errc::permission, "cannot mount below " + describe(dir) + ": " + why};
+    };
+    OwnedHandle h{::CreateFileW(
+        dir.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
+    if (h.h == INVALID_HANDLE_VALUE) return refuse("cannot open it to check who may change it");
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!::GetFileInformationByHandle(h.h, &info) ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        return refuse("it is not a directory");
+    }
+    if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        return refuse("it is a junction or link; mount below its target instead");
+    }
+    PSID owner = nullptr;
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    const DWORD err = ::GetSecurityInfo(h.h, SE_FILE_OBJECT,
+                                        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                                        &owner, nullptr, &dacl, nullptr, &sd);
+    if (err != ERROR_SUCCESS) return refuse("cannot read its security descriptor");
+    LocalPtr sd_memory(sd, &::LocalFree);
+    // The owner can always rewrite the access list.
+    if (owner == nullptr || !trusted(owner, user)) {
+        return refuse("it is owned by " + sid_name(owner) + ", who could change it");
+    }
+    if (dacl == nullptr) return refuse("it has no access list, so anyone can change it");
+    ACL_SIZE_INFORMATION sizes{};
+    if (!::GetAclInformation(dacl, &sizes, sizeof(sizes), AclSizeInformation)) {
+        return refuse("cannot read its access list");
+    }
+    for (DWORD i = 0; i < sizes.AceCount; ++i) {
+        void* ace = nullptr;
+        if (!::GetAce(dacl, i, &ace)) return refuse("cannot read its access list");
+        const auto* header = static_cast<const ACE_HEADER*>(ace);
+        if ((header->AceFlags & INHERIT_ONLY_ACE) != 0 ||
+            header->AceType == ACCESS_DENIED_ACE_TYPE) {
+            continue;
+        }
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) {
+            return refuse("its access list has an entry of a kind that is not checked");
+        }
+        auto* allowed = static_cast<ACCESS_ALLOWED_ACE*>(ace);
+        PSID sid = reinterpret_cast<PSID>(&allowed->SidStart);
+        // CREATOR OWNER and CREATOR GROUP stand for whoever creates an entry inside; they grant
+        // nothing on the directory itself.
+        if (::IsWellKnownSid(sid, WinCreatorOwnerSid) ||
+            ::IsWellKnownSid(sid, WinCreatorGroupSid)) {
+            continue;
+        }
+        if ((allowed->Mask & kChangeRights) != 0 && !trusted(sid, user)) {
+            return refuse(sid_name(sid) +
+                          " may rename, replace or change it; remove that permission or mount "
+                          "elsewhere, for example in your user profile");
+        }
     }
     return {};
 }
 
-// True if `path` is `root` (which ends in a separator) or lies below it, ignoring case.
-bool lies_inside(const std::filesystem::path& path, const std::wstring& root) {
+// Checks the existing ancestors of the mountpoint `dir` (see check_ancestor), then creates the
+// missing ones from the top down, each with an owner-only descriptor passed to CreateDirectoryW,
+// so none is ever accessible to anyone else; one that appears in the meantime is refused.
+// `dir` itself is left for WinFsp to create.
+core::Status prepare_parents(const std::filesystem::path& dir) {
+    auto sid = current_user_sid();
+    auto user = sid.empty() ? std::nullopt : sid_text(sid.data());
+    if (!user) return Error{Errc::io, "cannot read the current user's SID"};
+    std::vector<std::filesystem::path> missing;
+    std::error_code ec;
+    auto p = dir.parent_path();
+    for (;;) {
+        // A missing path is file_type::not_found (MSVC's library sets `ec` for it too); any
+        // other failure to tell is file_type::none.
+        const auto type = std::filesystem::symlink_status(p, ec).type();
+        if (type == std::filesystem::file_type::none) {
+            return Error{Errc::io, "cannot mount at " + describe(dir) + ": cannot check " +
+                                       describe(p) + ": " + ec.message()};
+        }
+        if (type != std::filesystem::file_type::not_found) break;
+        if (p == p.parent_path()) {
+            return Error{Errc::not_found, "cannot mount at " + describe(dir) +
+                                              ": its drive or share does not exist"};
+        }
+        missing.push_back(p);
+        p = p.parent_path();
+    }
+    for (auto up = p;; up = up.parent_path()) {
+        if (auto st = check_ancestor(up, sid.data()); !st) return st;
+        if (up == up.parent_path()) break;
+    }
+    ULONG size = 0;
+    auto sd = owner_only_sd(*user, L"OICI", &size);
+    if (!sd) return Error{Errc::io, "cannot build the security descriptor for the mount's parents"};
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = sd.get();
+    sa.bInheritHandle = FALSE;
+    for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+        if (!::CreateDirectoryW(it->c_str(), &sa)) {
+            const DWORD err = ::GetLastError();
+            if (err == ERROR_ALREADY_EXISTS) {
+                return Error{Errc::already_exists,
+                             "cannot create " + describe(*it) + ": it appeared while mounting"};
+            }
+            return Error{Errc::io,
+                         "cannot create " + describe(*it) + ": error " + std::to_string(err)};
+        }
+    }
+    return {};
+}
+
+// True if `path` is `root` (which ends in a separator) or lies below it, ignoring case; null if
+// that cannot be told.
+std::optional<bool> lies_inside(const std::filesystem::path& path, const std::wstring& root) {
     std::error_code ec;
     auto full = std::filesystem::absolute(path, ec);
-    if (ec) return false;
+    if (ec) return std::nullopt;
     full = full.lexically_normal();
     full.make_preferred();
-    const std::wstring candidate = fold(full.native() + L"\\");
-    const std::wstring prefix = fold(root);
-    return candidate.compare(0, prefix.size(), prefix) == 0;
+    const auto candidate = fold(full.native() + L"\\");
+    const auto prefix = fold(root);
+    if (!candidate || !prefix) return std::nullopt;
+    return candidate->compare(0, prefix->size(), *prefix) == 0;
 }
 
 }  // namespace
@@ -1017,13 +1200,24 @@ core::Result<std::unique_ptr<WinFspMount>> WinFspMount::mount(
                              ": it exists; the mountpoint must be a free drive letter or a path "
                              "that does not exist yet"};
         }
-        if (auto st = make_parents_private(dir.parent_path()); !st) return st.error();
         point = dir.native();
         root = point + L"\\";
     }
-    if (!options.data_dir.empty() && lies_inside(options.data_dir, root)) {
-        return Error{Errc::invalid_argument, "the data directory " + describe(options.data_dir) +
-                                                 " must not be inside the mount"};
+    if (!options.data_dir.empty()) {
+        const auto inside = lies_inside(options.data_dir, root);
+        if (!inside) {
+            return Error{Errc::invalid_argument, "cannot compare the data directory " +
+                                                     describe(options.data_dir) +
+                                                     " with the mountpoint"};
+        }
+        if (*inside) {
+            return Error{Errc::invalid_argument, "the data directory " +
+                                                     describe(options.data_dir) +
+                                                     " must not be inside the mount"};
+        }
+    }
+    if (!is_drive_letter(point)) {
+        if (auto st = prepare_parents(point); !st) return st.error();
     }
 
     FSP_FSCTL_VOLUME_PARAMS params{};
