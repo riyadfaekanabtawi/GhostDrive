@@ -21,8 +21,11 @@ constexpr const char* kUsage =
     "Runs a rendezvous and relay server on UDP port N (default 7374). The server's key is kept\n"
     "in FILE (default ./rendezvous.key, created on first run). Devices are pointed at it with\n"
     "  ghostdrive rendezvous HOST:PORT FINGERPRINT\n"
-    "using the fingerprint printed at startup. With --allow-group, only those drives may use the\n"
-    "server; `ghostdrive status` on a device shows its drive's group.\n";
+    "using the fingerprint printed at startup. With --allow-group, only drives that present one\n"
+    "of the listed admission IDs may use the server. `ghostdrive status` on a device shows the\n"
+    "drive's current admission ID and its earlier ones; lists made before IDs rotated keep\n"
+    "working. After removing a device, add the new ID, and drop the old ones once status says\n"
+    "all members have the current key: a removed device only has the old ones.\n";
 
 }  // namespace
 
@@ -37,7 +40,8 @@ int main(int argc, char** argv) {
         } else if (a == "--allow-group" && i + 1 < argc) {
             auto bytes = core::from_hex(argv[++i]);
             if (!bytes || bytes->size() != discovery::kGroupIdSize) {
-                std::cerr << "ghostdrive-rendezvous: --allow-group takes a 64-digit hex group\n";
+                std::cerr
+                    << "ghostdrive-rendezvous: --allow-group takes a 64-digit hex admission ID\n";
                 return 2;
             }
             discovery::GroupId group{};

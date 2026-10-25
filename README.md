@@ -27,7 +27,7 @@ On Windows it mounts through [WinFsp](https://winfsp.dev), at a drive letter or 
 ## How you use it
 
 The drive appears as a normal volume (Finder sidebar, any app). The terminal is only for setup;
-the menu-bar app (below) covers daily use, and QR pairing is planned.
+the desktop app (below) covers setup and daily use, and QR pairing is planned.
 
 On the first device:
 
@@ -105,45 +105,53 @@ when you log on, as you and without administrator rights; the Task Scheduler ret
 three times if it fails. The daemon runs in its own console window: minimise it, since closing
 it stops GhostDrive as `ghostdrive stop` does. `--mount X:` mounts at a drive letter.
 
-### Menu-bar app
+### Desktop app (macOS)
 
-On macOS 13 or later, `macos/GhostDriveMenu` is a small menu-bar app. It shows this device,
-which devices are online or offline, and whether the rendezvous server is connected, and it can
-copy an invite code, open the drive in Finder, start GhostDrive and stop it.
+On macOS 13 or later, `macos/GhostDrive` builds GhostDrive.app: a window for setting up and
+managing the drive, plus a menu-bar extra for quick actions.
 
 ```
-cd macos/GhostDriveMenu
-swift build                                     # or: swift run
+cd macos/GhostDrive
+swift build                                     # or: swift run GhostDriveApp
 swift test                                      # unit tests (no daemon needed)
-GHOSTDRIVE_BUILD_DIR=../../build/release ./make-app.sh   # .build/GhostDrive Menu.app
+GHOSTDRIVE_BUILD_DIR=../../build/release ./make-app.sh   # .build/GhostDrive.app, tools inside
 ```
 
-The app does everything by running the `ghostdrive` tool (`status --json`, `invite`, `stop`,
-`autostart on`). Settings (in the menu, or Command-comma) holds three values, each empty for
-the default:
+The window has these screens:
 
-- Data folder: passed to every command as `--data`. Default:
-  `~/Library/Application Support/GhostDrive`.
-- ghostdrive tool: the CLI to run; it must exist and be executable. Default: inside or next to
-  the app, then PATH, `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`.
-- Mountpoint: passed to Start as `--mount`. Default: `~/GhostDrive`.
+- Set up (only while the data folder holds no drive): "Create a new drive" runs
+  `ghostdrive init --name NAME`; "Join with an invite code" runs `ghostdrive join CODE --name
+  NAME`. Either then starts GhostDrive.
+- Home: this device's name and ID, whether GhostDrive is running (Start, Stop), where the drive
+  is mounted with an Open drive button, and the rendezvous server's state.
+- Devices: the other devices from `ghostdrive status --json`, online, relayed or offline, with
+  their IDs. Remove asks first, runs `ghostdrive remove ID` and shows what it printed, including
+  any devices the removed one added, each with a button to remove it too.
+- Add device: creates an invite (`ghostdrive invite`), shows the code large with Copy (marked
+  concealed for clipboard managers) and a countdown, notices when a device has used it, and
+  says what to do on the other device.
+- Settings: Start or Stop GhostDrive, Start at login (`ghostdrive autostart on` or `off`), the
+  rendezvous server (`ghostdrive rendezvous HOST:PORT FINGERPRINT`), and three folders, each
+  empty for the default:
+  - Data folder: passed to every command as `--data`. Default:
+    `~/Library/Application Support/GhostDrive`.
+  - Mount location: passed to the daemon as `--mount`. Default: `~/GhostDrive`.
+  - ghostdrive tool: the CLI to run; it must exist and be executable. Default: inside or next
+    to the app, then PATH, `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`.
 
-They are stored in UserDefaults (`org.ghostdrive.menu`, keys `ghostdriveDataDir`,
-`ghostdriveCLIPath`, `ghostdriveMountpoint`). The menu actions:
+Start runs the `ghostdrived` next to that tool directly, logging to `ghostdrived.log` in the
+data folder; it creates no login item, which only Start at login does. The menu-bar extra shows
+this device, the other devices and the rendezvous state, and has Open GhostDrive, Copy Invite
+Code, Open Drive in Finder, Start or Stop, and Settings. Closing the window keeps the menu-bar
+extra running.
 
-- Copy Invite Code runs `ghostdrive invite`, copies the `gd1-...` code (marked concealed for
-  clipboard managers) and shows how long the CLI says it is valid, for example "Invite copied,
-  valid 10 min".
-- Open Drive in Finder is disabled unless the daemon reports a mountpoint that is really
-  mounted.
-- Start GhostDrive runs `ghostdrive autostart on [--data DIR] [--mount DIR]`, which creates a
-  login item; it only runs when you click it. If a command fails, its error output is shown in
-  the menu.
-
-Device names and other text from the daemon are shown with control, bidirectional and other
-invisible formatting characters replaced by `?`. Without `GHOSTDRIVE_BUILD_DIR`, `make-app.sh`
-leaves the tools out of the bundle. The app never reads key files. `ghostdrive status --json`
-is also usable from scripts.
+The settings are stored in UserDefaults (`org.ghostdrive.menu`, the identifier of the earlier
+menu-bar app, keys `ghostdriveDataDir`, `ghostdriveCLIPath`, `ghostdriveMountpoint`; also
+`ghostdrivePort`, not shown, the UDP port for Start and Join when running several drives on one
+machine). The app polls `ghostdrive status --json` every few seconds and does everything through
+the CLI; it never reads key files. Device names and other text from the daemon are shown with
+control, bidirectional and other invisible formatting characters replaced by `?`. Without
+`GHOSTDRIVE_BUILD_DIR`, `make-app.sh` leaves the tools out of the bundle.
 
 ### Windows app
 
@@ -263,10 +271,10 @@ tar -xzf ghostdrive-0.1.0-macos-arm64.tar.gz
 cp ghostdrive-0.1.0-macos-arm64/bin/* ~/.local/bin/            # or any directory on PATH
 ```
 
-The macOS tarball also holds `GhostDrive Menu.app` with its own copy of `ghostdrive` and
+The macOS tarball also holds `GhostDrive.app` with its own copy of `ghostdrive` and
 `ghostdrived`; move it to `/Applications`. Its signature is ad-hoc, so macOS asks for
 confirmation the first time it opens (Control-click, Open), and a browser download is
-quarantined (`xattr -dr com.apple.quarantine "GhostDrive Menu.app"`). The Linux binaries also
+quarantined (`xattr -dr com.apple.quarantine GhostDrive.app`). The Linux binaries also
 need avahi-client (`libavahi-client3`) for LAN discovery.
 
 ### On Windows
@@ -312,7 +320,7 @@ cmake --install build/release --prefix ~/.local     # bin/, plus share/doc/ghost
 ```
 
 `scripts/package.sh` does the release build and writes the tarball described above into
-`build/release/`, including the menu-bar app on macOS; it writes nothing outside `build/release`.
+`build/release/`, including GhostDrive.app on macOS; it writes nothing outside `build/release`.
 On Windows, `pwsh scripts/package.ps1` does the same with the `windows-release` preset (static
 `x64-windows-static-release` triplet) and writes the zip into `build\windows-release\`.
 

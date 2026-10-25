@@ -76,7 +76,14 @@ struct ServiceStatus {
     std::string fingerprint;
     std::uint16_t port = 0;
     std::string rendezvous;  // configured server, empty if none
-    std::string rendezvous_group;  // hex, for the server's --allow-group
+    // Hex admission IDs for the server's --allow-group: the current discovery key's, and the
+    // earlier ones a Register also lists (the last is the drive secret's, generation 0).
+    std::string admission;
+    std::uint64_t admission_generation = 0;
+    std::vector<std::string> earlier_admissions;
+    // Every member has sent a key at or above the current one since the daemon started, so
+    // the earlier IDs can be dropped from allow lists.
+    bool members_caught_up = false;
     std::optional<asio::ip::udp::endpoint> observed;  // public address the server sees
     std::string removed_by;  // set when a member has removed this device from the drive
     // Set when a new discovery key could not be made or saved (removed devices may still find
@@ -179,6 +186,10 @@ private:
     std::pair<std::uint64_t, core::PublicKey> registered_key_{};
     // The highest discovery key generation each member has sent us.
     std::map<core::PublicKey, std::uint64_t> seen_generation_;
+    // The same by (generation, author), for whether every member holds the current key.
+    std::map<core::PublicKey, DiscoveryKeyId> seen_key_;
+    // Register in the form servers from before admission lists take; flips after a refusal.
+    bool fixed_register_ = false;
     // Dials prompted by LAN sightings under older keys, which a removed device can forge.
     std::map<core::PublicKey, std::chrono::steady_clock::time_point> last_old_key_dial_;
     std::chrono::steady_clock::time_point old_key_window_{};

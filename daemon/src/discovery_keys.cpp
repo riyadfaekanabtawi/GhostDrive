@@ -164,13 +164,13 @@ std::vector<DiscoveryKeys::Held> DiscoveryKeys::all() const {
     return out;
 }
 
-std::vector<const core::DriveSecret*> DiscoveryKeys::earlier() const {
-    std::vector<const core::DriveSecret*> out;
+std::vector<DiscoveryKeys::Held> DiscoveryKeys::earlier() const {
+    std::vector<Held> out;
     const auto& now = current();
     for (const auto& k : earlier_) {
-        if (k.key != now) out.push_back(&k.key);
+        if (k.key != now) out.push_back({k.generation, &k.key});
     }
-    if (best()) out.push_back(&base_);
+    if (best()) out.push_back({0, &base_});
     return out;
 }
 
@@ -302,6 +302,16 @@ bool DiscoveryKeys::merge(std::span<const DiscoveryKey> keys,
 
 void DiscoveryKeys::set_removed(const std::set<core::PublicKey>& removed) {
     if (auto d = digest(removed)) removed_digest_ = d.value();
+}
+
+bool members_hold(const std::map<core::PublicKey, DiscoveryKeyId>& seen,
+                  const std::set<core::PublicKey>& members, const core::PublicKey& self,
+                  const DiscoveryKeyId& current) {
+    return std::all_of(members.begin(), members.end(), [&](const core::PublicKey& m) {
+        if (m == self) return true;
+        auto it = seen.find(m);
+        return it != seen.end() && it->second >= current;
+    });
 }
 
 }  // namespace ghostdrive::daemon

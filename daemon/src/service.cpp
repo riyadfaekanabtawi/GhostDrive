@@ -134,6 +134,32 @@ std::set<core::PublicKey> member_keys(const MembershipView& view) {
     return out;
 }
 
+struct AdmissionId {
+    std::uint64_t generation = 0;
+    discovery::GroupId id{};
+};
+
+// The admission IDs a Register lists: the current key's, then the earlier keys', then the
+// drive secret's (generation 0), which is what allow lists held before IDs rotated.
+core::Result<std::vector<AdmissionId>> admission_ids(const DiscoveryKeys& keys) {
+    std::vector<AdmissionId> out;
+    auto add = [&](std::uint64_t generation, const core::DriveSecret& key) -> core::Status {
+        auto id = generation == 0 ? discovery::rendezvous_group(key)
+                                  : discovery::rendezvous_admission(key);
+        if (!id) return id.error();
+        out.push_back({generation, id.value()});
+        return {};
+    };
+    if (auto st = add(keys.current_id().first, keys.current()); !st) return st.error();
+    for (const auto& held : keys.earlier()) {
+        // The generation-0 ID always fits: kMaxAdmissions is the current key, the earlier ones
+        // and the drive secret.
+        if (held.generation != 0 && out.size() + 1 >= discovery::kMaxAdmissions) continue;
+        if (auto st = add(held.generation, *held.key); !st) return st.error();
+    }
+    return out;
+}
+
 }  // namespace
 
 Service::Service(asio::any_io_executor io, asio::any_io_executor disk, Drive& drive,
@@ -300,9 +326,11 @@ asio::awaitable<void> Service::rendezvous_loop() {
 
         auto control = co_await conn->open_stream();
         bool registered = false;
+        bool sent = false;
         auto request = rendezvous_register();
         if (control && request) {
             if (co_await control.value()->write(request.value())) {
+                sent = true;
                 auto reply = co_await wire::read_frame(*control.value(), 64);
                 if (reply && reply.value().type == wire::FrameType::rendezvous_registered) {
                     if (auto r = discovery::decode_registered(reply.value().payload)) {
@@ -317,6 +345,9 @@ asio::awaitable<void> Service::rendezvous_loop() {
             }
         }
         if (!*alive) co_return;
+        // A server from before admission lists closes on the newer Register, and one with an
+        // allow list may admit only one of the two forms: the next attempt uses the other.
+        if (sent && !registered) fixed_register_ = !fixed_register_;
         if (registered) {
             backoff = std::chrono::milliseconds(1'000);
             rendezvous_conn_ = conn;
@@ -347,21 +378,22 @@ asio::awaitable<void> Service::rendezvous_loop() {
 
 core::Result<core::Bytes> Service::rendezvous_register() {
     // The group follows the discovery key, so a removed device cannot meet members there; the
-    // server admits the drive by the group of the drive secret, which never changes. Members
-    // that missed a change of key are still in the groups of earlier keys, so this device looks
-    // for them there too, without being found there itself.
+    // server admits the drive by any of its admission IDs (see admission_ids). Members that
+    // missed a change of key are still in the groups of earlier keys, so this device looks for
+    // them there too, without being found there itself.
     auto& keys = drive_.discovery_keys();
     auto group = discovery::rendezvous_group(keys.current());
     if (!group) return group.error();
-    auto admission = discovery::rendezvous_group(drive_.secret());
-    if (!admission) return admission.error();
-    discovery::Register reg{group.value(), admission.value(), {}};
-    for (const auto* earlier : keys.earlier()) {
+    auto admissions = admission_ids(keys);
+    if (!admissions) return admissions.error();
+    discovery::Register reg{group.value(), {}, {}};
+    for (const auto& a : admissions.value()) reg.admissions.push_back(a.id);
+    for (const auto& earlier : keys.earlier()) {
         if (reg.hidden.size() == discovery::kMaxHiddenGroups) break;
-        if (auto g = discovery::rendezvous_group(*earlier)) reg.hidden.push_back(g.value());
+        if (auto g = discovery::rendezvous_group(*earlier.key)) reg.hidden.push_back(g.value());
     }
     registered_key_ = keys.current_id();
-    return discovery::encode(reg);
+    return fixed_register_ ? discovery::encode_fixed_register(reg) : discovery::encode(reg);
 }
 
 asio::awaitable<void> Service::request_peers(std::shared_ptr<transport::Connection> conn,
@@ -533,9 +565,16 @@ ServiceStatus Service::status() const {
         auto it = view.members.find(*view.removed_by);
         out.removed_by = it != view.members.end() ? it->second : core::fingerprint(*view.removed_by);
     }
-    if (auto group = discovery::rendezvous_group(drive_.secret())) {
-        out.rendezvous_group = core::to_hex(group.value());
+    auto& keys = drive_.discovery_keys();
+    if (auto ids = admission_ids(keys)) {
+        out.admission = core::to_hex(ids.value().front().id);
+        out.admission_generation = ids.value().front().generation;
+        for (std::size_t i = 1; i < ids.value().size(); ++i) {
+            out.earlier_admissions.push_back(core::to_hex(ids.value()[i].id));
+        }
     }
+    out.members_caught_up = members_hold(seen_key_, member_keys(view),
+                                         drive_.key().public_key(), keys.current_id());
     auto addresses = drive_.peer_addresses();
     if (auto devices = drive_.index().devices()) {
         for (const auto& d : devices.value()) {
@@ -1079,7 +1118,11 @@ asio::awaitable<void> Service::receive_discovery_keys(std::shared_ptr<transport:
         if (member) {
             // What the sender holds: its LAN advertisements under older keys are forgeries.
             auto& seen = seen_generation_[conn->peer_key()];
-            for (const auto& k : keys.value()) seen = std::max(seen, k.generation);
+            auto& seen_key = seen_key_[conn->peer_key()];
+            for (const auto& k : keys.value()) {
+                seen = std::max(seen, k.generation);
+                seen_key = std::max(seen_key, DiscoveryKeyId{k.generation, k.author});
+            }
             auto& held = drive_.discovery_keys();
             auto before = held.current_id();
             if (held.merge(keys.value(), member_keys(drive_.membership().view()))) {

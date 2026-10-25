@@ -165,7 +165,7 @@ asio::awaitable<Result<SharedChunk>> Fetcher::fetch_remote(core::ChunkId id,
         if (last_error) co_return *last_error;
         if (!co_await wait_for_holders(deadline, seen)) break;
     }
-    co_return Error{Errc::not_found, "no reachable device holds chunk " + id.to_hex()};
+    co_return Error{Errc::not_found, "no reachable device holds chunk " + id.short_hex()};
 }
 
 }  // namespace ghostdrive::vfs

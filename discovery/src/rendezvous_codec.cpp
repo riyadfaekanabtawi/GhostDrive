@@ -16,6 +16,42 @@ namespace wire = transport::wire;
 namespace {
 
 constexpr std::string_view kGroupLabel = "ghostdrive-rendezvous-group-v1";
+constexpr std::string_view kAdmissionLabel = "ghostdrive-rendezvous-admission-v1";
+
+// HMAC-SHA256(key, label). A silent failure would leave every drive with the all-zero ID.
+core::Result<GroupId> derive(const core::DriveSecret& key, std::string_view label) {
+    GroupId out{};
+    std::size_t len = 0;
+    if (EVP_Q_mac(nullptr, "HMAC", nullptr, "SHA256", nullptr, key.data(), key.size(),
+                  reinterpret_cast<const unsigned char*>(label.data()), label.size(),
+                  reinterpret_cast<unsigned char*>(out.data()), out.size(), &len) == nullptr ||
+        len != out.size()) {
+        return Error{Errc::crypto, "could not derive a rendezvous ID"};
+    }
+    return out;
+}
+
+void put_groups(core::Bytes& out, const std::vector<GroupId>& groups, std::size_t limit) {
+    auto n = std::min(groups.size(), limit);
+    out.push_back(static_cast<std::byte>(n));
+    for (std::size_t i = 0; i < n; ++i) out.insert(out.end(), groups[i].begin(), groups[i].end());
+}
+
+// A count u8 and that many groups, at most `limit`; consumes them from `in`.
+bool get_groups(std::span<const std::byte>& in, std::size_t limit, std::vector<GroupId>& out) {
+    if (in.empty()) return false;
+    auto n = std::to_integer<std::size_t>(in[0]);
+    in = in.subspan(1);
+    if (n > limit || in.size() < n * kGroupIdSize) return false;
+    for (std::size_t i = 0; i < n; ++i) {
+        GroupId g{};
+        std::copy_n(in.begin() + static_cast<std::ptrdiff_t>(i * kGroupIdSize), kGroupIdSize,
+                    g.begin());
+        out.push_back(g);
+    }
+    in = in.subspan(n * kGroupIdSize);
+    return true;
+}
 
 core::Bytes frame(wire::FrameType type, const core::Bytes& payload) {
     auto header = wire::encode_header(type, static_cast<std::uint32_t>(payload.size()));
@@ -74,25 +110,25 @@ Error malformed(const char* what) { return Error{Errc::protocol, std::string("ma
 }  // namespace
 
 core::Result<GroupId> rendezvous_group(const core::DriveSecret& key) {
-    GroupId out{};
-    std::size_t len = 0;
-    // A silent failure would leave every drive in the all-zero group together.
-    if (EVP_Q_mac(nullptr, "HMAC", nullptr, "SHA256", nullptr, key.data(), key.size(),
-                  reinterpret_cast<const unsigned char*>(kGroupLabel.data()), kGroupLabel.size(),
-                  reinterpret_cast<unsigned char*>(out.data()), out.size(), &len) == nullptr ||
-        len != out.size()) {
-        return Error{Errc::crypto, "could not derive the rendezvous group"};
-    }
-    return out;
+    return derive(key, kGroupLabel);
+}
+
+core::Result<GroupId> rendezvous_admission(const core::DriveSecret& key) {
+    return derive(key, kAdmissionLabel);
 }
 
 core::Bytes encode(const Register& m) {
     core::Bytes p(m.group.begin(), m.group.end());
-    p.insert(p.end(), m.admission.begin(), m.admission.end());
-    auto hidden = std::min(m.hidden.size(), kMaxHiddenGroups);
-    p.push_back(static_cast<std::byte>(hidden));
-    for (std::size_t i = 0; i < hidden; ++i)
-        p.insert(p.end(), m.hidden[i].begin(), m.hidden[i].end());
+    put_groups(p, m.admissions, kMaxAdmissions);
+    put_groups(p, m.hidden, kMaxHiddenGroups);
+    return frame(wire::FrameType::rendezvous_register, p);
+}
+
+core::Bytes encode_fixed_register(const Register& m) {
+    core::Bytes p(m.group.begin(), m.group.end());
+    const auto& admission = m.admissions.empty() ? m.group : m.admissions.back();
+    p.insert(p.end(), admission.begin(), admission.end());
+    put_groups(p, m.hidden, kMaxHiddenGroups);
     return frame(wire::FrameType::rendezvous_register, p);
 }
 
@@ -114,24 +150,31 @@ core::Bytes encode(const PeerAt& m) {
 
 core::Result<Register> decode_register(std::span<const std::byte> payload) {
     Register m;
-    if (payload.size() == kGroupIdSize) {  // an older client: its group admits it
-        std::copy_n(payload.begin(), kGroupIdSize, m.group.begin());
-        m.admission = m.group;
-        return m;
-    }
-    if (payload.size() < 2 * kGroupIdSize + 1) return malformed("Register");
+    if (payload.size() < kGroupIdSize) return malformed("Register");
     std::copy_n(payload.begin(), kGroupIdSize, m.group.begin());
-    std::copy_n(payload.begin() + kGroupIdSize, kGroupIdSize, m.admission.begin());
-    auto count = std::to_integer<std::size_t>(payload[2 * kGroupIdSize]);
-    auto rest = payload.subspan(2 * kGroupIdSize + 1);
-    if (count > kMaxHiddenGroups || rest.size() != count * kGroupIdSize)
-        return malformed("Register");
-    for (std::size_t i = 0; i < count; ++i) {
-        GroupId g{};
-        std::copy_n(rest.begin() + static_cast<std::ptrdiff_t>(i * kGroupIdSize), kGroupIdSize,
-                    g.begin());
-        m.hidden.push_back(g);
+    auto rest = payload.subspan(kGroupIdSize);
+    switch (payload.size() % kGroupIdSize) {
+        case 0:  // an older client: group only, which admits it
+            if (!rest.empty()) return malformed("Register");
+            m.admissions.push_back(m.group);
+            return m;
+        case 1: {  // group | admission | hidden
+            if (rest.size() < kGroupIdSize) return malformed("Register");
+            GroupId admission{};
+            std::copy_n(rest.begin(), kGroupIdSize, admission.begin());
+            m.admissions.push_back(admission);
+            rest = rest.subspan(kGroupIdSize);
+            break;
+        }
+        case 2:  // group | admissions | hidden
+            if (!get_groups(rest, kMaxAdmissions, m.admissions) || m.admissions.empty())
+                return malformed("Register");
+            break;
+        default:
+            return malformed("Register");
     }
+    if (!get_groups(rest, kMaxHiddenGroups, m.hidden) || !rest.empty())
+        return malformed("Register");
     return m;
 }
 

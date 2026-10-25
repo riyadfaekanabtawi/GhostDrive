@@ -167,13 +167,14 @@ jobs:
       - name: Test
         run: ctest --preset windows --timeout 60
 
-  # The macOS menu-bar app is a separate Swift package; its tests need no daemon.
+  # The macOS desktop app (macos/GhostDrive) is a separate Swift package; its tests need no
+  # daemon. The job keeps its name, a required check on main.
   menu-app:
     name: macos-menu-app
     runs-on: macos-latest
     defaults:
       run:
-        working-directory: macos/GhostDriveMenu
+        working-directory: macos/GhostDrive
     steps:
       - uses: actions/checkout@v7
 
@@ -182,6 +183,10 @@ jobs:
 
       - name: Test
         run: swift test
+
+      # The app bundle as scripts/package.sh makes it, without the tools.
+      - name: Bundle
+        run: ./make-app.sh debug
 
   # The GTK 4 desktop app for Linux (linux/ghostdrive-app), built with the rest of the project
   # so the screenshots can run real daemons. Its logic tests also run in the other jobs.

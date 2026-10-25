@@ -182,7 +182,7 @@ protected:
                     auto admission = discovery::rendezvous_group(drive_a_->secret()).value();
                     if (stream &&
                         co_await stream.value()->write(
-                            discovery::encode(discovery::Register{group, admission, {}})) &&
+                            discovery::encode(discovery::Register{group, {admission}, {}})) &&
                         co_await stream.value()->write(
                             discovery::encode(discovery::Connect{peer}))) {
                         for (int i = 0; i < 2; ++i) {
@@ -255,6 +255,11 @@ TEST_F(Rendezvous, ANewDiscoveryKeySpreadsWithoutDroppingTheRelay) {
     start_pair(true);
     auto b = drive_b_->key().public_key();
     auto old_key = drive_a_->discovery_keys().current();
+    auto legacy = core::to_hex(discovery::rendezvous_group(drive_a_->secret()).value());
+    auto before = a_->status();
+    EXPECT_EQ(before.admission, legacy) << "generation 0 keeps the drive secret's group";
+    EXPECT_EQ(before.admission_generation, 0u);
+    EXPECT_TRUE(before.earlier_admissions.empty());
     rotate_a();
     bool dropped = false;
     ASSERT_TRUE(drain([&] {
@@ -263,6 +268,18 @@ TEST_F(Rendezvous, ANewDiscoveryKeySpreadsWithoutDroppingTheRelay) {
     })) << "B never got A's new key";
     EXPECT_FALSE(dropped) << "re-registering tore down the relayed connection";
     EXPECT_TRUE(relayed(*a_, b));
+
+    // The admission ID follows the key; the generation-0 one is still listed. B sends the key
+    // back once it holds it, so A sees that every member has caught up.
+    auto after = a_->status();
+    auto& keys = drive_a_->discovery_keys();
+    EXPECT_EQ(after.admission,
+              core::to_hex(discovery::rendezvous_admission(keys.current()).value()));
+    EXPECT_EQ(after.admission_generation, keys.current_id().first);
+    ASSERT_FALSE(after.earlier_admissions.empty());
+    EXPECT_EQ(after.earlier_admissions.back(), legacy);
+    EXPECT_TRUE(drain([&] { return a_->status().members_caught_up; }))
+        << "A never saw B holding the current key";
 
     // Both moved to the new group; the old one no longer finds them.
     drain([] { return false; }, 500ms);
@@ -328,7 +345,7 @@ struct Probe {
 discovery::Register register_in(const core::DriveSecret& visible,
                                 std::vector<core::DriveSecret> hidden = {}) {
     discovery::Register reg{discovery::rendezvous_group(visible).value(),
-                            discovery::rendezvous_group(visible).value(),
+                            {discovery::rendezvous_group(visible).value()},
                             {}};
     for (const auto& h : hidden) reg.hidden.push_back(discovery::rendezvous_group(h).value());
     return reg;
@@ -400,6 +417,33 @@ protected:
         return to.received->size() == 1 && to.received->front() == frame;
     }
 
+    // `from` sends Connect for `peer`; waits for the server's answer.
+    bool ask(Probe& from, const core::PublicKey& peer) {
+        std::optional<bool> answered;
+        asio::co_spawn(
+            io_,
+            [&]() -> asio::awaitable<void> {
+                if (!co_await from.control->write(discovery::encode(discovery::Connect{peer}))) {
+                    answered = false;
+                    co_return;
+                }
+                for (;;) {
+                    auto reply = co_await wire::read_frame(*from.control, 64);
+                    if (!reply) break;
+                    if (reply.value().type != wire::FrameType::rendezvous_peer_at) continue;
+                    auto at = discovery::decode_peer_at(reply.value().payload);
+                    if (at && at.value().peer == peer) {
+                        answered = true;
+                        co_return;
+                    }
+                }
+                answered = false;
+            },
+            asio::detached);
+        drain([&] { return answered.has_value(); }, 5s);
+        return answered.value_or(false);
+    }
+
     static core::DriveSecret secret(std::uint8_t fill) {
         core::DriveSecret s{};
         s.fill(std::byte{fill});
@@ -429,7 +473,7 @@ TEST_F(Rendezvous, OtherGroupsLearnNothingAndCannotRelay) {
             probe.control = stream.value();
             auto reg = discovery::encode(
                 discovery::Register{discovery::rendezvous_group(other_secret).value(),
-                                    discovery::rendezvous_group(other_secret).value(),
+                                    {discovery::rendezvous_group(other_secret).value()},
                                     {}});
             (void)co_await probe.control->write(reg);
             auto ack = co_await wire::read_frame(*probe.control, 64);
@@ -476,7 +520,7 @@ TEST_F(Rendezvous, ANonMemberInTheGroupCannotRelayToAMember) {
             if (!stream) co_return;
             auto reg = discovery::Register{
                 discovery::rendezvous_group(drive_a_->discovery_keys().current()).value(),
-                discovery::rendezvous_group(drive_a_->secret()).value(),
+                {discovery::rendezvous_group(drive_a_->secret()).value()},
                 {}};
             (void)co_await stream.value()->write(discovery::encode(reg));
             auto ack = co_await wire::read_frame(*stream.value(), 64);
@@ -516,12 +560,123 @@ TEST_F(RelayRules, TheServerForwardsOnlyWithinTheGroupRules) {
     EXPECT_TRUE(relays(y, x, 2));
     EXPECT_FALSE(relays(other, y, 3)) << "forwarded between groups";
     EXPECT_FALSE(relays(y, other, 4)) << "forwarded between groups";
+    ASSERT_TRUE(ask(looking, y.key));
     EXPECT_TRUE(relays(looking, y, 5));
     EXPECT_TRUE(relays(y, looking, 6));
     EXPECT_FALSE(relays(unregistered, y, 7)) << "forwarded for an unregistered client";
     EXPECT_FALSE(relays(y, unregistered, 8)) << "forwarded to an unregistered client";
     EXPECT_FALSE(relays(x, x, 9)) << "forwarded to the sender itself";
     for (auto* p : {&x, &y, &other, &looking, &unregistered}) p->close();
+}
+
+TEST_F(RelayRules, RelayFromAnUnaskedKeyInAHiddenGroupIsDropped) {
+    // A member hidden in an earlier group, and someone visible there who knows that key (a
+    // removed device): its frames would use up the member's receive budget.
+    auto earlier = secret(1);
+    auto current = secret(2);
+    auto member = open_probe(register_in(current, {earlier}));
+    auto intruder = open_probe(register_in(earlier));
+    ASSERT_TRUE(member.registered && intruder.registered);
+    auto dropped = server_->stats().dropped_datagrams;
+    EXPECT_FALSE(relays(intruder, member, 1)) << "forwarded to a hidden member that never asked";
+    EXPECT_FALSE(relays(member, intruder, 2));
+    EXPECT_EQ(server_->stats().dropped_datagrams, dropped + 2);
+    EXPECT_EQ(server_->stats().relayed_datagrams, 0u);
+    // Asking for the intruder does not let it ask for the member in its place.
+    ASSERT_TRUE(ask(intruder, member.key));
+    EXPECT_FALSE(relays(intruder, member, 3));
+    for (auto* p : {&member, &intruder}) p->close();
+}
+
+TEST_F(RelayRules, RelayWorksAfterTheHiddenSideAsks) {
+    auto earlier = secret(1);
+    auto current = secret(2);
+    auto member = open_probe(register_in(current, {earlier}));
+    auto laggard = open_probe(register_in(earlier));  // a member that missed the new key
+    auto other = open_probe(register_in(earlier));
+    ASSERT_TRUE(member.registered && laggard.registered && other.registered);
+    ASSERT_TRUE(ask(member, laggard.key));
+    // Both directions of one connection.
+    EXPECT_TRUE(relays(member, laggard, 1));
+    EXPECT_TRUE(relays(laggard, member, 2));
+    EXPECT_FALSE(relays(other, member, 3)) << "the ask let in another key";
+
+    // The ask survives a new Register, so relayed connections survive a change of key.
+    std::optional<bool> moved;
+    asio::co_spawn(
+        io_,
+        [&]() -> asio::awaitable<void> {
+            (void)co_await member.control->write(
+                discovery::encode(register_in(secret(3), {current, earlier})));
+            for (;;) {
+                auto reply = co_await wire::read_frame(*member.control, 64);
+                if (!reply) break;
+                if (reply.value().type == wire::FrameType::rendezvous_registered) {
+                    moved = true;
+                    co_return;
+                }
+            }
+            moved = false;
+        },
+        asio::detached);
+    ASSERT_TRUE(drain([&] { return moved.has_value(); }, 5s) && *moved);
+    EXPECT_TRUE(relays(laggard, member, 4));
+    EXPECT_TRUE(relays(member, laggard, 5));
+    for (auto* p : {&member, &laggard, &other}) p->close();
+}
+
+TEST_F(RelayRules, AskedKeysExpire) {
+    server_->stop();
+    rendezvous::ServerOptions options;
+    options.listen = asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0);
+    options.asked_ttl = 400ms;
+    server_ = rendezvous::Server::start(io_.get_executor(), *server_key_, options).value();
+
+    auto earlier = secret(1);
+    auto member = open_probe(register_in(secret(2), {earlier}));
+    auto laggard = open_probe(register_in(earlier));
+    ASSERT_TRUE(member.registered && laggard.registered);
+    ASSERT_TRUE(ask(member, laggard.key));
+    EXPECT_TRUE(relays(laggard, member, 1));
+    drain([] { return false; }, 600ms);
+    EXPECT_FALSE(relays(laggard, member, 2)) << "an old ask still let frames through";
+    EXPECT_FALSE(relays(member, laggard, 3));
+    // Asking again, as members do every rendezvous interval while relayed, renews it.
+    ASSERT_TRUE(ask(member, laggard.key));
+    EXPECT_TRUE(relays(laggard, member, 4));
+    for (auto* p : {&member, &laggard}) p->close();
+}
+
+TEST_F(RelayRules, AClientRemembersOnlyItsLatestAskedKeys) {
+    auto earlier = secret(1);
+    auto member = open_probe(register_in(secret(2), {earlier}));
+    auto laggard = open_probe(register_in(earlier));
+    ASSERT_TRUE(member.registered && laggard.registered);
+    ASSERT_TRUE(ask(member, laggard.key));
+    EXPECT_TRUE(relays(laggard, member, 1));
+    // 64 more keys push the first one out. The server answers only 30 Connect per 10 s but
+    // remembers every one, so the rest are only sent.
+    for (int i = 0; i < 28; ++i) {
+        ASSERT_TRUE(ask(member, core::DeviceKey::generate().value().public_key()));
+    }
+    std::optional<bool> sent;
+    asio::co_spawn(
+        io_,
+        [&]() -> asio::awaitable<void> {
+            for (int i = 28; i < 64; ++i) {
+                auto other = core::DeviceKey::generate().value().public_key();
+                if (!co_await member.control->write(discovery::encode(discovery::Connect{other}))) {
+                    sent = false;
+                    co_return;
+                }
+            }
+            sent = true;
+        },
+        asio::detached);
+    ASSERT_TRUE(drain([&] { return sent.has_value(); }, 5s) && *sent);
+    drain([] { return false; }, 500ms);
+    EXPECT_FALSE(relays(laggard, member, 2)) << "the oldest asked key was kept";
+    for (auto* p : {&member, &laggard}) p->close();
 }
 
 TEST_F(RelayRules, BudgetsCountWholeFramesPerSenderAndPerReceiver) {
@@ -649,28 +804,43 @@ TEST_F(Rendezvous, AFullEarlierGroupDoesNotKeepMembersOut) {
         return registered.value_or(false);
     };
     auto admission = group_of(earlier);
-    EXPECT_TRUE(try_register({group_of(earlier), admission, {}}));
-    EXPECT_FALSE(try_register({group_of(earlier), admission, {}})) << "the group is full";
-    EXPECT_TRUE(try_register({group_of(current), admission, {group_of(earlier)}}));
+    EXPECT_TRUE(try_register({group_of(earlier), {admission}, {}}));
+    EXPECT_FALSE(try_register({group_of(earlier), {admission}, {}})) << "the group is full";
+    EXPECT_TRUE(try_register({group_of(current), {admission}, {group_of(earlier)}}));
     for (auto& e : endpoints) e->close();
     server->stop();
 }
 
 TEST_F(Rendezvous, AllowListedServersServeOnlyTheirGroups) {
-    rendezvous::ServerOptions options;
-    options.listen = asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0);
     core::DriveSecret mine{};
     mine.fill(std::byte{1});
-    options.allowed_groups.insert(discovery::rendezvous_group(mine).value());
-    auto key = core::DeviceKey::generate().value();
-    auto server = rendezvous::Server::start(io_.get_executor(), key, options).value();
+    core::DriveSecret theirs{};
+    theirs.fill(std::byte{2});
+    core::DriveSecret rotated{};  // a discovery key of generation 1 or higher
+    rotated.fill(std::byte{3});
+    core::DriveSecret older{};  // an earlier one, which a removed device still knows
+    older.fill(std::byte{4});
+    auto group_of = [](const core::DriveSecret& s) {
+        return discovery::rendezvous_group(s).value();
+    };
+    auto admission_of = [](const core::DriveSecret& s) {
+        return discovery::rendezvous_admission(s).value();
+    };
+    // Generation 0's ID is the drive secret's group, which allow lists held before.
+    auto legacy = group_of(mine);
 
-    // The list holds the group of the drive secret; members register in the group of their
-    // current discovery key and give the drive secret's group as their admission.
-    auto try_register = [&](const core::DriveSecret& current, const core::DriveSecret& secret) {
+    auto try_register = [&](const std::set<discovery::GroupId>& allowed,
+                            const core::DriveSecret& current,
+                            std::vector<discovery::GroupId> admissions, bool fixed = false) {
+        rendezvous::ServerOptions options;
+        options.listen = asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0);
+        options.allowed_groups = allowed;
+        auto key = core::DeviceKey::generate().value();
+        auto server = rendezvous::Server::start(io_.get_executor(), key, options).value();
         auto client_key = core::DeviceKey::generate().value();
         auto endpoint = transport::Endpoint::create(io_.get_executor(), client_key, {}).value();
         std::optional<bool> registered;
+        discovery::Register reg{group_of(current), std::move(admissions), {}};
         asio::co_spawn(
             io_,
             [&]() -> asio::awaitable<void> {
@@ -682,11 +852,8 @@ TEST_F(Rendezvous, AllowListedServersServeOnlyTheirGroups) {
                     co_return;
                 }
                 auto stream = co_await conn.value()->open_stream();
-                auto reg = discovery::encode(
-                    discovery::Register{discovery::rendezvous_group(current).value(),
-                                        discovery::rendezvous_group(secret).value(),
-                                        {}});
-                (void)co_await stream.value()->write(reg);
+                (void)co_await stream.value()->write(fixed ? discovery::encode_fixed_register(reg)
+                                                           : discovery::encode(reg));
                 auto ack = co_await wire::read_frame(*stream.value(), 64);
                 registered = ack && ack.value().type == wire::FrameType::rendezvous_registered;
                 conn.value()->close();
@@ -694,17 +861,108 @@ TEST_F(Rendezvous, AllowListedServersServeOnlyTheirGroups) {
             asio::detached);
         drain([&] { return registered.has_value(); });
         endpoint->close();
+        server->stop();
         return registered.value_or(false);
     };
-    core::DriveSecret theirs{};
-    theirs.fill(std::byte{2});
-    core::DriveSecret rotated{};
-    rotated.fill(std::byte{3});
-    EXPECT_TRUE(try_register(mine, mine));
-    EXPECT_TRUE(try_register(rotated, mine));
-    EXPECT_FALSE(try_register(theirs, theirs));
-    EXPECT_FALSE(try_register(mine, theirs)) << "admission, not the group, is checked";
-    server->stop();
+
+    // A list from before rotation: older clients and new ones (which send generation 0's ID
+    // last) both get in, in either form.
+    EXPECT_TRUE(try_register({legacy}, mine, {legacy}));
+    EXPECT_TRUE(try_register({legacy}, mine, {legacy}, true));
+    EXPECT_TRUE(try_register({legacy}, rotated, {admission_of(rotated), legacy}));
+    EXPECT_TRUE(try_register({legacy}, rotated, {admission_of(rotated), legacy}, true));
+    EXPECT_FALSE(try_register({legacy}, theirs, {group_of(theirs)}));
+    EXPECT_FALSE(try_register({legacy}, mine, {group_of(theirs)}))
+        << "admission, not the group, is checked";
+
+    // After a removal the operator adds the new ID; both work while members catch up.
+    std::set<discovery::GroupId> both{legacy, admission_of(rotated)};
+    EXPECT_TRUE(try_register(both, rotated, {admission_of(rotated), admission_of(older), legacy}));
+    EXPECT_TRUE(try_register(both, older, {admission_of(older), legacy}));
+
+    // Once the old IDs are dropped, a client that has only them is refused: a removed device,
+    // or a member still on an older key (which then has to catch up on the LAN or directly).
+    std::set<discovery::GroupId> rotated_only{admission_of(rotated)};
+    EXPECT_TRUE(
+        try_register(rotated_only, rotated, {admission_of(rotated), admission_of(older), legacy}));
+    EXPECT_FALSE(try_register(rotated_only, older, {admission_of(older), legacy}));
+    EXPECT_FALSE(try_register(rotated_only, mine, {legacy}));
+    EXPECT_FALSE(try_register(rotated_only, rotated, {admission_of(rotated), legacy}, true))
+        << "the fixed form carries only generation 0's ID";
+    EXPECT_FALSE(try_register(rotated_only, rotated, {group_of(rotated)}))
+        << "the group of a key is not its admission ID";
+}
+
+// A rendezvous server from before admission lists: it takes only the 32-byte and the fixed
+// Register, and closes the connection on anything else.
+class OldServer {
+public:
+    explicit OldServer(asio::io_context& io) : key_(core::DeviceKey::generate().value()) {
+        transport::EndpointOptions options;
+        options.bind = asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0);
+        options.require_address_validation = true;
+        options.accept_peer = [](const core::PublicKey&) { return true; };  // a test server
+        options.accept_datagrams = true;
+        endpoint_ = transport::Endpoint::create(io.get_executor(), key_, options).value();
+        asio::co_spawn(io, accept(io.get_executor(), endpoint_, refused_), asio::detached);
+    }
+    ~OldServer() { endpoint_->close(); }
+    OldServer(const OldServer&) = delete;
+    OldServer& operator=(const OldServer&) = delete;
+
+    std::uint16_t port() const { return endpoint_->local_endpoint().port(); }
+    core::PublicKey key() const { return key_.public_key(); }
+    int refused() const { return *refused_; }
+
+private:
+    static asio::awaitable<void> accept(asio::any_io_executor executor,
+                                        std::shared_ptr<transport::Endpoint> endpoint,
+                                        std::shared_ptr<int> refused) {
+        for (;;) {
+            auto conn = co_await endpoint->accept();
+            if (!conn) co_return;
+            asio::co_spawn(executor, serve(conn.value(), refused), asio::detached);
+        }
+    }
+    static asio::awaitable<void> serve(std::shared_ptr<transport::Connection> conn,
+                                       std::shared_ptr<int> refused) {
+        auto stream = co_await conn->accept_stream();
+        if (!stream) co_return;
+        auto first = co_await wire::read_frame(*stream.value(), 256);
+        if (!first) {
+            conn->close();
+            co_return;
+        }
+        auto size = first.value().payload.size();
+        if (size != 32 && (size < 65 || (size - 65) % 32 != 0)) {
+            ++*refused;
+            conn->close();
+            co_return;
+        }
+        (void)co_await stream.value()->write(
+            discovery::encode(discovery::Registered{conn->current_remote_endpoint()}));
+        while (co_await wire::read_frame(*stream.value(), 256)) {
+        }
+        conn->close();
+    }
+
+    core::DeviceKey key_;
+    std::shared_ptr<transport::Endpoint> endpoint_;
+    std::shared_ptr<int> refused_ = std::make_shared<int>(0);
+};
+
+TEST_F(Rendezvous, ADeviceFallsBackToTheFixedRegisterForAnOlderServer) {
+    OldServer old(io_);
+    auto a = Drive::create(dir_.path() / "a", "desk");
+    ASSERT_TRUE(a);
+    drive_a_ = std::move(a).value();
+    ASSERT_TRUE(drive_a_->set_rendezvous(RendezvousConfig{"127.0.0.1", old.port(), old.key()}));
+    a_ = std::make_unique<Service>(io_.get_executor(), disk_.get_executor(), *drive_a_,
+                                   options(true));
+    ASSERT_TRUE(a_->start());
+    EXPECT_TRUE(drain([&] { return a_->status().observed.has_value(); }))
+        << "the device never registered with the older server";
+    EXPECT_EQ(old.refused(), 1) << "the first Register should be the newer form";
 }
 
 TEST(RendezvousServer, CanBeDestroyedBeforeItsExecutorRuns) {

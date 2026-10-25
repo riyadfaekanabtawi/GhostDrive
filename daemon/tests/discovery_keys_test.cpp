@@ -245,9 +245,11 @@ TEST(DiscoveryKeys, EarlierKeysAreKeptForMembersThatMissedAChange) {
     }
     auto earlier = a.keys.earlier();
     ASSERT_EQ(earlier.size(), DiscoveryKeys::kMaxEarlierKeys + 1);
-    EXPECT_EQ(*earlier[0], made[3]) << "newest first";
-    EXPECT_EQ(*earlier[2], made[1]);
-    EXPECT_EQ(*earlier.back(), drive_secret());
+    EXPECT_EQ(*earlier[0].key, made[3]) << "newest first";
+    EXPECT_EQ(earlier[0].generation, 4u);
+    EXPECT_EQ(*earlier[2].key, made[1]);
+    EXPECT_EQ(*earlier.back().key, drive_secret());
+    EXPECT_EQ(earlier.back().generation, 0u);
     EXPECT_TRUE(holds(a.keys, made[2]));
     EXPECT_FALSE(holds(a.keys, made[0])) << "only the last few are kept";
 
@@ -256,7 +258,36 @@ TEST(DiscoveryKeys, EarlierKeysAreKeptForMembersThatMissedAChange) {
     ASSERT_TRUE(parsed) << parsed.error().message;
     auto again = parsed.value().earlier();
     ASSERT_EQ(again.size(), earlier.size());
-    for (std::size_t i = 0; i < again.size(); ++i) EXPECT_EQ(*again[i], *earlier[i]);
+    for (std::size_t i = 0; i < again.size(); ++i) {
+        EXPECT_EQ(*again[i].key, *earlier[i].key);
+        EXPECT_EQ(again[i].generation, earlier[i].generation);
+    }
+}
+
+TEST(DiscoveryKeys, MembersHoldTheCurrentKeyOnceEachSentItOrANewerOne) {
+    core::PublicKey self{}, b{}, c{}, low{}, high{};
+    self.fill(std::byte{1});
+    b.fill(std::byte{2});
+    c.fill(std::byte{3});
+    low.fill(std::byte{4});
+    high.fill(std::byte{5});
+    DiscoveryKeyId current{2, high};
+    std::map<core::PublicKey, DiscoveryKeyId> seen;
+    EXPECT_TRUE(members_hold(seen, {self}, self, current)) << "nobody else to wait for";
+    EXPECT_FALSE(members_hold(seen, {self, b}, self, current)) << "b has sent nothing";
+    seen[b] = {1, high};
+    EXPECT_FALSE(members_hold(seen, {self, b}, self, current)) << "an older generation";
+    seen[b] = {2, low};
+    EXPECT_FALSE(members_hold(seen, {self, b}, self, current))
+        << "the same generation by another author is a different key";
+    seen[b] = current;
+    EXPECT_TRUE(members_hold(seen, {self, b}, self, current));
+    EXPECT_FALSE(members_hold(seen, {self, b, c}, self, current)) << "c has not caught up";
+    seen[c] = {3, low};
+    EXPECT_TRUE(members_hold(seen, {self, b, c}, self, current)) << "a newer key counts";
+    seen[low] = {0, low};
+    EXPECT_TRUE(members_hold(seen, {self, b, c}, self, current))
+        << "devices that are not members do not count";
 }
 
 }  // namespace

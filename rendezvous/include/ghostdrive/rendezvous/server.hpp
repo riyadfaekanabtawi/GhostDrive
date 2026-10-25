@@ -26,9 +26,9 @@ struct ServerOptions {
     // Per IPv4 address, or per IPv6 /64 (a single host usually holds a whole /64).
     std::size_t max_clients_per_ip = 16;
     std::size_t max_group_size = 256;
-    // When not empty, only drives with these admission IDs may register: an operator serving
-    // only their own drives lists them here (`ghostdrive status` shows a drive's ID as its
-    // group).
+    // When not empty, only drives with these admission IDs may register (a client is admitted
+    // if any ID it lists is here): an operator serving only their own drives lists them here
+    // (`ghostdrive status` shows a drive's IDs).
     std::set<discovery::GroupId> allowed_groups;
     // Relay budget per client, as a token bucket charged with whole relay frames.
     std::size_t relay_bytes_per_second = 4u * 1024 * 1024;
@@ -37,6 +37,9 @@ struct ServerOptions {
     // group) cannot flood one member together.
     std::size_t relay_receive_bytes_per_second = 8u * 1024 * 1024;
     std::size_t relay_receive_burst_bytes = 2u * 1024 * 1024;
+    // How long a Connect lets the asked key relay to a client hidden in that key's group.
+    // Members ask again every rendezvous interval (10 s) while they need the relay.
+    std::chrono::milliseconds asked_ttl{30'000};
     transport::Impairment impairment{};
 };
 

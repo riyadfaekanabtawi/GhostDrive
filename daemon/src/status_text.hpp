@@ -32,7 +32,19 @@ inline std::string format_status(const ServiceStatus& status, const std::string&
         }
         out << "\n";
     }
-    if (!status.rendezvous_group.empty()) out << "Group:     " << status.rendezvous_group << "\n";
+    if (!status.admission.empty()) {
+        out << "Admission: " << status.admission << " (generation " << status.admission_generation
+            << ")\n";
+        for (const auto& id : status.earlier_admissions) out << "  earlier  " << id << "\n";
+        if (!status.earlier_admissions.empty()) {
+            out << (status.members_caught_up
+                        ? "           all members have the current key; earlier --allow-group "
+                          "values can be dropped once every member runs GhostDrive 0.2 or "
+                          "later\n"
+                        : "           not every member has the current key yet; keep the earlier "
+                          "--allow-group values\n");
+        }
+    }
     if (status.peers.empty()) {
         out << "Devices:   none yet (add one with `ghostdrive invite`)\n";
         return out.str();

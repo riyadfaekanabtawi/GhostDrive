@@ -79,7 +79,7 @@ Result<ChunkId> ChunkStore::put(std::span<const std::byte> data) {
 
 Status ChunkStore::put_verified(const ChunkId& expected, std::span<const std::byte> data) {
     if (hasher_.hash(data) != expected) {
-        return Error{Errc::corrupt, "chunk data does not match id " + expected.to_hex()};
+        return Error{Errc::corrupt, "chunk data does not match id " + expected.short_hex()};
     }
     return write_object(expected, data);
 }
@@ -95,7 +95,7 @@ Result<std::uint64_t> ChunkStore::size(const ChunkId& id) const {
     const auto bytes = fs::file_size(path, ec);
     if (ec) {
         if (ec == std::errc::no_such_file_or_directory) {
-            return Error{Errc::not_found, "chunk " + id.to_hex() + " not found"};
+            return Error{Errc::not_found, "chunk " + id.short_hex() + " not found"};
         }
         return fs_error("stat", path, ec);
     }
@@ -123,7 +123,7 @@ Result<Bytes> ChunkStore::read_verified(const ChunkId& id) const {
     if (!n) return n.error();
     data.resize(n.value());
     if (hasher_.hash(data) != id) {
-        return Error{Errc::corrupt, "chunk " + id.to_hex() + " failed verification"};
+        return Error{Errc::corrupt, "chunk " + id.short_hex() + " failed verification"};
     }
     return data;
 }
@@ -133,7 +133,7 @@ Status ChunkStore::remove(const ChunkId& id) {
     std::error_code ec;
     if (!fs::remove(path, ec)) {
         if (ec) return fs_error("remove", path, ec);
-        return Error{Errc::not_found, "chunk " + id.to_hex() + " not found"};
+        return Error{Errc::not_found, "chunk " + id.short_hex() + " not found"};
     }
     return {};
 }
