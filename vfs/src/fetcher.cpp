@@ -51,14 +51,15 @@ asio::awaitable<Result<core::Bytes>> request_with_deadline(
 Fetcher::Fetcher(asio::any_io_executor io, asio::any_io_executor disk,
                  const core::ChunkStore& store, const core::MetadataIndex& index,
                  core::ChunkCache& cache, ConnectionLookup peers,
-                 std::chrono::milliseconds request_timeout)
+                 std::chrono::milliseconds request_timeout, std::chrono::milliseconds holder_wait)
     : io_(std::move(io)),
       disk_(std::move(disk)),
       store_(store),
       index_(index),
       cache_(cache),
       peers_(std::move(peers)),
-      request_timeout_(request_timeout) {}
+      request_timeout_(request_timeout),
+      holder_wait_(holder_wait) {}
 
 asio::awaitable<Result<SharedChunk>> Fetcher::get(core::ChunkId id, std::uint32_t size) {
     if (auto cached = cache_.get(id)) {
@@ -90,6 +91,27 @@ void Fetcher::prefetch(const core::ChunkId& id, std::uint32_t size) {
         asio::detached);
 }
 
+void Fetcher::holders_changed() {
+    ++holders_generation_;
+    for (auto& weak : holder_waiters_) {
+        if (auto timer = weak.lock()) timer->cancel();
+    }
+    holder_waiters_.clear();
+}
+
+asio::awaitable<bool> Fetcher::wait_for_holders(std::chrono::steady_clock::time_point deadline,
+                                                std::uint64_t seen) {
+    if (holders_generation_ != seen) co_return true;
+    if (std::chrono::steady_clock::now() >= deadline) co_return false;
+    ++stats_.holder_waits;
+    auto timer = std::make_shared<asio::steady_timer>(io_, deadline);
+    std::erase_if(holder_waiters_, [](const auto& weak) { return weak.expired(); });
+    holder_waiters_.push_back(timer);
+    std::error_code ec;
+    co_await timer->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+    co_return holders_generation_ != seen;
+}
+
 asio::awaitable<Result<SharedChunk>> Fetcher::load(core::ChunkId id, std::uint32_t size) {
     auto local = co_await detail::run_on(disk_, [this, id]() -> std::optional<Result<core::Bytes>> {
         if (!store_.contains(id)) return std::nullopt;
@@ -107,35 +129,42 @@ asio::awaitable<Result<SharedChunk>> Fetcher::load(core::ChunkId id, std::uint32
 
 asio::awaitable<Result<SharedChunk>> Fetcher::fetch_remote(core::ChunkId id,
                                                            std::uint32_t size) {
-    auto holders = co_await detail::run_on(disk_, [this, id] { return index_.holders(id); });
-    if (!holders) co_return holders.error();
+    // A file's record can arrive before the record that names a holder of its chunks, and a
+    // holder can be about to connect, so a fetch with no holder to ask waits a while for one.
+    const auto deadline = std::chrono::steady_clock::now() + holder_wait_;
+    for (;;) {
+        const auto seen = holders_generation_;
+        auto holders = co_await detail::run_on(disk_, [this, id] { return index_.holders(id); });
+        if (!holders) co_return holders.error();
 
-    std::optional<Error> last_error;
-    for (const auto& key : holders.value()) {
-        auto conn = peers_ ? peers_(key) : nullptr;
-        if (!conn || !conn->is_open()) continue;
-        auto data = co_await request_with_deadline(io_, conn, id, size, request_timeout_);
-        if (!data) {
-            last_error = data.error();
-            continue;
+        std::optional<Error> last_error;
+        for (const auto& key : holders.value()) {
+            auto conn = peers_ ? peers_(key) : nullptr;
+            if (!conn || !conn->is_open()) continue;
+            auto data = co_await request_with_deadline(io_, conn, id, size, request_timeout_);
+            if (!data) {
+                last_error = data.error();
+                continue;
+            }
+            if (data.value().size() != size) {
+                ++stats_.hash_mismatches;
+                last_error = Error{Errc::corrupt, "peer sent a chunk of the wrong size"};
+                continue;
+            }
+            auto shared = std::make_shared<const core::Bytes>(std::move(data).value());
+            auto matches = co_await detail::run_on(
+                disk_, [this, shared, id] { return store_.hasher().hash(*shared) == id; });
+            if (!matches) {
+                ++stats_.hash_mismatches;
+                last_error = Error{Errc::corrupt, "peer sent a chunk that does not match its hash"};
+                continue;
+            }
+            ++stats_.remote_fetches;
+            co_return shared;
         }
-        if (data.value().size() != size) {
-            ++stats_.hash_mismatches;
-            last_error = Error{Errc::corrupt, "peer sent a chunk of the wrong size"};
-            continue;
-        }
-        auto shared = std::make_shared<const core::Bytes>(std::move(data).value());
-        auto matches = co_await detail::run_on(
-            disk_, [this, shared, id] { return store_.hasher().hash(*shared) == id; });
-        if (!matches) {
-            ++stats_.hash_mismatches;
-            last_error = Error{Errc::corrupt, "peer sent a chunk that does not match its hash"};
-            continue;
-        }
-        ++stats_.remote_fetches;
-        co_return shared;
+        if (last_error) co_return *last_error;
+        if (!co_await wait_for_holders(deadline, seen)) break;
     }
-    if (last_error) co_return *last_error;
     co_return Error{Errc::not_found, "no reachable device holds chunk " + id.to_hex()};
 }
 
