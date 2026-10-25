@@ -1,15 +1,27 @@
 # GhostDrive
 
+```text
+      .-'''''-.
+     /         \        ____ _               _   ____       _
+    |  (o) (o)  |      / ___| |__   ___  ___| |_|  _ \ _ __(_)_   _____
+    |     o     |     | |  _| '_ \ / _ \/ __| __| | | | '__| \ \ / / _ \
+    |  .-----.  |     | |_| | | | | (_) \__ \ |_| |_| | |  | |\ V /  __/
+    |  | ::: |  |      \____|_| |_|\___/|___/\__|____/|_|  |_| \_/ \___|
+    |  '-----'  |
+    \/\/\/\/\/\/\       a drive made of your own devices
+
+    laptop <=== QUIC, end-to-end encrypted ===> desktop <=====> phone
+```
+
 GhostDrive is a virtual drive whose storage is your own devices. Each device mounts the same
 drive. When you open a file that lives on another device, GhostDrive fetches only the byte ranges
 being read, directly from that device over QUIC, end-to-end encrypted. There is no storage
 server. The only server component is a rendezvous/relay you can host yourself; it forwards
 encrypted packets and never stores file data.
 
-Status: early, but usable between devices on the same network (macOS with FUSE-T, Linux with
-libfuse3). Devices find each other on the local network automatically (mDNS); reaching them
-across the internet (rendezvous, hole punching, relay) is not built yet. See
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Status: early, but usable (macOS with FUSE-T, Linux with libfuse3). Devices find each other on
+the local network automatically (mDNS), and across the internet through a rendezvous server you
+host, with hole punching and a relay fallback. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How you use it
 
