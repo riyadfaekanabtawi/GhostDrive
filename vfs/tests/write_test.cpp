@@ -48,18 +48,19 @@ protected:
         while (!done() && std::chrono::steady_clock::now() < deadline) io_.run_one_for(5ms);
     }
 
-    core::Status wait_status(std::function<void(Filesystem::StatusCallback)> start) {
+    core::Status wait_status(std::function<void(Filesystem::StatusCallback)> start,
+                             std::chrono::milliseconds limit = 10s) {
         std::optional<core::Status> result;
         start([&](core::Status st) { result = std::move(st); });
-        drain([&] { return result.has_value(); });
+        drain([&] { return result.has_value(); }, limit);
         return result ? *result : core::Status(core::Error{core::Errc::timeout, "drain"});
     }
 
     core::Status write(std::uint64_t h, std::uint64_t offset, const core::Bytes& data) {
         return wait_status([&](auto cb) { fs_.write(h, offset, data, std::move(cb)); });
     }
-    core::Status flush(std::uint64_t h) {
-        return wait_status([&](auto cb) { fs_.flush(h, std::move(cb)); });
+    core::Status flush(std::uint64_t h, std::chrono::milliseconds limit = 10s) {
+        return wait_status([&](auto cb) { fs_.flush(h, std::move(cb)); }, limit);
     }
     core::Result<Attr> setattr(Ino ino, SetAttr changes, std::optional<std::uint64_t> h = {}) {
         std::optional<core::Result<Attr>> result;
@@ -233,7 +234,9 @@ TEST_F(WriteTest, TruncatingOpenRechoosesTheBlockSize) {
     // 300 MiB would need more than 2000 blocks of 128 KiB; write sparsely to keep it cheap.
     std::uint64_t big = 300ull * 1024 * 1024;
     ASSERT_TRUE(write(h.value(), big - 10, random_bytes(10, 10)));
-    ASSERT_TRUE(flush(h.value()));
+    // The commit hashes all 300 MiB: about 4 s idle in a Debug build, much more while the rest
+    // of the suite runs in parallel.
+    ASSERT_TRUE(flush(h.value(), 120s));
     fs_.release(h.value());
     auto record = record_of("f");
     EXPECT_EQ(record.size, big);
