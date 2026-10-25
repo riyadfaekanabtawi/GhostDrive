@@ -6,9 +6,9 @@
 
 #include "ghostdrive/core/result.hpp"
 
-// Files that start ghostdrived at login: a launchd LaunchAgent on macOS, a systemd user unit on
-// Linux. Everything here is pure except write_file_atomic; running launchctl or systemctl is the
-// CLI's job.
+// What starts ghostdrived at login: a launchd LaunchAgent on macOS, a systemd user unit on
+// Linux, a Task Scheduler logon task on Windows. Everything here is pure except write_file_atomic
+// and the Windows section at the end; running launchctl or systemctl is the CLI's job.
 namespace ghostdrive::autostart {
 
 struct Spec {
@@ -18,12 +18,19 @@ struct Spec {
     std::filesystem::path log;     // absolute log file (launchd only; systemd uses the journal)
 };
 
+// The account a Windows logon task belongs to.
+struct WindowsUser {
+    std::string sid;   // S-1-5-21-...
+    std::string name;  // DOMAIN\user
+};
+
 // 16 hex digits identifying a data directory, so each drive on a machine gets its own job.
 // `data` should already be absolute and normalised.
 std::string data_dir_id(const std::filesystem::path& data);
 
 std::string launchd_label(const std::filesystem::path& data);      // io.ghostdrive.daemon.<id>
 std::string systemd_unit_name(const std::filesystem::path& data);  // ghostdrive-<id>.service
+std::string task_name(const std::filesystem::path& data);          // GhostDrive-<id>
 
 // ~/Library/LaunchAgents/<label>.plist
 std::filesystem::path launch_agent_path(const std::filesystem::path& home,
@@ -38,12 +45,32 @@ core::Result<std::string> xml_escape(std::string_view text);
 // One argument of a systemd command line as a double-quoted word, with backslash, quote,
 // specifier (%) and variable ($) characters escaped. Fails on control characters.
 core::Result<std::string> systemd_quote(std::string_view text);
+// One argument of a Windows command line, double-quoted so that CommandLineToArgvW and the C
+// runtime give it back unchanged (backslashes are doubled only before a quote and at the end).
+// Fails on control characters.
+core::Result<std::string> windows_quote(std::string_view text);
 
 core::Result<std::string> launch_agent_plist(const std::string& label, const Spec& spec);
 core::Result<std::string> systemd_unit(const Spec& spec);
+// Task Scheduler XML: start ghostdrived when `user` logs on, in that user's session with their
+// normal (not elevated) rights, without a time limit, and restart it after a failure.
+core::Result<std::string> task_xml(const Spec& spec, const WindowsUser& user);
 
+#ifndef _WIN32
 // Writes `text` to `path` with mode 0644 through a temp file in the same directory and a
 // rename, creating the parent directories.
 core::Status write_file_atomic(const std::filesystem::path& path, std::string_view text);
+#else
+// The user this process runs as.
+core::Result<WindowsUser> current_windows_user();
+// The Task Scheduler, through its COM API, in the root task folder. Registering a task that runs
+// as yourself with an interactive token needs no administrator rights.
+// Checks the XML as registering would, without registering anything (TASK_VALIDATE_ONLY).
+core::Status validate_task(const std::string& name, const std::string& xml);
+core::Status register_task(const std::string& name, const std::string& xml);  // or replace
+core::Status run_task(const std::string& name);
+core::Result<bool> task_exists(const std::string& name);
+core::Result<bool> delete_task(const std::string& name);  // false if there was none
+#endif
 
 }  // namespace ghostdrive::autostart
