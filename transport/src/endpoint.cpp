@@ -97,13 +97,15 @@ Udp::endpoint Endpoint::local_endpoint() const {
 }
 
 asio::awaitable<Result<std::shared_ptr<Connection>>> Endpoint::connect(Udp::endpoint remote,
-                                                                       core::PublicKey peer_key) {
+                                                                       core::PublicKey peer_key,
+                                                                       ConnectOptions options) {
     co_return co_await asio::async_initiate<const asio::use_awaitable_t<>,
                                             void(Result<std::shared_ptr<Connection>>)>(
-        [this](auto handler, const Udp::endpoint& to, const core::PublicKey& key) {
-            start_connect(ConnectionHandler(std::move(handler)), to, key);
+        [this](auto handler, const Udp::endpoint& to, const core::PublicKey& key,
+               ConnectOptions opts) {
+            start_connect(ConnectionHandler(std::move(handler)), to, key, opts);
         },
-        asio::use_awaitable, remote, peer_key);
+        asio::use_awaitable, remote, peer_key, options);
 }
 
 asio::awaitable<Result<std::shared_ptr<Connection>>> Endpoint::accept() {
@@ -114,13 +116,13 @@ asio::awaitable<Result<std::shared_ptr<Connection>>> Endpoint::accept() {
 }
 
 void Endpoint::start_connect(ConnectionHandler handler, const Udp::endpoint& remote,
-                             const core::PublicKey& peer_key) {
+                             const core::PublicKey& peer_key, ConnectOptions options) {
     using ConnResult = Result<std::shared_ptr<Connection>>;
     if (closed_) {
         post_completion(executor_, handler, ConnResult(Error{Errc::closed, "endpoint closed"}));
         return;
     }
-    auto conn = Connection::create_client(shared_from_this(), remote, peer_key);
+    auto conn = Connection::create_client(shared_from_this(), remote, peer_key, options);
     if (!conn) {
         post_completion(executor_, handler, ConnResult(conn.error()));
         return;
@@ -177,30 +179,9 @@ void Endpoint::on_receive(std::size_t length) {
         case PacketKind::quic:
             route_quic(packet, rx_from_);
             break;
-        case PacketKind::ghostdrive: {
-            auto relayed = parse_relay(std::as_bytes(packet));
-            if (relayed && relay_server_ && rx_from_ == *relay_server_) {
-                // Only the server knows our token, so this did come through it. Accept it only
-                // from a key we allow, and hand the packet to QUIC from that key's virtual
-                // address; QUIC then authenticates the peer itself.
-                if (CRYPTO_memcmp(relayed->token.data(), relay_token_.data(), kRelayTokenSize) != 0) break;
-                core::PublicKey source{};
-                std::copy(relayed->key.begin(), relayed->key.end(), source.begin());
-                if (!relay_allowed_ || !relay_allowed_(source)) break;
-                auto inner = relayed->payload;
-                auto virtual_address = relay_address(source);
-                if (virtual_address && classify_packet(inner) == PacketKind::quic) {
-                    route_quic(std::span(reinterpret_cast<const std::uint8_t*>(inner.data()), inner.size()),
-                               *virtual_address);
-                }
-                break;
-            }
-            // As a relay client, a relay datagram from anyone but our server is ignored; a relay
-            // server (no relay configured) hands every datagram to its handler.
-            if (relayed && relay_server_) break;
+        case PacketKind::ghostdrive:
             if (datagram_handler_) datagram_handler_(std::as_bytes(packet), rx_from_);
             break;
-        }
         case PacketKind::unknown:
             break;
     }
@@ -275,15 +256,35 @@ void Endpoint::send_datagram(std::span<const std::byte> datagram, const Udp::end
     send_packet(datagram, to);
 }
 
-void Endpoint::set_relay(Udp::endpoint server, RelayToken token, PinCheck allowed) {
-    relay_server_ = server;
-    relay_token_ = token;
+void Endpoint::set_relay(const std::shared_ptr<Connection>& server, PinCheck allowed) {
+    clear_relay();
+    relay_ = server;
     relay_allowed_ = std::move(allowed);
+    server->set_datagram_handler([weak = weak_from_this()](core::Bytes frame) {
+        if (auto self = weak.lock()) self->on_relay_frame(frame);
+    });
 }
 
 void Endpoint::clear_relay() {
-    relay_server_.reset();
+    if (auto conn = relay_.lock()) conn->set_datagram_handler(nullptr);
+    relay_.reset();
     relay_allowed_ = nullptr;
+}
+
+void Endpoint::on_relay_frame(std::span<const std::byte> frame) {
+    // The frame arrived on the authenticated connection to our server. Accept it only from a
+    // key we allow, and hand the packet to QUIC from that key's virtual address; QUIC then
+    // authenticates the peer itself.
+    if (frame.size() <= kRelayKeySize || !relay_allowed_) return;
+    core::PublicKey source{};
+    std::copy_n(frame.begin(), kRelayKeySize, source.begin());
+    if (!relay_allowed_(source)) return;
+    auto inner = frame.subspan(kRelayKeySize);
+    if (classify_packet(inner) != PacketKind::quic) return;
+    if (auto virtual_address = relay_address(source)) {
+        route_quic(std::span(reinterpret_cast<const std::uint8_t*>(inner.data()), inner.size()),
+                   *virtual_address);
+    }
 }
 
 std::optional<Udp::endpoint> Endpoint::relay_address(const core::PublicKey& peer) {
@@ -304,9 +305,17 @@ std::optional<Udp::endpoint> Endpoint::relay_address(const core::PublicKey& peer
 
 void Endpoint::send_packet(std::span<const std::byte> packet, const Udp::endpoint& to) {
     if (auto it = relay_peer_.find(to); it != relay_peer_.end()) {
-        if (!relay_server_) return;  // no relay configured: the packet is lost, as on a dead path
-        auto wrapped = make_relay(relay_token_, it->second, packet);
-        send_packet(wrapped, *relay_server_);
+        // Without a relay, or when the frame is refused (queue full), the packet is lost as on
+        // a congested path, and QUIC recovers.
+        auto conn = relay_.lock();
+        if (!conn || packet.size() > kMaxRelayedPacket) return;
+        // COPY: the frame waits in the rendezvous connection's queue until its congestion
+        // control sends it, after `packet` (the sender's packet buffer) is gone.
+        core::Bytes frame;
+        frame.reserve(kRelayKeySize + packet.size());
+        frame.insert(frame.end(), it->second.begin(), it->second.end());
+        frame.insert(frame.end(), packet.begin(), packet.end());
+        conn->send_datagram(std::move(frame));
         return;
     }
     if (!impairer_) {

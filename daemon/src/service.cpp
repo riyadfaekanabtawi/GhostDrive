@@ -248,7 +248,8 @@ asio::awaitable<void> Service::rendezvous_loop() {
         Udp::endpoint server;
         if (!ec && !results.empty()) {
             server = results.begin()->endpoint();
-            auto connected = co_await endpoint_->connect(server, config->key);
+            // Datagrams: relayed packets travel as DATAGRAM frames on this connection.
+            auto connected = co_await endpoint_->connect(server, config->key, {.datagrams = true});
             if (!*alive || stopped_) co_return;
             if (connected) conn = std::move(connected).value();
         }
@@ -267,10 +268,10 @@ asio::awaitable<void> Service::rendezvous_loop() {
                 if (reply && reply.value().type == wire::FrameType::rendezvous_registered) {
                     if (auto r = discovery::decode_registered(reply.value().payload)) {
                         observed_ = r.value().observed;
-                        // Relayed packets are accepted only with our token and only from
+                        // Relayed packets are accepted only on this connection and only from
                         // members; QUIC then authenticates the member itself.
-                        endpoint_->set_relay(server, r.value().relay_token,
-                                             [this](const core::PublicKey& key) { return is_member(key); });
+                        endpoint_->set_relay(
+                            conn, [this](const core::PublicKey& key) { return is_member(key); });
                         registered = true;
                     }
                 }

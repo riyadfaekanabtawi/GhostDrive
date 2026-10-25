@@ -21,9 +21,6 @@ constexpr std::uint32_t kMaxControlFrame = 256;  // a Register with every hidden
 // Frames waiting for a client that does not read; beyond this they are dropped, not buffered.
 constexpr std::size_t kMaxOutbox = 64;
 constexpr std::chrono::seconds kRegisterTimeout{10};
-// Clients send QUIC packets of at most 1400 bytes; with the relay header that still fits a
-// 1500-byte MTU.
-constexpr std::size_t kMaxRelayPayload = 1400;
 // Connect requests per client per window; each one makes the server message two devices.
 constexpr int kMaxConnectsPerWindow = 30;
 constexpr std::chrono::seconds kConnectWindow{10};
@@ -47,7 +44,6 @@ struct Server::Client {
     discovery::GroupId group{};           // where others find it
     std::set<discovery::GroupId> hidden;  // where it may only look for others
     bool placed = false;                  // counted in group_sizes_
-    discovery::RelayToken token{};
     bool registered = false;
 
     std::deque<core::Bytes> outbox;
@@ -84,15 +80,11 @@ core::Result<std::unique_ptr<Server>> Server::start(asio::any_io_executor execut
     // the server in advance. The handshake still proves each client holds its key, and nothing
     // is served before the client registers into a group (see serve()).
     endpoint_options.accept_peer = [](const core::PublicKey&) { return true; };
+    // Relay frames travel as DATAGRAM frames on these connections; raw UDP is never relayed.
+    endpoint_options.accept_datagrams = true;
     auto endpoint = transport::Endpoint::create(executor, key, endpoint_options);
     if (!endpoint) return endpoint.error();
     server->endpoint_ = std::move(endpoint).value();
-    auto* raw = server.get();
-    server->endpoint_->set_datagram_handler(
-        [raw, alive = server->alive_](std::span<const std::byte> datagram,
-                                      const Udp::endpoint& from) {
-            if (*alive) raw->on_datagram(datagram, from);
-        });
     asio::co_spawn(executor, server->accept_loop(), asio::detached);
     return server;
 }
@@ -104,7 +96,6 @@ std::uint16_t Server::port() const {
 void Server::stop() {
     for (auto& [key, client] : clients_) client->conn->close();
     clients_.clear();
-    by_token_.clear();
     if (endpoint_) endpoint_->close();
 }
 
@@ -132,6 +123,13 @@ asio::awaitable<void> Server::serve(std::shared_ptr<transport::Connection> conn)
     client->conn = conn;
     client->tokens = static_cast<double>(options_.relay_burst_bytes);
     client->refilled = std::chrono::steady_clock::now();
+    // The connection authenticates the sender, so a frame needs no token and shows nothing
+    // identifying on the wire. Weak: the connection owns this handler.
+    conn->set_datagram_handler(
+        [this, alive, weak = std::weak_ptr<Client>(client)](core::Bytes frame) {
+            auto sender = weak.lock();
+            if (*alive && sender) on_relay_frame(*sender, std::move(frame));
+        });
 
     // Registration must come promptly; until then the client gets nothing.
     asio::steady_timer deadline(executor_, kRegisterTimeout);
@@ -155,29 +153,27 @@ asio::awaitable<void> Server::serve(std::shared_ptr<transport::Connection> conn)
         if (reg) {
             if (auto it = clients_.find(client->key); it != clients_.end()) drop(it->second);
         }
-        if (reg && admits(*reg) && core::random_bytes(client->token)) {
+        if (reg && admits(*reg)) {
             place(client, *reg);
             client->registered = true;
             clients_[client->key] = client;
-            by_token_[client->token] = client;
             stats_.clients = clients_.size();
             deadline.cancel();
-            send(client, discovery::encode(discovery::Registered{conn->current_remote_endpoint(),
-                                                                 client->token}));
+            send(client, discovery::encode(discovery::Registered{conn->current_remote_endpoint()}));
 
             for (;;) {
                 auto frame = co_await wire::read_frame(*client->control, kMaxControlFrame);
                 if (!*alive) co_return;
                 if (frame && frame.value().type == wire::FrameType::rendezvous_register) {
-                    // Moving to other groups (the drive's discovery key changed); the relay
-                    // token, and so any relayed connection, stays.
+                    // Moving to other groups (the drive's discovery key changed); the
+                    // connection, and so any relayed connection, stays.
                     auto again = discovery::decode_register(frame.value().payload);
                     if (!again) break;
                     unplace(client);
                     if (!admits(again.value())) break;  // its old groups were released above
                     place(client, again.value());
-                    send(client, discovery::encode(discovery::Registered{
-                                     conn->current_remote_endpoint(), client->token}));
+                    send(client,
+                         discovery::encode(discovery::Registered{conn->current_remote_endpoint()}));
                     continue;
                 }
                 if (!frame || frame.value().type != wire::FrameType::rendezvous_connect) break;
@@ -218,9 +214,6 @@ asio::awaitable<void> Server::serve(std::shared_ptr<transport::Connection> conn)
 }
 
 void Server::drop(const std::shared_ptr<Client>& client) {
-    if (auto it = by_token_.find(client->token); it != by_token_.end() && it->second == client) {
-        by_token_.erase(it);
-    }
     if (client->registered) {
         unplace(client);
         client->registered = false;
@@ -280,55 +273,54 @@ void Server::send(const std::shared_ptr<Client>& client, core::Bytes frame) {
         asio::detached);
 }
 
-void Server::on_datagram(std::span<const std::byte> datagram, const Udp::endpoint& from) {
-    auto relayed = transport::parse_relay(datagram);
-    if (!relayed || relayed->payload.size() > kMaxRelayPayload ||
-        transport::classify_packet(relayed->payload) != transport::PacketKind::quic) {
+void Server::on_relay_frame(Client& sender, core::Bytes frame) {
+    // The sender is the authenticated client on whose connection the frame arrived; until it
+    // registers (or once it is replaced or moving between groups) it may not relay.
+    auto payload = std::span<const std::byte>(frame);
+    if (!sender.registered || !sender.placed || frame.size() <= transport::kRelayKeySize ||
+        frame.size() > transport::kMaxRelayFrame ||
+        transport::classify_packet(payload.subspan(transport::kRelayKeySize)) !=
+            transport::PacketKind::quic) {
         ++stats_.dropped_datagrams;
         return;
     }
-    // The sender is whoever holds this registration token. The source address alone would be
-    // spoofable; it must also match the sender's current path, so a token seen on the wire
-    // cannot be replayed from elsewhere.
-    discovery::RelayToken token{};
-    std::copy(relayed->token.begin(), relayed->token.end(), token.begin());
-    auto src = by_token_.find(token);
-    if (src == by_token_.end() || src->second->conn->current_remote_endpoint() != from) {
-        ++stats_.dropped_datagrams;
-        return;
-    }
+    payload = payload.subspan(transport::kRelayKeySize);
     core::PublicKey dest_key{};
-    std::copy(relayed->key.begin(), relayed->key.end(), dest_key.begin());
+    std::copy_n(frame.begin(), transport::kRelayKeySize, dest_key.begin());
     // Between clients that could have found each other: a shared group, or one looking in the
     // other's group.
     auto dest = clients_.find(dest_key);
     auto shares = [](const Client& a, const Client& b) {
         return a.group == b.group || a.hidden.contains(b.group) || b.hidden.contains(a.group);
     };
-    if (dest == clients_.end() || dest->second == src->second ||
-        !shares(*src->second, *dest->second)) {
+    if (dest == clients_.end() || dest->second.get() == &sender || !dest->second->placed ||
+        !shares(sender, *dest->second)) {
         ++stats_.dropped_datagrams;
         return;
     }
 
-    auto& sender = *src->second;
     auto now = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(now - sender.refilled).count();
     sender.refilled = now;
     sender.tokens = std::min(static_cast<double>(options_.relay_burst_bytes),
                              sender.tokens + elapsed * static_cast<double>(options_.relay_bytes_per_second));
-    if (sender.tokens < static_cast<double>(relayed->payload.size())) {
+    auto size = payload.size();
+    if (sender.tokens < static_cast<double>(size)) {
         ++stats_.dropped_datagrams;  // over budget: drop, never queue (QUIC recovers)
         return;
     }
-    sender.tokens -= static_cast<double>(relayed->payload.size());
+    sender.tokens -= static_cast<double>(size);
 
-    // COPY: the relay rewraps the datagram for the receiver: its token, the sender's key (C4).
-    auto& receiver = *dest->second;
-    auto out = transport::make_relay(receiver.token, sender.key, relayed->payload);
-    endpoint_->send_datagram(out, receiver.conn->current_remote_endpoint());
+    // The frame is reused for the receiver: the destination key becomes the source key, and
+    // the packet bytes stay where they are.
+    std::copy(sender.key.begin(), sender.key.end(), frame.begin());
+    // A receiver whose queue is full (it is not keeping up) loses the frame.
+    if (!dest->second->conn->send_datagram(std::move(frame))) {
+        ++stats_.dropped_datagrams;
+        return;
+    }
     ++stats_.relayed_datagrams;
-    stats_.relayed_bytes += relayed->payload.size();
+    stats_.relayed_bytes += size;
 }
 
 }  // namespace ghostdrive::rendezvous

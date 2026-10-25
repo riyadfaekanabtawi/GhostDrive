@@ -158,9 +158,10 @@ document assumes the corrected version.
 
 ### 3.2 transport/
 - ngtcp2 (sans-IO) driven by our own event loop. One UDP socket per address family, shared by
-  QUIC, hole-punch probes, and relay-encapsulated datagrams.
-- **Demux on the first byte.** QUIC packets always have the fixed bit (0x40) set. Our probe and
-  relay frames start with the magic prefix `0D 'G' 'D' 01` (last byte is the format version).
+  QUIC and hole-punch probes. Relayed packets travel inside QUIC, as DATAGRAM frames on the
+  connection to the rendezvous server (section 3.5).
+- **Demux on the first byte.** QUIC packets always have the fixed bit (0x40) set. Our probes
+  start with the magic prefix `0D 'G' 'D' 01` (last byte is the format version).
   0x0D has the fixed bit clear and lies in 4..15, which RFC 7983 and RFC 9443 leave unassigned,
   so it collides with neither STUN (0..3) nor DTLS (20..63). The 0x80-0xBF range was rejected
   because Version Negotiation packets may have the fixed bit clear. `grease_quic_bit` (RFC 9287)
@@ -270,7 +271,8 @@ document assumes the corrected version.
     server for relayed peers, and a direct connection that succeeds replaces the relayed one
     (which is closed). A relayed connection never replaces a live direct one.
   - No NAT classification; the relay is the fallback for every hard case.
-  - QUIC packets are at most 1400 bytes so the 37-byte relay header fits in a 1500-byte MTU.
+  - QUIC packets are at most 1400 bytes, which fits a 1500-byte MTU over IPv4 and IPv6, and at
+    most 1280 bytes on relayed connections so they fit inside relay frames (section 3.5).
 
 ### 3.5 rendezvous/ (server binary)
 - One self-hostable binary: signalling plus datagram relay. It is stateless apart from in-memory
@@ -291,22 +293,40 @@ document assumes the corrected version.
   - Groups are `HMAC-SHA256(drive_secret, "ghostdrive-rendezvous-group-v1")` instead of a
     member-signed token: the server could not check such a signature anyway, since it does not
     know the members. Only members can compute the ID, and it says nothing about the secret.
-  - Relay datagrams are raw UDP to the server's port: `0D 'G' 'D' 01 | 'R' | token(16) |
-    key(32) | QUIC packet`. `Registered` gives each client a random 128-bit token, carried in
-    every relay datagram in both directions. The server identifies the sender by its token (and
-    requires the source to be that client's current path), never by source address alone, so
-    an off-path spoofer can neither relay as a member nor spend its budget; it forwards only
-    within one group, to the receiver's current path, with the receiver's token. Clients accept
-    relay datagrams only from their server, with their own token, and only for member keys,
-    and hand the inner packet to QUIC from a virtual address in 198.18.0.0/15 (bounded table);
-    QUIC still authenticates the peer end to end.
+  - Relay frames are QUIC DATAGRAM frames (RFC 9221) on the device's connection to the server,
+    negotiated with the `max_datagram_frame_size` transport parameter on that connection only:
+    `peer_key(32) | QUIC packet`, where the key is the destination when a client sends and the
+    source when the server delivers. The connection is mutually authenticated, so the server
+    knows the sender from the connection it arrived on, and an observer sees only encrypted
+    QUIC: no device key and no token on the wire, so it cannot follow a device across
+    networks by its relay traffic. The server forwards a frame only from a registered client,
+    within the group rules below, on the receiver's connection, after replacing the
+    destination key with the sender's. Clients take frames only from their server connection
+    and only for member keys, and hand the packet to QUIC from a virtual address in
+    198.18.0.0/15 (bounded table); QUIC still authenticates the peer end to end. Raw UDP is
+    never relayed. ngtcp2 1.25.0 provides this as `ngtcp2_conn_writev_datagram` (one frame per
+    packet here, subject to congestion control and pacing; DATAGRAM frames are never
+    retransmitted) and the `recv_datagram` callback (frames are copied out and handled after
+    ngtcp2 returns; frames flagged 0-RTT, before the handshake, are dropped).
+  - Packet sizing. A 1-RTT packet of the server connection spends 42 bytes on a short header
+    (1 + 18-byte connection ID + up to 4-byte packet number), the 16-byte AEAD tag and the
+    DATAGRAM frame header (type and 2-byte length), so a 1400-byte packet holds a 1358-byte
+    frame. Connections to a relay virtual address therefore send QUIC packets of at most 1280
+    bytes (`max_tx_udp_payload_size`, and `max_udp_payload_size` to the peer), a frame of at
+    most 1312 bytes, which leaves room for an ACK in the same packet. 1280 is above QUIC's
+    1200-byte minimum, so relayed Initials fit. ngtcp2 otherwise sends 1200-byte packets until
+    Path MTU Discovery finds more, and a 1200-byte Initial plus the key does not fit in 1200
+    bytes, so the server connection and relayed connections turn off payload shaping and PMTUD
+    and use these fixed sizes. Like the raw relay datagrams before, relaying therefore needs a
+    path that carries 1428-byte IPv4 (1448-byte IPv6) packets, or IP fragmentation.
   - New Initials get a Retry (RFC 9000 section 8.1): no state is created until the client
     returns the token from its own address, so spoofed Initials cannot fill handshake slots or
     use the server as a reflector. Handshakes time out after 5 s.
   - Limits: 10,000 clients, 16 per IPv4 address or IPv6 /64, 256 per group, registration
     within 10 s, 30 `Connect` per 10 s, 64 queued control frames per client (more are
-    dropped), relayed payloads must be QUIC packets of at most 1400 bytes, and a per-client
-    token bucket (4 MiB/s, 1 MiB burst) that drops instead of queueing. `--allow-group HEX`
+    dropped), relayed payloads must be QUIC packets of at most 1280 bytes, a per-client
+    token bucket (4 MiB/s, 1 MiB burst) that drops instead of queueing, and at most 64 frames
+    waiting on each connection for congestion control (more are dropped). `--allow-group HEX`
     restricts the server to the operator's own drives; `ghostdrive status` shows the group.
   - Daemons act on a `PeerAt` for one peer at most every 2 s and run at most 32 dials at once,
     so even a malicious server cannot turn them into amplifiers. Probes carry no key. Active
@@ -326,11 +346,8 @@ document assumes the corrected version.
     still have the server forward datagrams to a member hidden in its group; the member drops
     them (relayed packets are accepted only from members), so this costs bandwidth within the
     sender's relay budget and reveals nothing. A later `Register` on the same control stream moves
-    the client to new groups and keeps its relay token, so relayed connections survive a
+    the client to new groups and keeps its connection, so relayed connections survive a
     change of discovery key.
-  - Still open: relay headers carry public keys in clear, so an on-path observer
-    can follow a device across networks; carrying relay traffic as QUIC DATAGRAM frames on the
-    authenticated connections (RFC 9221) would close both this and the token's visibility.
   - Hosting needs UDP: a VPS or any host that forwards a UDP port. Platforms that only proxy
     HTTP(S) to one port, such as Hugging Face Spaces, cannot run it.
 
@@ -571,8 +588,8 @@ The file lives only on device B.
    then writes it to the stream. ngtcp2 packetizes and encrypts it into the send buffer, and
    `sendmsg` puts it on the socket, using GSO where available.
 8. **Network.** The datagrams travel either directly (UDP) or through the relay. On the relay
-   path they are wrapped in `Send{dest_key, ...}` frames over B's relay connection and unwrapped
-   on A's. The relay sees only ciphertext.
+   path each one is a DATAGRAM frame `A's key | packet` on B's QUIC connection to the server,
+   delivered as `B's key | packet` on A's. The relay sees only ciphertext.
 9. **Local receive (A).**
    1. `recvmsg` receives into a pooled buffer.
    2. The demux identifies the packet as QUIC.
@@ -600,7 +617,7 @@ Every copy of payload bytes on this path:
 | C1 | B: disk -> pooled buffer (`pread`) | Data must leave the page cache to be encrypted. |
 | C2 | B: plaintext -> ngtcp2 packet buffer (encrypt) | AEAD writes ciphertext into the outgoing packet. |
 | C3 | B: user -> kernel (`sendmsg`) | Kernel socket boundary. |
-| C4 | Relay (relayed path only): recv buffer -> send buffer | Relay rewraps frames; could be zero-copy later with splice or io_uring. |
+| C4 | Relayed path only: B's packet -> frame queue; on the server and A, DATAGRAM frame -> frame buffer | The frame waits for the outer connection's congestion control, and ngtcp2's decrypted data is valid only inside `recv_datagram`. The server reuses the received buffer for the receiver (only the key is rewritten); each hop also adds the outer connection's encrypt and decrypt. |
 | C5 | A: kernel -> pooled buffer (`recvmsg`) | Kernel socket boundary. |
 | C6 | A: ciphertext -> plaintext (decrypt) | ngtcp2 decrypts into its own buffer (`conn->crypto.decrypt_buf`, checked in ngtcp2 1.25.0). In-place decrypt is not exposed. |
 | C7 | A: ngtcp2 stream data -> chunk buffer | Callback data is only valid during the callback, so it is reassembled into the chunk buffer. |
