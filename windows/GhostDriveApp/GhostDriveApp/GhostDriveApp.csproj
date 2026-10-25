@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- WinUI 3 through the Windows App SDK, unpackaged (no MSIX) and self-contained, so the
+       built folder runs from the release zip next to ghostdrive.exe with nothing installed:
+       the Windows App SDK runtime and the .NET runtime are both copied into the output. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>GhostDriveApp</RootNamespace>
+    <!-- Not "GhostDrive.exe": Windows file names ignore case, and ghostdrive.exe sits beside it. -->
+    <AssemblyName>GhostDriveApp</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Product>GhostDrive</Product>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 2.5.1 is the current Stable release (2026-09-16). 1.8 reached the end of servicing on
+         2026-09-24, so it gets no more fixes. Pinned exactly; update it deliberately. -->
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="[2.5.1]" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\GhostDriveApp.Core\GhostDriveApp.Core.csproj" />
+  </ItemGroup>
+
+</Project>

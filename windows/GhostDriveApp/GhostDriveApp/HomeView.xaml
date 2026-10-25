@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="GhostDriveApp.HomeView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <StackPanel Spacing="20">
+        <StackPanel Spacing="4">
+            <TextBlock x:Name="DeviceName" Text="GhostDrive" Style="{StaticResource TitleTextBlockStyle}"
+                       TextTrimming="CharacterEllipsis" />
+            <TextBlock x:Name="DeviceId" FontFamily="Consolas" IsTextSelectionEnabled="True"
+                       TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+        </StackPanel>
+
+        <InfoBar x:Name="RemovedBar" Severity="Error" IsClosable="False" Title="Removed from the drive" />
+        <InfoBar x:Name="DiscoveryBar" Severity="Warning" IsClosable="False" Title="Finding devices" />
+        <InfoBar x:Name="ActionResult" IsClosable="True" />
+
+        <Grid ColumnSpacing="24" RowSpacing="18">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0" Text="GhostDrive" Style="{StaticResource BodyStrongTextBlockStyle}" />
+            <StackPanel Grid.Row="0" Grid.Column="1" Spacing="8">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Ellipse x:Name="RunningDot" Width="10" Height="10" VerticalAlignment="Center" />
+                    <TextBlock x:Name="RunningText" Text="Checking..." />
+                </StackPanel>
+                <TextBlock x:Name="RunningDetail" TextWrapping="Wrap"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button x:Name="StartButton" Content="Start GhostDrive" Style="{StaticResource AccentButtonStyle}"
+                            Click="OnStart" />
+                    <ProgressRing x:Name="Busy" IsActive="False" Width="20" Height="20" />
+                </StackPanel>
+            </StackPanel>
+
+            <TextBlock Grid.Row="1" Text="Drive" Style="{StaticResource BodyStrongTextBlockStyle}" />
+            <StackPanel Grid.Row="1" Grid.Column="1" Spacing="8">
+                <TextBlock x:Name="MountText" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
+                <Button x:Name="OpenButton" Content="Open drive" Click="OnOpen" />
+            </StackPanel>
+
+            <TextBlock Grid.Row="2" Text="Rendezvous" Style="{StaticResource BodyStrongTextBlockStyle}" />
+            <StackPanel Grid.Row="2" Grid.Column="1" Spacing="4">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Ellipse x:Name="RendezvousDot" Width="10" Height="10" VerticalAlignment="Center" />
+                    <TextBlock x:Name="RendezvousText" TextWrapping="Wrap" />
+                </StackPanel>
+                <TextBlock x:Name="RendezvousDetail" TextWrapping="Wrap"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            </StackPanel>
+        </Grid>
+    </StackPanel>
+</UserControl>

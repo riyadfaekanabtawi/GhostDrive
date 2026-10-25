@@ -182,3 +182,79 @@ jobs:
 
       - name: Test
         run: swift test
+
+  # The WinUI 3 desktop app (windows/GhostDriveApp), separate from the windows job: the
+  # GhostDriveApp.Core tests, a self-contained build of the app, and a UI check that starts it
+  # against throwaway daemons (--no-mount) and uploads screenshots of its pages.
+  windows-app:
+    name: windows-app
+    runs-on: windows-latest
+    env:
+      VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Test GhostDriveApp.Core
+        working-directory: windows/GhostDriveApp
+        run: dotnet test GhostDriveApp.Core.Tests -c Release
+
+      - name: Build the app
+        working-directory: windows/GhostDriveApp
+        run: dotnet publish GhostDriveApp -c Release -o "$env:RUNNER_TEMP\GhostDriveApp"
+
+      # ghostdrive.exe and ghostdrived.exe for the UI check, from the windows preset with the
+      # vcpkg tree the windows job caches (restored only; that job saves it).
+      - name: Set up the MSVC environment
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { "$($matches[1])=$($matches[2])" >> $env:GITHUB_ENV }
+          }
+
+      - name: Bootstrap vcpkg
+        id: vcpkg
+        run: |
+          .\external\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "commit=$(git rev-parse HEAD:external/vcpkg)" >> $env:GITHUB_OUTPUT
+
+      - name: Restore vcpkg installed tree
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.VCPKG_INSTALLED_DIR }}
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-windows-${{ hashFiles('vcpkg.json') }}-${{ steps.vcpkg.outputs.commit }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-windows-
+
+      - name: Build ghostdrive and ghostdrived
+        run: |
+          cmake --preset windows "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_DIR"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset windows --target ghostdrive ghostdrived
+
+      - name: UI check
+        run: >
+          ./windows/GhostDriveApp/ci/ui-check.ps1
+          -App "$env:RUNNER_TEMP\GhostDriveApp"
+          -Cli "$pwd\build\windows\cli\ghostdrive.exe"
+          -Daemon "$pwd\build\windows\daemon\ghostdrived.exe"
+          -OutDir "$env:RUNNER_TEMP\screenshots"
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-app-screenshots
+          path: ${{ runner.temp }}\screenshots
+          if-no-files-found: warn
