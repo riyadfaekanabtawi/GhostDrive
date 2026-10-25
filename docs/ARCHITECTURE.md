@@ -109,26 +109,36 @@ document assumes the corrected version.
   tag allows migrating to ciphertext-addressed chunks when friends' devices arrive.
 - **Metadata index.** SQLite in WAL mode. Tables:
   - files: path, inode, size, mode, mtime, HLC, version vector, chunking params, deleted flag,
-    sequence, the author's signature, origin path (conflict copies), and a local effective
+    sequence, signer and signature, origin path (conflict copies), and a local effective
     version vector;
   - chunk maps: file version to an ordered list of chunk IDs;
   - devices: key, last acknowledged sequence, `have` info;
-  - signers: short ID to key for every device ever pinned, with a retired mark. Rows are never
-    deleted, so a short ID stays bound to its first key.
+  - signers: short ID to key for every device ever pinned or known as removed, with a retired
+    mark. Rows are never deleted, so a short ID stays bound to its first key.
 
   The scheme follows Syncthing BEP: each device has a monotonic local sequence plus an `index_id`.
   A peer sends `{index_id, max_sequence}` and receives only newer records.
-- **Signed records.** The device in a record's `modified_by` signs it with its Ed25519 key over
-  a context string, the drive ID, the path (the origin path for a conflict copy), size, mode,
-  mtime, HLC, the canonical version vector, `modified_by`, block size, chunking, the deleted
-  flag and the chunk list. Sequence and the holds flag are not signed. Relays never re-sign, so
-  a member can neither forge a change in another device's name nor alter a record it relays.
-  The index verifies a remote record only when it would change something (new, newer, or
-  concurrent); ignored records cost no check. A record whose signer is unknown or retired is
-  rejected. Index schema 2 adds this; opening a schema 1 index signs this device's own records
-  as they are, adopts records by devices no longer pinned, gives the index a new `index_id`, and
-  keeps other devices' records unsigned (still readable, but not sent on) until a peer sends
-  the same version with its author's signature.
+- **Signed records.** A record carries a `signer` beside `modified_by`; the signer signs it
+  with its Ed25519 key over a context string, the drive ID, the path (the origin path for a
+  conflict copy), size, mode, mtime, HLC, the canonical version vector, `modified_by`, the
+  signer, block size, chunking, the deleted flag and the chunk list. Sequence and the holds
+  flag are not signed. The signer is the author (`modified_by`), except for an adopted record
+  (section 3.6): one whose author is a retired signer here, signed by a member pinned here.
+  Relays never re-sign, so a member can neither forge a change in another device's name nor
+  alter a record it relays. The index verifies a remote record only when it would change
+  something (new, newer, or concurrent); ignored records cost no check. A record signed by a
+  retired key, or by someone other than its author while the author is not retired, is
+  rejected for good; one whose signer is not known here yet (or an adopted record whose
+  author is not known as removed, or whose signer is not pinned) is rejected as possibly
+  valid later.
+- **Schema 2 migration.** Index schema 2 adds signatures. Opening a schema 1 index signs this
+  device's own records as they are and gives the index a new `index_id`. Other devices'
+  records stay unsigned: still readable here, never sent on or adopted, until a peer sends the
+  same version signed by its author with the same content, author and HLC. Different content
+  at that version is treated as a concurrent change, so both stay and only the signed one is
+  sent. Trust on upgrade: schema 1 did not check `modified_by`, so a member could have planted
+  a row in this device's name, and the migration signs it with this device's key. Schema 1
+  stores no provenance to tell such rows apart; the exposure is one-time, at the upgrade.
 - **Chunk cache.** A bounded LRU of verified chunks held in refcounted pooled buffers. Buffers in
   use by a pending FUSE reply are pinned and cannot be evicted. Sequential access detection
   triggers readahead of the next N chunks, with N growing up to a cap while the stream stays
@@ -400,17 +410,23 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   sender holds every chunk of that version, which feeds `holders()` on the receiver.
   - Records carry their signature (section 3.1) in frame type 15; the unsigned type 6 is no
     longer sent or accepted, so an older peer fails cleanly. Unsigned records are not sent.
-  - A rejected record is skipped for good, except one by a device not pinned yet: the
-    membership stream can lag the index stream. When the membership view pins a new device,
-    every peer's progress is reset to 0 and the connections that delivered such records are
-    closed, so the next one sends everything again (records already stored compare equal and
-    are not verified again).
-  - When a device is unpinned its key is retired as a signer: its stored records stay, new ones
-    are rejected. Each remaining member adopts its records (tombstones included): it commits
-    each again with the same content and HLC, its own counter bumped, signed by itself (an edit
-    made elsewhere meanwhile is newer and keeps the name), so devices that join later and never
-    learn the removed key can still verify them. Members adopting at once produce concurrent
-    versions with equal content, which resolve without a conflict copy.
+  - A rejected record is skipped for good, except one that may become valid later (its signer
+    is not known here yet: the membership stream can lag the index stream). Progress on that
+    stream then stops just before the first such record, so the next connection sends it
+    again; nothing is reset for other peers. When the membership view pins or retires a
+    device, the connections that delivered such records are closed. A batch still being
+    applied when that happens notices it (a counter taken before and checked after) and closes
+    its connection itself.
+  - A device removed for good (not one in doubt, and not one whose removal may still be
+    undone) has its key retired as a signer: its stored records stay, new ones signed by it are
+    rejected. Retiring runs before unpinning and again whenever the drive is opened, so a crash
+    in between never leaves the key accepted. Each remaining member adopts the removed device's
+    verified records, tombstones included, in the same transaction: it signs each as signer
+    and changes nothing else, not the version, content or `modified_by`. Adoptions of the same
+    version by several members compare equal, and a newer version by the removed device still
+    supersedes an older one whoever adopted each, so adoption neither brings deleted files back
+    nor makes conflict copies. A device that joins later accepts these records once it knows
+    the device was removed, from the membership entries it is given.
 - **Data directory** (0700): `device.key` and `drive` (ID, secret, name) are 0600 and refused
   when readable by others, as are `membership` and `discovery` (section 3.7); `index.db`, `chunks/`, `staging/`, `peers` (last known address per
   member), and the control socket.
@@ -421,12 +437,19 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   block sizes must be powers of two in 128 KiB to 16 MiB; remote records whose clock is more
   than a day ahead or whose version counters near 2^62 are rejected, so neither can be wrapped;
   a member's claim to hold chunks counts only for the version actually stored; a holder that
-  does not answer a GetChunk within 10 s is passed over. Still open: a member can inflate other
-  devices' counters in a vector it signs, hiding their later edits (attributable, not
-  prevented); a relay can present any record a device once signed as that version's conflict
-  copy; a device in doubt that is unpinned has its records adopted, and they stay adopted if it
-  becomes a member again; adopting a removed device's records runs on the I/O thread in one
-  transaction, about 20 us of signing per record.
+  does not answer a GetChunk within 10 s is passed over. Still open:
+  - a member can inflate other devices' counters in a vector it signs, hiding their later
+    edits (attributable, not prevented);
+  - a member can present any content in a removed device's name, as an adopted record; it is
+    signed by that member, so it is traceable;
+  - any version a device once signed can be presented as that version's conflict copy, under
+    the author's own signature (not attributable to the relay). A copy is valid only at the
+    name derived from its origin, mtime and author, so this resurfaces old content under a
+    `.sync-conflict-` name and cannot replace a file;
+  - a member that sends records under keys never pinned anywhere holds that stream's
+    progress back, so its records are fetched again on every connection;
+  - adopting a removed device's records runs on the I/O thread in one transaction, about
+    20 us of signing per record.
 - **FUSE-T caching**: the macOS NFS client caches attributes and negative lookups, and FUSE-T
   cannot invalidate them (notifications are unsupported on its NFS backend). Mounts use
   `-o noattrcache`, and a directory's mtime is the time its entries last changed on this
@@ -581,8 +604,6 @@ Cache hits skip C1 through C7. Code marks each of these with a `// COPY:` commen
     effective vector, the merge of every version it has seen for the path, and compares
     incoming records and bumps its own edits against that. Every device picks the same winner,
     so they converge without anyone signing the merged vector.
-  - Concurrent versions with equal content (size, mode, mtime, chunks, deleted) need no
-    conflict copy.
 - Deletes are tombstones with a version bump. A delete that is concurrent with an edit keeps the
   edit as a conflict copy.
   - Tombstones are garbage-collected once every member has acknowledged a sequence past them,

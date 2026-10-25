@@ -29,6 +29,7 @@ core::FileRecord sample_record() {
     r.version.bump(7);
     r.version.bump(99);
     r.modified_by = 99;
+    r.signer = 7;
     r.block_size = 128 * 1024;
     r.sequence = 42;
     for (std::uint8_t i = 0; i < 3; ++i) {
@@ -81,6 +82,7 @@ TEST(Codec, IndexBatchRoundTrip) {
     EXPECT_EQ(a.block_size, expected.block_size);
     EXPECT_EQ(a.sequence, expected.sequence);
     EXPECT_EQ(a.chunks, expected.chunks);
+    EXPECT_EQ(a.signer, expected.signer);
     EXPECT_EQ(a.signature, expected.signature);
     EXPECT_EQ(a.origin_path, expected.origin_path);
     EXPECT_TRUE(decoded.value()[1].record.origin_path.empty());

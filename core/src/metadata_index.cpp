@@ -62,7 +62,8 @@ constexpr const char* kSchemaV2 = R"sql(
 ALTER TABLE files ADD COLUMN signature BLOB;
 ALTER TABLE files ADD COLUMN origin_path TEXT NOT NULL DEFAULT '';
 ALTER TABLE files ADD COLUMN effective_version BLOB;
-UPDATE files SET effective_version = version;
+ALTER TABLE files ADD COLUMN signer INTEGER NOT NULL DEFAULT 0;
+UPDATE files SET effective_version = version, signer = modified_by;
 CREATE TABLE signers (
     short_id INTEGER PRIMARY KEY,
     key BLOB NOT NULL UNIQUE,
@@ -238,6 +239,7 @@ struct MetadataIndex::Impl {
     struct Signer {
         PublicKey key{};
         bool retired = false;
+        bool pinned = false;  // in the devices table, or this device
     };
 
     Db db;
@@ -254,10 +256,9 @@ struct MetadataIndex::Impl {
     Status sign(FileRecord& record) const;
     Status verify(const FileRecord& record) const;
     Status load_signers();
-    Status migrate_to_v2(HybridClock& clock);
-    // The caller holds a transaction. Adopting keeps the record's HLC, so an edit made elsewhere
-    // that the adopted version turns out concurrent with is newer and keeps the name.
-    Result<FileRecord> commit_in_tx(FileRecord record, HybridClock& clock, bool adopt = false);
+    Status migrate_to_v2();
+    // The caller holds a transaction.
+    Result<FileRecord> commit_in_tx(FileRecord record, HybridClock& clock);
     Result<FileRecord> commit(FileRecord record, HybridClock& clock);
     Result<ApplyOutcome> resolve_concurrent(const FileRecord& local, const FileRecord& remote);
 };
@@ -265,8 +266,8 @@ struct MetadataIndex::Impl {
 Result<std::optional<FileRecord>> MetadataIndex::Impl::read_record(std::string_view path) const {
     auto stmt = prepare(db.get(),
                         "SELECT size, mode, mtime_ns, hlc, version, modified_by, block_size, "
-                        "chunking, deleted, sequence, signature, origin_path, effective_version "
-                        "FROM files WHERE path = ?");
+                        "chunking, deleted, sequence, signature, origin_path, effective_version, "
+                        "signer FROM files WHERE path = ?");
     if (!stmt) return stmt.error();
     Stmt& s = stmt.value();
     s.bind_text(1, path);
@@ -299,6 +300,7 @@ Result<std::optional<FileRecord>> MetadataIndex::Impl::read_record(std::string_v
     auto effective = VersionVector::parse(s.col_blob(12));
     if (!effective) return effective.error();
     record.effective_version = std::move(effective).value();
+    record.signer = s.col_u64(13);
 
     auto chunks = prepare(db.get(), "SELECT chunk FROM chunks WHERE path = ? ORDER BY idx");
     if (!chunks) return chunks.error();
@@ -327,7 +329,8 @@ Result<FileRecord> MetadataIndex::Impl::write_record(FileRecord record) {
     auto ins = prepare(db.get(),
                        "INSERT INTO files(path, size, mode, mtime_ns, hlc, version, modified_by, "
                        "block_size, chunking, deleted, sequence, signature, origin_path, "
-                       "effective_version) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                       "effective_version, signer) "
+                       "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     if (!ins) return ins.error();
     const Bytes version = record.version.serialize();
     const Bytes effective = record.effective_version.serialize();
@@ -350,6 +353,7 @@ Result<FileRecord> MetadataIndex::Impl::write_record(FileRecord record) {
                   .bind_u64(11, record.sequence)
                   .bind_text(13, record.origin_path)
                   .bind_blob(14, effective)
+                  .bind_u64(15, record.signer)
                   .run();
     if (!st) return st.error();
 
@@ -383,6 +387,7 @@ Result<std::vector<std::string>> MetadataIndex::Impl::paths_where(const char* sq
 }
 
 Status MetadataIndex::Impl::sign(FileRecord& record) const {
+    record.signer = local_device;
     auto signature = key->sign(record_signed_bytes(drive, record));
     if (!signature) return signature.error();
     record.signature = signature.value();
@@ -390,12 +395,24 @@ Status MetadataIndex::Impl::sign(FileRecord& record) const {
 }
 
 Status MetadataIndex::Impl::verify(const FileRecord& record) const {
-    auto it = signers.find(record.modified_by);
+    // not_found: the record may become valid once a device is pinned or retired here.
+    auto it = signers.find(record.signer);
     if (it == signers.end()) {
-        return Error{Errc::invalid_argument, "record by an unknown device: " + record.path};
+        return Error{Errc::not_found, "record signed by an unknown device: " + record.path};
     }
     if (it->second.retired) {
-        return Error{Errc::invalid_argument, "record by a removed device: " + record.path};
+        return Error{Errc::invalid_argument, "record signed by a removed device: " + record.path};
+    }
+    // Only a removed device's records may be signed by another: a member that adopted them.
+    if (record.signer != record.modified_by) {
+        auto author = signers.find(record.modified_by);
+        if (!it->second.pinned || author == signers.end()) {
+            return Error{Errc::not_found, "adopted record not verifiable yet: " + record.path};
+        }
+        if (!author->second.retired) {
+            return Error{Errc::invalid_argument,
+                         "record signed by a device other than its author: " + record.path};
+        }
     }
     if (!record.signature ||
         !verify_signature(it->second.key, record_signed_bytes(drive, record), *record.signature)) {
@@ -420,12 +437,22 @@ Status MetadataIndex::Impl::load_signers() {
         signer.retired = !s.col_null(2);
         loaded[s.col_u64(0)] = signer;
     }
+    auto pinned = prepare(db.get(), "SELECT short_id FROM devices");
+    if (!pinned) return pinned.error();
+    for (;;) {
+        auto row = pinned.value().step();
+        if (!row) return row.error();
+        if (!row.value()) break;
+        if (auto it = loaded.find(pinned.value().col_u64(0)); it != loaded.end()) {
+            it->second.pinned = true;
+        }
+    }
+    loaded[local_device].pinned = true;
     signers = std::move(loaded);
     return {};
 }
 
-Result<FileRecord> MetadataIndex::Impl::commit_in_tx(FileRecord record, HybridClock& clock,
-                                                     bool adopt) {
+Result<FileRecord> MetadataIndex::Impl::commit_in_tx(FileRecord record, HybridClock& clock) {
     if (record.deleted) {
         record.size = 0;
         record.chunks.clear();
@@ -438,7 +465,7 @@ Result<FileRecord> MetadataIndex::Impl::commit_in_tx(FileRecord record, HybridCl
     record.version = existing.value() ? existing.value()->effective_version : VersionVector{};
     record.version.bump(local_device);
     record.effective_version = record.version;
-    if (!adopt) record.hlc = clock.now();
+    record.hlc = clock.now();
     record.modified_by = local_device;
     if (auto st = sign(record); !st) return st.error();
     return write_record(std::move(record));
@@ -453,7 +480,7 @@ Result<FileRecord> MetadataIndex::Impl::commit(FileRecord record, HybridClock& c
     return written;
 }
 
-Status MetadataIndex::Impl::migrate_to_v2(HybridClock& clock) {
+Status MetadataIndex::Impl::migrate_to_v2() {
     if (auto st = exec(db.get(), kSchemaV2); !st) return st;
     auto self = prepare(db.get(), "INSERT INTO signers(short_id, key) VALUES(?, ?)");
     if (!self) return self.error();
@@ -475,20 +502,8 @@ Status MetadataIndex::Impl::migrate_to_v2(HybridClock& clock) {
         auto st = update.value().bind_blob(1, *record.value()->signature).bind_text(2, path).run();
         if (!st) return st;
     }
-    // The authors of these are no longer pinned and will never sign them: adopt them.
-    auto orphans = paths_where(
-        "SELECT path FROM files WHERE modified_by <> ? AND modified_by NOT IN "
-        "(SELECT short_id FROM signers)",
-        local_device);
-    if (!orphans) return orphans.error();
-    for (const auto& path : orphans.value()) {
-        auto record = read_record(path);
-        if (!record) return record.error();
-        if (!record.value()) continue;
-        auto c = commit_in_tx(std::move(*record.value()), clock, true);
-        // A record no longer valid stays as it is rather than block opening the drive.
-        if (!c && c.error().code != Errc::invalid_argument) return c.error();
-    }
+    // Other devices' records stay unsigned: nothing here can vouch for them. They are filled in
+    // when their author's signature arrives, and are never sent or adopted until then.
     // Peers already passed these records unsigned; a new index_id makes them fetch them again.
     auto id = random_u64();
     if (!id) return id.error();
@@ -515,11 +530,9 @@ Result<ApplyOutcome> MetadataIndex::Impl::resolve_concurrent(const FileRecord& l
     winner.effective_version = local.effective_version.merged(remote.version);
     if (auto w = write_record(std::move(winner)); !w) return w.error();
 
-    // Deletes lose to edits outright. Equal content (devices adopting the same records at
-    // once in retire_signer) needs no copy either. A loser that is itself a conflict
-    // copy cannot be copied again: its signature covers only its origin.
-    if (local.deleted || remote.deleted || same_content(local, remote) ||
-        !loser.origin_path.empty()) {
+    // Deletes lose to edits outright. A loser that is itself a conflict copy cannot be copied
+    // again: its signature covers only its origin.
+    if (local.deleted || remote.deleted || !loser.origin_path.empty()) {
         return ApplyOutcome{
             remote_wins ? ApplyOutcome::Kind::applied : ApplyOutcome::Kind::kept_local, {}};
     }
@@ -600,8 +613,7 @@ Result<MetadataIndex> MetadataIndex::open(const std::filesystem::path& db_path,
         }
         // Before migrating, which signs records as this device.
         if (auto st = check_device(); !st) return st.error();
-        HybridClock clock;
-        if (auto st = impl->migrate_to_v2(clock); !st) return st.error();
+        if (auto st = impl->migrate_to_v2(); !st) return st.error();
         if (auto st = tx.commit(); !st) return st.error();
     }
     if (auto st = check_device(); !st) return st.error();
@@ -713,11 +725,20 @@ Result<ApplyOutcome> MetadataIndex::apply_remote(const FileRecord& record, Hybri
         const FileRecord& stored = *local.value();
         switch (record.version.compare(stored.effective_version)) {
             case VersionVector::Order::equal:
-                // A record stored unsigned before signing takes the author's signature.
                 if (stored.signature || record.version != stored.version) return outcome;
                 if (auto st = impl_->verify(incoming); !st) return st.error();
-                incoming.effective_version = stored.effective_version;
-                if (auto w = impl_->write_record(std::move(incoming)); !w) return w.error();
+                // A record stored unsigned before signing takes the author's signature, but
+                // only if it says the same. An unsigned row has no provenance, so different
+                // content at the same version is treated as a concurrent change.
+                if (same_content(stored, incoming) && stored.modified_by == incoming.modified_by &&
+                    stored.hlc == incoming.hlc) {
+                    incoming.effective_version = stored.effective_version;
+                    if (auto w = impl_->write_record(std::move(incoming)); !w) return w.error();
+                } else {
+                    auto resolved = impl_->resolve_concurrent(stored, incoming);
+                    if (!resolved) return resolved.error();
+                    outcome = std::move(resolved).value();
+                }
                 break;
             case VersionVector::Order::before:
                 return outcome;
@@ -756,19 +777,20 @@ Status MetadataIndex::add_device(const PublicKey& key, std::string_view name) {
     // Either the key or its 64-bit short ID is already present.
     if (!st && sqlite3_errcode(db) == SQLITE_CONSTRAINT) return clash;
     if (!st) return st;
-    // A device pinned again (one in doubt that became a member) signs again.
-    auto signer = prepare(db, known == impl_->signers.end()
-                                  ? "INSERT INTO signers(short_id, key) VALUES(?, ?)"
-                                  : "UPDATE signers SET retired_seq = NULL WHERE short_id = ? AND "
-                                    "key = ?");
-    if (!signer) return signer.error();
-    if (auto sst = signer.value().bind_u64(1, id).bind_blob(2, key).run(); !sst) return sst;
+    if (known == impl_->signers.end()) {
+        auto signer = prepare(db, "INSERT INTO signers(short_id, key) VALUES(?, ?)");
+        if (!signer) return signer.error();
+        if (auto sst = signer.value().bind_u64(1, id).bind_blob(2, key).run(); !sst) return sst;
+    }
     if (auto cst = tx.commit(); !cst) return cst;
-    impl_->signers[id] = Impl::Signer{key, false};
+    // A retired key stays retired even if pinned again: removal is permanent.
+    auto& entry = impl_->signers[id];
+    entry.key = key;
+    entry.pinned = true;
     return {};
 }
 
-Result<std::size_t> MetadataIndex::retire_signer(const PublicKey& key, HybridClock& clock) {
+Result<std::size_t> MetadataIndex::retire_signer(const PublicKey& key) {
     std::lock_guard lock(impl_->mutex);
     sqlite3* db = impl_->db.get();
     const std::uint64_t id = short_id(key);
@@ -778,6 +800,8 @@ Result<std::size_t> MetadataIndex::retire_signer(const PublicKey& key, HybridClo
     auto known = impl_->signers.find(id);
     // Records under this short ID were signed by another key; they are not this key's to give up.
     if (known != impl_->signers.end() && known->second.key != key) return std::size_t{0};
+    // Retiring and adopting happen in one transaction, so a retired key is done.
+    if (known != impl_->signers.end() && known->second.retired) return std::size_t{0};
 
     Transaction tx(db);
     if (auto st = tx.begin(); !st) return st.error();
@@ -790,21 +814,26 @@ Result<std::size_t> MetadataIndex::retire_signer(const PublicKey& key, HybridClo
     auto st = signer.value().bind_u64(1, id).bind_blob(2, key).bind_u64(3, sequence.value()).run();
     if (!st) return st.error();
 
-    // Adoption: a device that joins later never learns the retired key, so the records it
-    // signed would be rejected there. Each member commits them again unchanged under its own
-    // key. Members adopting at once make concurrent versions with equal content, which
-    // resolve_concurrent settles without a conflict copy.
-    auto paths = impl_->paths_where("SELECT path FROM files WHERE modified_by = ?", id);
+    // Adoption: a device that joins later cannot check the retired key's signatures, so this
+    // device signs each verified record it signed as the record's signer. Content, version and
+    // modified_by stay as they were, so adoptions by several members compare equal and a newer
+    // version by the removed device still supersedes an older one, whoever adopted each.
+    // Unsigned rows were never verified and are not adopted.
+    auto paths = impl_->paths_where(
+        "SELECT path FROM files WHERE modified_by = ?1 AND signer = ?1 AND signature IS NOT NULL",
+        id);
     if (!paths) return paths.error();
     for (const auto& path : paths.value()) {
         auto record = impl_->read_record(path);
         if (!record) return record.error();
         if (!record.value()) continue;
-        auto c = impl_->commit_in_tx(std::move(*record.value()), clock, true);
-        if (!c && c.error().code != Errc::invalid_argument) return c.error();
+        if (auto sst = impl_->sign(*record.value()); !sst) return sst.error();
+        if (auto w = impl_->write_record(std::move(*record.value())); !w) return w.error();
     }
     if (auto cst = tx.commit(); !cst) return cst.error();
-    impl_->signers[id] = Impl::Signer{key, true};
+    auto& entry = impl_->signers[id];
+    entry.key = key;
+    entry.retired = true;
     return paths.value().size();
 }
 
@@ -814,6 +843,12 @@ bool MetadataIndex::is_active_signer(std::uint64_t id) const {
     return it != impl_->signers.end() && !it->second.retired;
 }
 
+bool MetadataIndex::is_retired_signer(std::uint64_t id) const {
+    std::lock_guard lock(impl_->mutex);
+    auto it = impl_->signers.find(id);
+    return it != impl_->signers.end() && it->second.retired;
+}
+
 Status MetadataIndex::remove_device(const PublicKey& key) {
     std::lock_guard lock(impl_->mutex);
     auto stmt = prepare(impl_->db.get(), "DELETE FROM devices WHERE key = ?");
@@ -821,6 +856,9 @@ Status MetadataIndex::remove_device(const PublicKey& key) {
     if (auto st = stmt.value().bind_blob(1, key).run(); !st) return st;
     if (sqlite3_changes(impl_->db.get()) == 0) {
         return Error{Errc::not_found, "device not pinned: " + fingerprint(key)};
+    }
+    if (auto it = impl_->signers.find(short_id(key)); it != impl_->signers.end()) {
+        it->second.pinned = false;
     }
     return {};
 }

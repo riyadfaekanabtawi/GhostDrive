@@ -127,6 +127,7 @@ void put_record(Writer& w, const core::FileRecord& r) {
     w.u32(static_cast<std::uint32_t>(r.chunks.size()));
     for (const auto& id : r.chunks) w.bytes(id.to_bytes());
     // Only signed records are sent; an unsigned one goes out with zeros and fails to verify.
+    w.u64(r.signer);
     w.bytes(r.signature.value_or(core::Signature{}));
     w.str16(r.origin_path);
 }
@@ -176,9 +177,11 @@ std::optional<core::FileRecord> get_record(Reader& r) {
         if (!id) return std::nullopt;
         rec.chunks.push_back(id.value());
     }
+    auto signer = r.u64();
     core::Signature signature{};
-    auto origin = r.fixed(signature) ? r.str16(kMaxPathBytes) : std::nullopt;
+    auto origin = signer && r.fixed(signature) ? r.str16(kMaxPathBytes) : std::nullopt;
     if (!origin) return std::nullopt;
+    rec.signer = *signer;
     rec.signature = signature;
     rec.origin_path = std::move(*origin);
     return rec;

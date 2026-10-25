@@ -60,6 +60,7 @@ protected:
     // A record as `key` would sign it.
     FileRecord signed_by(const DeviceKey& key, FileRecord record) const {
         record.modified_by = short_id(key.public_key());
+        record.signer = record.modified_by;
         record.signature = key.sign(record_signed_bytes(drive_, record)).value();
         return record;
     }
@@ -416,7 +417,8 @@ TEST_F(MetadataIndexTest, AnUnknownSignerIsRejectedUntilPinned) {
     from_b.version.bump(id_b_);
     from_b = signed_by(key_b_, from_b);
     EXPECT_FALSE(a.is_active_signer(id_b_));
-    EXPECT_EQ(a.apply_remote(from_b, clock_a_).error().code, Errc::invalid_argument);
+    // not_found: it may become valid, so the exchange fetches it again later.
+    EXPECT_EQ(a.apply_remote(from_b, clock_a_).error().code, Errc::not_found);
     EXPECT_FALSE(a.get("f").value().has_value());
 
     ASSERT_TRUE(a.add_device(key_b_.public_key(), "b"));
@@ -446,32 +448,81 @@ TEST_F(MetadataIndexTest, ARetiredSignerIsRejectedButItsRecordsStay) {
 
     // B is removed from the drive.
     ASSERT_TRUE(a.remove_device(key_b_.public_key()));
-    auto adopted = a.retire_signer(key_b_.public_key(), clock_a_);
+    auto adopted = a.retire_signer(key_b_.public_key());
     ASSERT_TRUE(adopted) << adopted.error().message;
     EXPECT_EQ(adopted.value(), 2u);  // the tombstone too
     EXPECT_FALSE(a.is_active_signer(id_b_));
     EXPECT_EQ(a.apply_remote(late, clock_a_).error().code, Errc::invalid_argument);
     EXPECT_FALSE(a.get("late").value().has_value());
+    EXPECT_EQ(a.retire_signer(key_b_.public_key()).value(), 0u);  // done once
 
-    // Its records are still readable, now signed by A with the same content.
+    // Its records are still readable, unchanged but for the signer.
     auto kept = a.get("kept").value();
     ASSERT_TRUE(kept);
     EXPECT_EQ(kept->chunks, std::vector<ChunkId>{chunk_with(1)});
-    EXPECT_EQ(kept->modified_by, id_a_);
-    EXPECT_EQ(kept->version.get(id_b_), 1u);
-    EXPECT_EQ(kept->version.get(id_a_), 1u);
+    EXPECT_EQ(kept->modified_by, id_b_);
+    EXPECT_EQ(kept->signer, id_a_);
+    EXPECT_EQ(kept->version, b.get("kept").value()->version);
     EXPECT_TRUE(a.get("gone").value()->deleted);
 
-    // A device that joins later and never learns B's key still accepts them.
+    // A device that joins later and never pinned B accepts them once it knows B was removed.
     MetadataIndex c = open("c.db", key_c_);
     ASSERT_TRUE(c.add_device(key_a_.public_key(), "a"));
+    auto from_a = a.records_since(0, 100, true).value();
+    ASSERT_EQ(from_a.size(), 2u);
+    EXPECT_EQ(c.apply_remote(from_a[0], clock_a_).error().code, Errc::not_found);
+    ASSERT_TRUE(c.retire_signer(key_b_.public_key()));
     std::uint64_t a_to_c = 0;
     for (const auto& o : sync(a, c, a_to_c, clock_a_)) EXPECT_EQ(o.kind, Kind::applied);
     expect_same(a, c, "kept");
 
-    // Pinned again (a device in doubt that became a member), B signs again.
+    // Removal is permanent: pinned again, B still cannot sign.
     ASSERT_TRUE(a.add_device(key_b_.public_key(), "b"));
-    EXPECT_TRUE(a.apply_remote(late, clock_a_));
+    EXPECT_EQ(a.apply_remote(late, clock_a_).error().code, Errc::invalid_argument);
+}
+
+TEST_F(MetadataIndexTest, OnlyARemovedDevicesRecordsMayBeSignedByAnother) {
+    MetadataIndex a = open_peer("a.db", key_a_);
+    MetadataIndex b = open_peer("b.db", key_b_);
+    auto genuine = b.commit_local(file("f", 1, 1), clock_b_).value();
+    // C signs B's record as if adopting it while B is still a member.
+    auto relabelled = genuine;
+    relabelled.signer = id_c_;
+    relabelled.signature = key_c_.sign(record_signed_bytes(drive_, relabelled)).value();
+    EXPECT_EQ(a.apply_remote(relabelled, clock_a_).error().code, Errc::invalid_argument);
+    // Once B is removed, an adoption by a pinned member is fine.
+    ASSERT_TRUE(a.retire_signer(key_b_.public_key()));
+    EXPECT_EQ(a.apply_remote(relabelled, clock_a_).value().kind, Kind::applied);
+    // Not by a device that is not pinned here.
+    auto by_unpinned = genuine;
+    by_unpinned.path = "g";
+    ASSERT_TRUE(a.remove_device(key_c_.public_key()));
+    by_unpinned.signer = id_c_;
+    by_unpinned.signature = key_c_.sign(record_signed_bytes(drive_, by_unpinned)).value();
+    EXPECT_EQ(a.apply_remote(by_unpinned, clock_a_).error().code, Errc::not_found);
+}
+
+TEST_F(MetadataIndexTest, AdoptionDoesNotBringBackADeletedFile) {
+    MetadataIndex a = open_peer("a.db", key_a_);
+    MetadataIndex b = open_peer("b.db", key_b_);
+    MetadataIndex c = open_peer("c.db", key_c_);
+    // C writes P; A hears of it, then C deletes P and only B hears of that.
+    auto written = c.commit_local(file("p", 1, 1), clock_a_).value();
+    ASSERT_TRUE(a.apply_remote(written, clock_a_));
+    ASSERT_TRUE(b.apply_remote(written, clock_b_));
+    auto deleted = c.delete_local("p", clock_a_).value();
+    ASSERT_TRUE(b.apply_remote(deleted, clock_b_));
+    // C is removed; A and B each adopt what they hold.
+    ASSERT_EQ(a.retire_signer(key_c_.public_key()).value(), 1u);
+    ASSERT_EQ(b.retire_signer(key_c_.public_key()).value(), 1u);
+    EXPECT_EQ(a.apply_remote(deleted, clock_a_).error().code, Errc::invalid_argument);
+    std::uint64_t a_to_b = 0;
+    std::uint64_t b_to_a = 0;
+    for (const auto& o : sync(a, b, a_to_b, clock_b_)) EXPECT_EQ(o.kind, Kind::ignored);
+    for (const auto& o : sync(b, a, b_to_a, clock_a_)) EXPECT_EQ(o.kind, Kind::applied);
+    EXPECT_TRUE(a.get("p").value()->deleted);
+    EXPECT_TRUE(b.get("p").value()->deleted);
+    expect_same(a, b, "p");
 }
 
 TEST_F(MetadataIndexTest, AdoptionByEveryMemberConvergesWithoutAConflictCopy) {
@@ -485,16 +536,17 @@ TEST_F(MetadataIndexTest, AdoptionByEveryMemberConvergesWithoutAConflictCopy) {
     sync(c, b, c_to_b, clock_b_);
 
     // A and B both retire C and adopt its record at once.
-    ASSERT_EQ(a.retire_signer(key_c_.public_key(), clock_a_).value(), 1u);
+    ASSERT_EQ(a.retire_signer(key_c_.public_key()).value(), 1u);
     pt_ += 10;
-    ASSERT_EQ(b.retire_signer(key_c_.public_key(), clock_b_).value(), 1u);
+    ASSERT_EQ(b.retire_signer(key_c_.public_key()).value(), 1u);
     std::uint64_t a_to_b = a.max_sequence().value() - 1;
     std::uint64_t b_to_a = b.max_sequence().value() - 1;
     for (int round = 0; round < 2; ++round) {
-        for (const auto& o : sync(a, b, a_to_b, clock_b_)) EXPECT_NE(o.kind, Kind::conflict);
-        for (const auto& o : sync(b, a, b_to_a, clock_a_)) EXPECT_NE(o.kind, Kind::conflict);
+        for (const auto& o : sync(a, b, a_to_b, clock_b_)) EXPECT_EQ(o.kind, Kind::ignored);
+        for (const auto& o : sync(b, a, b_to_a, clock_a_)) EXPECT_EQ(o.kind, Kind::ignored);
     }
     expect_same(a, b, "doc.txt");
+    EXPECT_EQ(a.get("doc.txt").value()->version, c.get("doc.txt").value()->version);
     const auto all = a.records_since(0, 100).value();
     EXPECT_EQ(all.size(), 1u);
     for (const auto& r : all) {
@@ -502,7 +554,7 @@ TEST_F(MetadataIndexTest, AdoptionByEveryMemberConvergesWithoutAConflictCopy) {
     }
 }
 
-TEST_F(MetadataIndexTest, AnEditConcurrentWithAnAdoptionKeepsTheName) {
+TEST_F(MetadataIndexTest, AnEditOfAnAdoptedRecordSupersedesIt) {
     MetadataIndex a = open_peer("a.db", key_a_);
     MetadataIndex b = open_peer("b.db", key_b_);
     MetadataIndex c = open_peer("c.db", key_c_);
@@ -514,8 +566,8 @@ TEST_F(MetadataIndexTest, AnEditConcurrentWithAnAdoptionKeepsTheName) {
     // B edits C's file; A has not seen the edit when it adopts C's version.
     pt_ += 5000;
     auto edit = b.commit_local(file("doc.txt", 2, 2), clock_b_).value();
-    ASSERT_EQ(a.retire_signer(key_c_.public_key(), clock_a_).value(), 1u);
-    EXPECT_EQ(a.apply_remote(edit, clock_a_).value().kind, Kind::conflict);
+    ASSERT_EQ(a.retire_signer(key_c_.public_key()).value(), 1u);
+    EXPECT_EQ(a.apply_remote(edit, clock_a_).value().kind, Kind::applied);
     EXPECT_EQ(a.get("doc.txt").value()->chunks, std::vector<ChunkId>{chunk_with(2)});
 }
 
@@ -690,31 +742,69 @@ TEST_F(MetadataIndexTest, AVersionOneIndexMigrates) {
     ASSERT_TRUE(mine.signature);
     EXPECT_EQ(mine.version.get(id_a_), 1u);
     EXPECT_EQ(b.apply_remote(mine, clock_b_).value().kind, Kind::applied);
-    // The removed device's record is adopted.
+    // Nothing vouches for the removed device's record: it stays readable here, unsigned.
     auto gone = a.get("gone.txt").value().value();
-    EXPECT_EQ(gone.modified_by, id_a_);
-    EXPECT_EQ(gone.version.get(removed), 1u);
-    ASSERT_TRUE(gone.signature);
-    EXPECT_EQ(b.apply_remote(gone, clock_b_).value().kind, Kind::applied);
+    EXPECT_EQ(gone.modified_by, removed);
+    EXPECT_FALSE(gone.signature);
 
     // B's record stays unsigned and is not sent on until B's signature arrives.
     auto unsigned_theirs = a.get("theirs.txt").value().value();
     EXPECT_FALSE(unsigned_theirs.signature);
     auto sendable = a.records_since(0, 100, true).value();
-    EXPECT_EQ(sendable.size(), 2u);
+    EXPECT_EQ(sendable.size(), 1u);
     auto forged = theirs;
     forged.signature = key_c_.sign(record_signed_bytes(drive_, theirs)).value();
     EXPECT_EQ(a.apply_remote(forged, clock_a_).error().code, Errc::invalid_argument);
     EXPECT_EQ(a.apply_remote(theirs, clock_a_).value().kind, Kind::ignored);
     EXPECT_EQ(a.get("theirs.txt").value()->signature, theirs.signature);
-    EXPECT_EQ(a.records_since(0, 100, true).value().size(), 3u);
+    EXPECT_EQ(a.records_since(0, 100, true).value().size(), 2u);
     EXPECT_EQ(a.apply_remote(theirs, clock_a_).value().kind, Kind::ignored);
 
     // Reopening does not migrate again.
     const auto index_id = a.index_id();
     a = open("a.db", key_a_);
     EXPECT_EQ(a.index_id(), index_id);
-    EXPECT_EQ(a.records_since(0, 100, true).value().size(), 3u);
+    EXPECT_EQ(a.records_since(0, 100, true).value().size(), 2u);
+}
+
+// A version 1 index of device A holding `record` (unsigned) and B pinned.
+void make_v1_index(const std::filesystem::path& path, std::uint64_t local, const PublicKey& b,
+                   FileRecord record) {
+    V1Database v1(path);
+    record.sequence = 1;
+    v1.insert(record);
+    v1.insert_device(b);
+    v1.exec("INSERT INTO meta VALUES('index_id', 1), ('sequence', 1), ('local_device', " +
+            std::to_string(static_cast<std::int64_t>(local)) + ")");
+}
+
+TEST_F(MetadataIndexTest, UnsignedRowsAreNotAdopted) {
+    MetadataIndex b = open_peer("b.db", key_b_);
+    auto theirs = b.commit_local(file("theirs.txt", 2, 2), clock_b_).value();
+    make_v1_index(dir_.path() / "a.db", id_a_, key_b_.public_key(), theirs);
+    MetadataIndex a = open("a.db", key_a_);
+    // B is removed before its signature reached A: the row was never verified.
+    EXPECT_EQ(a.retire_signer(key_b_.public_key()).value(), 0u);
+    EXPECT_FALSE(a.get("theirs.txt").value()->signature);
+    EXPECT_TRUE(a.records_since(0, 100, true).value().empty());
+}
+
+TEST_F(MetadataIndexTest, AnUnsignedRowIsReplacedOnlyByTheSameRecord) {
+    MetadataIndex b = open_peer("b.db", key_b_);
+    auto theirs = b.commit_local(file("theirs.txt", 2, 2), clock_b_).value();
+    // The stored row claims B's version with other content (planted by some member).
+    auto planted = theirs;
+    planted.chunks = {chunk_with(7)};
+    make_v1_index(dir_.path() / "a.db", id_a_, key_b_.public_key(), planted);
+    MetadataIndex a = open("a.db", key_a_);
+    auto outcome = a.apply_remote(theirs, clock_a_);
+    ASSERT_TRUE(outcome);
+    // Treated as concurrent: both contents stay, and only the signed one is sent on.
+    EXPECT_EQ(outcome.value().kind, Kind::conflict);
+    const auto sendable = a.records_since(0, 100, true).value();
+    ASSERT_EQ(sendable.size(), 1u);
+    EXPECT_EQ(sendable[0].chunks, std::vector<ChunkId>{chunk_with(2)});
+    EXPECT_EQ(a.records_since(0, 100).value().size(), 2u);
 }
 
 }  // namespace
