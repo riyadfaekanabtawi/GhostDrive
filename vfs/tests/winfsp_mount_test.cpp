@@ -11,6 +11,8 @@
 
 #include <gtest/gtest.h>
 
+#include <asio/co_spawn.hpp>
+#include <asio/detached.hpp>
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
 #include <asio/post.hpp>
@@ -24,7 +26,9 @@
 #include <thread>
 
 #include "ghostdrive/core/chunking.hpp"
+#include "ghostdrive/core/file.hpp"
 #include "ghostdrive/core/hlc.hpp"
+#include "ghostdrive/vfs/chunk_exchange.hpp"
 #include "temp_dir.hpp"
 
 namespace ghostdrive::vfs {
@@ -79,6 +83,15 @@ protected:
 
     ~WinFsp() override {
         mount_.reset();  // unmount before the executor and the filesystem go away
+        if (io_thread_.joinable()) {
+            std::promise<void> closed;
+            asio::post(io_, [&] {
+                if (client_) client_->close();
+                if (server_) server_->close();
+                closed.set_value();
+            });
+            closed.get_future().wait();
+        }
         work_.reset();
         io_.stop();
         if (io_thread_.joinable()) io_thread_.join();
@@ -91,10 +104,12 @@ protected:
         return *r.value();
     }
 
-    void start(bool writable = false, std::filesystem::path mountpoint = {}) {
-        if (!mountpoint.empty()) mountpoint_ = std::move(mountpoint);
+    // Starts the filesystem without mounting it. A fetch with no connected holder waits up to
+    // 20 s for one, which the tests use to hold a read in flight.
+    void prepare(bool writable = false, ConnectionLookup peers = nullptr) {
         fetcher_ = std::make_unique<Fetcher>(io_.get_executor(), disk_.get_executor(), store_,
-                                             index_, cache_, nullptr);
+                                             index_, cache_, std::move(peers),
+                                             std::chrono::seconds(10), std::chrono::seconds(20));
         std::optional<WriteSupport> writes;
         if (writable) {
             writes.emplace(WriteSupport{store_, index_, clock_, disk_.get_executor(),
@@ -103,17 +118,29 @@ protected:
         fs_ = std::make_unique<Filesystem>(io_.get_executor(), tree_, *fetcher_,
                                            FilesystemOptions{}, std::move(writes));
         io_thread_ = std::thread([this] { io_.run(); });
+    }
+
+    core::Result<std::unique_ptr<WinFspMount>> try_mount(const std::filesystem::path& at,
+                                                         std::filesystem::path data_dir = {}) {
         WinFspMountOptions options;
-        options.capacity_from = dir_.path();
-        auto mounted = WinFspMount::mount(*fs_, mountpoint_, options);
+        options.data_dir = data_dir.empty() ? dir_.path() : std::move(data_dir);
+        return WinFspMount::mount(*fs_, at, options);
+    }
+
+    void start(bool writable = false, std::filesystem::path mountpoint = {},
+               ConnectionLookup peers = nullptr) {
+        if (!mountpoint.empty()) mountpoint_ = std::move(mountpoint);
+        prepare(writable, std::move(peers));
+        auto mounted = try_mount(mountpoint_);
         ASSERT_TRUE(mounted) << mounted.error().message;
         mount_ = std::move(mounted).value();
     }
 
-    core::FileRecord add(const std::string& path, const core::Bytes& data) {
+    core::FileRecord add(core::ChunkStore& store, const std::string& path,
+                         const core::Bytes& data) {
         auto source = dir_.path() / ("src-" + std::to_string(counter_++));
         write_whole(source, data);
-        auto imported = store_.import_file(source).value();
+        auto imported = store.import_file(source).value();
         core::FileRecord record;
         record.path = path;
         record.size = imported.size;
@@ -124,6 +151,66 @@ protected:
         EXPECT_TRUE(index_.commit_local(record, clock_));
         EXPECT_TRUE(tree_.refresh(index_));
         return record;
+    }
+    core::FileRecord add(const std::string& path, const core::Bytes& data) {
+        return add(store_, path, data);
+    }
+
+    // A file whose chunks only a second device holds, and a connection to that device that
+    // publish() makes visible to the fetcher. Until then reads of the file wait in the fetcher.
+    void add_remote(const std::string& path, const core::Bytes& data) {
+        server_store_.emplace(
+            core::ChunkStore::open(dir_.path() / "server-store", core::ChunkHasher(secret_))
+                .value());
+        auto record = add(*server_store_, path, data);
+        ASSERT_TRUE(index_.add_device(server_key_.public_key(), "server"));
+        for (const auto& id : record.chunks) {
+            ASSERT_TRUE(index_.set_holds(server_key_.public_key(), id, true));
+        }
+    }
+    ConnectionLookup peers() {
+        return [this](const core::PublicKey&) { return conn_; };
+    }
+    void connect_peer() {
+        transport::EndpointOptions server_options;
+        server_options.accept_peer = [pin = client_key_.public_key()](const core::PublicKey& k) {
+            return k == pin;
+        };
+        std::promise<core::Result<std::shared_ptr<transport::Connection>>> connected;
+        asio::post(io_, [&] {
+            server_ = transport::Endpoint::create(io_.get_executor(), server_key_, server_options)
+                          .value();
+            client_ = transport::Endpoint::create(io_.get_executor(), client_key_, {}).value();
+            asio::co_spawn(
+                io_,
+                [&]() -> asio::awaitable<void> {
+                    asio::co_spawn(
+                        io_,
+                        [this]() -> asio::awaitable<void> {
+                            auto incoming = co_await server_->accept();
+                            if (incoming) {
+                                co_await serve_chunks(incoming.value(), *server_store_,
+                                                      disk_.get_executor());
+                            }
+                        },
+                        asio::detached);
+                    connected.set_value(co_await client_->connect(server_->local_endpoint(),
+                                                                  server_key_.public_key()));
+                },
+                asio::detached);
+        });
+        auto result = connected.get_future().get();
+        ASSERT_TRUE(result) << result.error().message;
+        pending_conn_ = result.value();
+    }
+    void publish() {
+        std::promise<void> done;
+        asio::post(io_, [&] {
+            conn_ = pending_conn_;
+            fetcher_->holders_changed();
+            done.set_value();
+        });
+        done.get_future().wait();
     }
 
     test::TempDir dir_;
@@ -144,6 +231,13 @@ protected:
     std::filesystem::path mountpoint_;
     std::unique_ptr<WinFspMount> mount_;
     int counter_ = 0;
+    std::optional<core::ChunkStore> server_store_;
+    core::DeviceKey server_key_ = core::DeviceKey::generate().value();
+    core::DeviceKey client_key_ = core::DeviceKey::generate().value();
+    std::shared_ptr<transport::Endpoint> client_;
+    std::shared_ptr<transport::Endpoint> server_;
+    std::shared_ptr<transport::Connection> pending_conn_;
+    std::shared_ptr<transport::Connection> conn_;  // touched on the io thread only
 };
 
 TEST_F(WinFsp, ListsStatsAndReadsFiles) {
@@ -331,11 +425,138 @@ TEST_F(WinFsp, OnlyTheCurrentUserHasAccess) {
 
 TEST_F(WinFsp, DirectoryMountpointComesAndGoes) {
     add("f.txt", random_bytes(10, 13));
-    std::filesystem::create_directories(mountpoint_);  // an empty leftover is replaced
-    ASSERT_NO_FATAL_FAILURE(start());
+    // Missing parents are created private to this user.
+    ASSERT_NO_FATAL_FAILURE(start(false, dir_.path() / "a" / "b" / "mnt"));
+    EXPECT_TRUE(core::is_private_dir(dir_.path() / "a"));
+    EXPECT_TRUE(core::is_private_dir(dir_.path() / "a" / "b"));
     EXPECT_TRUE(std::filesystem::exists(mountpoint_ / "f.txt"));
     mount_->unmount();
     EXPECT_FALSE(std::filesystem::exists(mountpoint_));
+}
+
+TEST_F(WinFsp, LeavesWhatIsAlreadyAtTheMountpointAlone) {
+    ASSERT_NO_FATAL_FAILURE(prepare());
+    // An existing directory, even an empty one, is the user's.
+    std::filesystem::create_directories(mountpoint_);
+    auto mounted = try_mount(mountpoint_);
+    ASSERT_FALSE(mounted);
+    EXPECT_EQ(mounted.error().code, core::Errc::already_exists);
+    EXPECT_TRUE(std::filesystem::is_directory(mountpoint_));
+
+    // So is a junction or directory link, which is not followed or removed.
+    const auto target = dir_.path() / "target";
+    std::filesystem::create_directories(target);
+    const auto link = dir_.path() / "link";
+    std::error_code ec;
+    std::filesystem::create_directory_symlink(target, link, ec);
+    if (!ec) {
+        auto over_link = try_mount(link);
+        ASSERT_FALSE(over_link);
+        EXPECT_TRUE(std::filesystem::is_symlink(link));
+    }
+
+    // A data directory inside the mount is refused.
+    auto around_data = try_mount(dir_.path() / "outer", dir_.path() / "outer" / "data");
+    ASSERT_FALSE(around_data);
+    EXPECT_EQ(around_data.error().code, core::Errc::invalid_argument);
+    EXPECT_FALSE(std::filesystem::exists(dir_.path() / "outer"));
+}
+
+// WinFsp keeps one kernel file node per name compared without case, so of names that differ
+// only in case, one is shown and every spelling opens it.
+TEST_F(WinFsp, ShowsOneOfNamesThatDifferOnlyInCase) {
+    auto upper = random_bytes(100, 15);
+    auto lower = random_bytes(200, 16);
+    add("Report.txt", upper);
+    add("report.txt", lower);
+    ASSERT_NO_FATAL_FAILURE(start());
+    EXPECT_EQ(names_in(mountpoint_), (std::set<std::wstring>{L"Report.txt"}));
+    EXPECT_TRUE(read_whole(mountpoint_ / "Report.txt") == upper);
+    EXPECT_TRUE(read_whole(mountpoint_ / "report.txt") == upper);
+    EXPECT_TRUE(read_whole(mountpoint_ / "REPORT.TXT") == upper);
+}
+
+// A read waiting on a peer is cancelled by its reader: WinFsp keeps the request (and its
+// buffer) until it is answered, and the mount carries on.
+TEST_F(WinFsp, ACancelledSlowReadLeavesTheMountHealthy) {
+    auto remote = random_bytes(3 * core::kMinBlockSize + 7, 17);
+    auto local = random_bytes(5000, 18);
+    ASSERT_NO_FATAL_FAILURE(add_remote("remote.bin", remote));
+    add("local.bin", local);
+    ASSERT_NO_FATAL_FAILURE(start(false, {}, peers()));
+    ASSERT_NO_FATAL_FAILURE(connect_peer());
+
+    Handle file{::CreateFileW((mountpoint_ / "remote.bin").c_str(), GENERIC_READ, FILE_SHARE_READ,
+                              nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr)};
+    ASSERT_NE(file.h, INVALID_HANDLE_VALUE) << ::GetLastError();
+    core::Bytes buf(65536);
+    OVERLAPPED at{};
+    at.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ASSERT_FALSE(::ReadFile(file.h, buf.data(), static_cast<DWORD>(buf.size()), nullptr, &at));
+    ASSERT_EQ(::GetLastError(), static_cast<DWORD>(ERROR_IO_PENDING));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // the fetch is waiting
+    ::CancelIoEx(file.h, &at);
+
+    // Other files read correctly while that read is outstanding.
+    EXPECT_TRUE(read_whole(mountpoint_ / "local.bin") == local);
+
+    publish();
+    DWORD n = 0;
+    if (::GetOverlappedResult(file.h, &at, &n, TRUE)) {
+        EXPECT_EQ(n, buf.size());
+        EXPECT_TRUE(std::equal(buf.begin(), buf.end(), remote.begin()));
+    } else {
+        EXPECT_EQ(::GetLastError(), static_cast<DWORD>(ERROR_OPERATION_ABORTED));
+    }
+    ::CloseHandle(at.hEvent);
+    EXPECT_TRUE(read_whole(mountpoint_ / "remote.bin") == remote);
+    EXPECT_TRUE(read_whole(mountpoint_ / "local.bin") == local);
+}
+
+// Unmounting cancels a read still waiting on a peer and unmaps its buffer; when the bytes
+// arrive afterwards they must not be copied anywhere.
+TEST_F(WinFsp, UnmountingWithASlowReadInFlightIsSafe) {
+    auto remote = random_bytes(3 * core::kMinBlockSize + 7, 19);
+    ASSERT_NO_FATAL_FAILURE(add_remote("remote.bin", remote));
+    ASSERT_NO_FATAL_FAILURE(start(false, {}, peers()));
+    ASSERT_NO_FATAL_FAILURE(connect_peer());
+
+    Handle file{::CreateFileW((mountpoint_ / "remote.bin").c_str(), GENERIC_READ, FILE_SHARE_READ,
+                              nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr)};
+    ASSERT_NE(file.h, INVALID_HANDLE_VALUE) << ::GetLastError();
+    core::Bytes buf(65536);
+    OVERLAPPED at{};
+    at.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ASSERT_FALSE(::ReadFile(file.h, buf.data(), static_cast<DWORD>(buf.size()), nullptr, &at));
+    ASSERT_EQ(::GetLastError(), static_cast<DWORD>(ERROR_IO_PENDING));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    std::thread unmounting([this] { mount_->unmount(); });  // waits for the fetch to end
+    DWORD n = 0;
+    EXPECT_FALSE(::GetOverlappedResult(file.h, &at, &n, TRUE));  // cancelled by the unmount
+    publish();  // the bytes arrive after the request is gone
+    unmounting.join();
+    ::CloseHandle(at.hEvent);
+
+    // The process is intact and a new mount reads the file.
+    mount_.reset();
+    auto again = try_mount(dir_.path() / "mnt2");
+    ASSERT_TRUE(again) << again.error().message;
+    EXPECT_TRUE(read_whole(dir_.path() / "mnt2" / "remote.bin") == remote);
+}
+
+TEST_F(WinFsp, WritesOnHandlesStillOpenAtUnmountAreCommitted) {
+    ASSERT_NO_FATAL_FAILURE(start(true));
+    Handle file{::CreateFileW((mountpoint_ / "open.txt").c_str(), GENERIC_WRITE, 0, nullptr,
+                              CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr)};
+    ASSERT_NE(file.h, INVALID_HANDLE_VALUE) << ::GetLastError();
+    const char text[] = "still open";
+    DWORD n = 0;
+    ASSERT_TRUE(::WriteFile(file.h, text, sizeof(text) - 1, &n, nullptr));
+    mount_->unmount();
+    auto record = indexed("open.txt");
+    ASSERT_TRUE(record);
+    EXPECT_EQ(record->size, sizeof(text) - 1);
 }
 
 TEST_F(WinFsp, MountsAtADriveLetter) {

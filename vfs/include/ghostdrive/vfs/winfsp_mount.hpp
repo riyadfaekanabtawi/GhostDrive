@@ -15,15 +15,16 @@ struct WinFspMountOptions {
     // How long Windows may cache file information, security and directory listings. Data is never
     // cached by Windows; every read reaches the Filesystem and its chunk cache.
     std::chrono::milliseconds info_timeout{1000};
-    // Free and total space reported for the volume: those of the disk holding this path (the
-    // data directory). Empty reports zero.
-    std::filesystem::path capacity_from;
+    // The daemon's data directory. The volume reports the free and total space of its disk
+    // (zero when empty), and mounting refuses a mountpoint that would contain it.
+    std::filesystem::path data_dir;
     bool debug = false;
 };
 
 // A WinFsp mount of a Filesystem (native FSP_FILE_SYSTEM_INTERFACE), read-only unless the
 // Filesystem has WriteSupport. The mountpoint is a drive letter ("X:") or a directory that does
-// not exist yet (an empty one is removed first); WinFsp creates it and removes it on unmount.
+// not exist yet; WinFsp creates it and removes it on unmount, and missing parents are created
+// owner-only. Files still open at unmount have their writes committed.
 // Only the current user can open anything in it. mount() fails with Errc::not_found when WinFsp
 // is not installed.
 class WinFspMount {

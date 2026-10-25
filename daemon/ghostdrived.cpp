@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
     if (args.mount) {
         vfs::WinFspMountOptions mount_options;
         mount_options.volume_name = "GhostDrive";
-        mount_options.capacity_from = args.data;
+        mount_options.data_dir = args.data;
         auto mounted = vfs::WinFspMount::mount(service.filesystem(), args.mountpoint, mount_options);
         if (!mounted) {
             std::cerr << "ghostdrived: " << mounted.error().message << "\n";

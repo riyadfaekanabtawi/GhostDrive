@@ -631,23 +631,44 @@ As built after step (c), before discovery (ahead of the planned order so the dri
     thread waits for the network; read bytes are copied once into the request's buffer (C8).
     WinFsp allows `STATUS_PENDING` only for Read, Write and ReadDirectory, so the rest
     (Overwrite, Flush, Cleanup, SetFileSize, SetBasicInfo) wait for their callback on the
-    dispatcher thread; none of them fetch from peers. Unmount waits for outstanding replies
-    before deleting the volume. Read-ahead, the chunk cache and hash verification are the
-    Filesystem's, unchanged.
+    dispatcher thread; none of them fetch from peers. Read-ahead, the chunk cache and hash
+    verification are the Filesystem's, unchanged. Writes are copied 4 MiB at a time, so a large
+    non-cached write does not need a buffer of its size; append-to-end takes the size when the
+    request arrives, so two handles appending at once are not atomic.
+  - *Pending request buffers.* A pending request's buffer is the reader's memory mapped into
+    the daemon (WinFsp 2.1 `src/sys/read.c`, `FspFsvolReadPrepare`), unmapped by the request's
+    fini (`FspFsvolReadNonCachedRequestFini`) when the request is completed or cancelled. The
+    driver is built with `FSP_IOQ_PROCESS_NO_CANCEL` (`src/sys/driver.h`; `src/sys/ioq.c`,
+    `FspIoqStartProcessingIrp`): once a request reaches the file system it has no cancel
+    routine and no timeout, so a reader's `CancelIoEx`, its exit or `IrpTimeout` cannot end it.
+    Only stopping the I/O queue with cancellation does (`FspIoqStop`, from `FSP_FSCTL_STOP` in
+    `FspFileSystemStopDispatcher`, or the volume handle closing). So a late reply copies into the
+    buffer only under a shared lock and while the mount is open; unmount closes it under the
+    exclusive lock before stopping the dispatcher, then waits for outstanding replies, then
+    commits and releases files still open (WinFsp sends them no Close), then deletes the volume.
   - *Cleanup and Close.* `Cleanup`, the last `CloseHandle` of a file object, is close(2): it
     commits the handle's writes (Filesystem `flush`), or carries out a delete. `Close` releases
     the Filesystem handle. A handle opened with `FILE_WRITE_DATA` or `FILE_APPEND_DATA` gets a
-    write handle, as `O_WRONLY`/`O_RDWR` does under FUSE. `FileInfoTimeout` is finite (1 s), so
-    WinFsp keeps the Windows cache manager off: every read and write reaches the Filesystem and
-    nothing is written back after Cleanup. Attributes and listings may be cached for 1 s.
+    write handle, as `O_WRONLY`/`O_RDWR` does under FUSE. The Windows cache manager is off:
+    the FSD enables it only when `FileInfoTimeout` is `INFINITE` and the open's
+    `Rsp.Create.Opened.DisableCache` is clear (`inc/winfsp/fsctl.h`; `src/sys/create.c`,
+    `FspFsvolCreateComplete`), and the timeout is 1 s and every open sets `DisableCache`. So
+    every read and write reaches the Filesystem and nothing is written back after Cleanup.
+    Attributes and listings may be cached for 1 s. Write-handle reads have the same request
+    deadline as other reads.
   - *Delete and rename.* `CanDelete` refuses non-empty directories; the delete happens in
     `Cleanup` with `FspCleanupDelete`, which also covers `FILE_FLAG_DELETE_ON_CLOSE`.
     Unlinking orphans open writers, as on POSIX. `Rename` maps to Filesystem `rename` with
     `no_replace` unless `ReplaceIfExists`; a target differing only in case is the same name, so
     a case-only rename works and a different file at such a name counts as existing. Replacing a
     directory is refused, as NTFS does.
-  - *Names.* The volume is case-insensitive and case-preserving. Lookups take an exact match
-    first, then the first entry equal under `CompareStringOrdinal(..., TRUE)`. New names with
+  - *Names.* The volume is case-insensitive and case-preserving, and WinFsp keeps one kernel
+    file node per name compared without case. So of a directory's entries whose names differ
+    only in case (possible from POSIX devices), only the first in the Tree's order (UTF-8 byte
+    order, `Report.txt` before `report.txt`) is listed, and every spelling, including the exact
+    name of a hidden one, resolves to it; the others stay on the drive but are unreachable from
+    Windows. Names are compared by their file-system uppercase (`LCMapStringEx` with
+    `LCMAP_UPPERCASE` and no linguistic casing). New names with
     control characters, `<>:"/\|?*`, a trailing dot or space, or a device name (`CON`, `NUL`,
     `COM1`, ...) are refused with `STATUS_OBJECT_NAME_INVALID`; existing names like that, from
     other platforms, are left out of listings. Names are converted strictly between UTF-16 and
@@ -655,12 +676,15 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   - *Security.* One self-relative descriptor, `O:<user>G:<user>D:P(A;;FA;;;<user>)` for the
     user running the daemon, is returned for every file and directory and set on the
     mountpoint; WinFsp checks access against it, so other users (and services) cannot open
-    anything. `SetSecurity` is not implemented. A directory mountpoint must not exist (an empty
-    one is removed first); WinFsp creates it and removes it on unmount.
-  - *Not handled.* Two names that differ only in case (possible from POSIX devices) both show,
-    and lookups reach the exact or first one. Named streams, extended attributes, reparse
-    points and hard links are not supported; file attributes other than read-only are not
-    stored.
+    anything. `SetSecurity` is not implemented.
+  - *Mountpoint.* A drive letter, or a directory that does not exist: anything already at the
+    path (a directory, even an empty one, a junction, a file) is the user's and mounting
+    refuses it. WinFsp creates the directory and removes it on unmount; missing parents are
+    created owner-only (`core::make_private_dir`), existing ones are not checked. A mount that
+    would contain the data directory is refused.
+  - *Not handled.* Named streams, extended attributes, reparse points and hard links are not
+    supported; file attributes other than read-only are not stored. Case-insensitive lookups
+    scan the directory.
 - **Not on Windows yet.** No LAN discovery: the `lan_discovery_none` backend is built, and
   devices are reached by stored addresses and the rendezvous server. No `ghostdrive autostart`,
   which says so. LAN discovery (DNS-SD through `windns.h` `DnsServiceBrowse`/`DnsServiceRegister`,

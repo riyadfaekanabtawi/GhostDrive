@@ -152,8 +152,9 @@ is also usable from scripts.
   or `--mount X:` for a drive letter), but there is no LAN discovery yet (devices are reached by
   stored addresses and the rendezvous server) and no `ghostdrive autostart`. The Windows volume
   is case-insensitive: files from other devices whose names Windows cannot use (such as `a:b`
-  or `CON`) are not shown there, and two names that differ only in case both show but open the
-  same one.
+  or `CON`) are not shown there, and of names that differ only in case only one is shown (the
+  one whose name sorts first, so `Report.txt` before `report.txt`); the others stay on the
+  drive but cannot be reached from Windows.
 - A device that stays offline while more than three devices are removed may not find the
   others through the rendezvous server when it comes back; it reconnects once it sees one of
   them on the local network or reaches an address it has stored.

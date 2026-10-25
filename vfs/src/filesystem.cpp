@@ -350,13 +350,6 @@ void Filesystem::read(std::uint64_t handle, std::uint64_t offset, std::size_t si
         });
         return;
     }
-    if (h->writer) {
-        enqueue(h, [h, offset, size, done = std::move(done)]() -> asio::awaitable<void> {
-            done(co_await h->writer->read(offset, size));
-        });
-        return;
-    }
-
     // Whichever finishes first, the read or the deadline, answers; the other is ignored.
     struct State {
         ReadCallback done;
@@ -370,6 +363,20 @@ void Filesystem::read(std::uint64_t handle, std::uint64_t offset, std::size_t si
         state->answered = true;
         state->done(Error{Errc::timeout, "read timed out"});
     });
+
+    if (h->writer) {
+        // The read stays in the handle's queue until it finishes, keeping later operations in
+        // order, but the caller is answered by the deadline (a block copied in from a peer can
+        // take as long as any remote read).
+        enqueue(h, [h, offset, size, state]() -> asio::awaitable<void> {
+            auto result = co_await h->writer->read(offset, size);
+            if (state->answered) co_return;
+            state->answered = true;
+            state->deadline.cancel();
+            state->done(std::move(result));
+        });
+        return;
+    }
 
     // The view lives in the coroutine frame, so a release() during the read is safe.
     asio::co_spawn(

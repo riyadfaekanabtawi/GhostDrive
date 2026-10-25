@@ -20,6 +20,8 @@ typedef NTSTATUS* PNTSTATUS;
 
 #include "ghostdrive/vfs/winfsp_mount.hpp"
 
+#include "ghostdrive/core/file.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -31,9 +33,11 @@ typedef NTSTATUS* PNTSTATUS;
 #include <future>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -83,6 +87,22 @@ std::optional<std::wstring> to_wide(std::string_view utf8) {
 bool equal_ignoring_case(std::wstring_view a, std::wstring_view b) {
     return ::CompareStringOrdinal(a.data(), static_cast<int>(a.size()), b.data(),
                                   static_cast<int>(b.size()), TRUE) == CSTR_EQUAL;
+}
+
+// The key two names share when Windows treats them as the same name: uppercase by file system
+// rules (LCMapStringEx without LCMAP_LINGUISTIC_CASING, documented as the file system casing).
+std::wstring fold(std::wstring_view name) {
+    if (name.empty()) return {};
+    const int in = static_cast<int>(name.size());
+    const int n = ::LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, name.data(), in, nullptr,
+                                  0, nullptr, nullptr, 0);
+    if (n <= 0) return std::wstring(name);
+    std::wstring out(static_cast<std::size_t>(n), L'\0');
+    if (::LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, name.data(), in, out.data(), n,
+                        nullptr, nullptr, 0) != n) {
+        return std::wstring(name);
+    }
+    return out;
 }
 
 // A name Windows can create and open: no control or reserved characters, no trailing dot or
@@ -197,6 +217,22 @@ struct WinFspMount::Impl {
         std::lock_guard lock(pending_mutex);
         if (--pending == 0) pending_done.notify_all();
     }
+
+    // A pending request's buffer is mapped into this process until the request is answered or
+    // the volume's I/O queue is stopped with its requests cancelled (FSP_FSCTL_STOP, sent by
+    // FspFileSystemStopDispatcher), whichever comes first. A reader's cancel or exit and the IRP
+    // timeout do not end it: the driver is built with FSP_IOQ_PROCESS_NO_CANCEL, so a request
+    // the file system has received has no cancel routine (WinFsp 2.1 src/sys/ioq.c,
+    // FspIoqStartProcessingIrp; the unmapping is FspFsvolReadNonCachedRequestFini in read.c).
+    // A late reply touches the buffer only while holding `replies` shared and seeing
+    // `replies_open`; unmount clears it under `replies` exclusively before stopping the
+    // dispatcher.
+    std::shared_mutex replies;
+    bool replies_open = true;
+
+    // Opens WinFsp has not closed yet; unmount commits and releases what remains.
+    std::mutex nodes_mutex;
+    std::unordered_set<void*> nodes;
 };
 
 namespace {
@@ -252,17 +288,18 @@ struct Child {
     std::string name;  // as stored, which may differ in case from the name asked for
 };
 
-// Windows looks names up without regard to case: an exact match first, then the first entry
-// that is equal ignoring case.
+// Windows looks names up without regard to case, and WinFsp keeps one kernel file node per name
+// compared that way. So of the entries in a directory whose names differ only in case (possible
+// from POSIX devices), exactly one is visible: the first in the Tree's order, which sorts names
+// by their UTF-8 bytes ("Report.txt" before "report.txt"). Every spelling resolves to it, even
+// the exact name of a hidden one, and listings show only it.
 std::optional<Child> find_child(const Filesystem& fs, Ino parent, std::wstring_view name) {
-    auto utf8 = to_utf8(name);
-    if (!utf8) return std::nullopt;
-    if (auto ino = fs.lookup(parent, *utf8)) return Child{*ino, std::move(*utf8)};
     auto entries = fs.readdir(parent);
     if (!entries) return std::nullopt;
+    const std::wstring key = fold(name);
     for (auto& e : *entries) {
         auto wide = to_wide(e.name);
-        if (wide && equal_ignoring_case(*wide, name)) return Child{e.ino, std::move(e.name)};
+        if (wide && fold(*wide) == key) return Child{e.ino, std::move(e.name)};
     }
     return std::nullopt;
 }
@@ -327,8 +364,8 @@ NTSTATUS op_get_volume_info(FSP_FILE_SYSTEM* fsp, FSP_FSCTL_VOLUME_INFO* info) {
         std::memset(info, 0, sizeof(*info));
         ULARGE_INTEGER free_to_caller{};
         ULARGE_INTEGER total{};
-        if (!self.options.capacity_from.empty() &&
-            ::GetDiskFreeSpaceExW(self.options.capacity_from.c_str(), &free_to_caller, &total,
+        if (!self.options.data_dir.empty() &&
+            ::GetDiskFreeSpaceExW(self.options.data_dir.c_str(), &free_to_caller, &total,
                                   nullptr)) {
             info->TotalSize = total.QuadPart;
             info->FreeSize = free_to_caller.QuadPart;
@@ -354,6 +391,22 @@ NTSTATUS op_get_security_by_name(FSP_FILE_SYSTEM* fsp, PWSTR name, PUINT32 attri
         }
         return copy_security(self, security, security_size);
     });
+}
+
+// Hands a new open to WinFsp with the system cache off for it. The FSD enables the cache only
+// when FileInfoTimeout is INFINITE and Rsp.Create.Opened.DisableCache is clear (fsctl.h,
+// FSP_FSCTL_TRANSACT_RSP; src/sys/create.c, FspFsvolCreateComplete); the volume's timeout is
+// finite and this sets the flag as well, so every read and write reaches the Filesystem and
+// nothing is written back after Cleanup.
+NTSTATUS opened(Impl& self, std::unique_ptr<Node> node, PVOID* context, FSP_FSCTL_FILE_INFO* info) {
+    fill(self, node->last, info);
+    FspFileSystemGetOperationContext()->Response->Rsp.Create.Opened.DisableCache = 1;
+    {
+        std::lock_guard lock(self.nodes_mutex);
+        self.nodes.insert(node.get());
+    }
+    *context = node.release();
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS op_create(FSP_FILE_SYSTEM* fsp, PWSTR name, UINT32 create_options, UINT32, UINT32,
@@ -386,9 +439,7 @@ NTSTATUS op_create(FSP_FILE_SYSTEM* fsp, PWSTR name, UINT32 create_options, UINT
             node->handle = created.value().second;
             node->last = created.value().first;
         }
-        fill(self, node->last, info);
-        *context = node.release();
-        return STATUS_SUCCESS;
+        return opened(self, std::move(node), context, info);
     });
 }
 
@@ -413,9 +464,7 @@ NTSTATUS op_open(FSP_FILE_SYSTEM* fsp, PWSTR name, UINT32, UINT32 granted, PVOID
             if (!handle) return to_ntstatus(handle.error());
             node->handle = handle.value();
         }
-        fill(self, node->last, info);
-        *context = node.release();
-        return STATUS_SUCCESS;
+        return opened(self, std::move(node), context, info);
     });
 }
 
@@ -477,9 +526,38 @@ void op_cleanup(FSP_FILE_SYSTEM* fsp, PVOID context, PWSTR name, ULONG flags) {
 void op_close(FSP_FILE_SYSTEM* fsp, PVOID context) {
     std::unique_ptr<Node> node(static_cast<Node*>(context));
     (void)guarded([&] {
-        if (node->handle) impl_of(fsp).fs.release(*node->handle);
+        auto& self = impl_of(fsp);
+        {
+            std::lock_guard lock(self.nodes_mutex);
+            self.nodes.erase(context);
+        }
+        if (node->handle) self.fs.release(*node->handle);
         return STATUS_SUCCESS;
     });
+}
+
+// Sends a late reply. `touch_buffer` runs first, both only while the request's buffer is still
+// mapped (see Impl::replies); after unmount has begun, neither runs.
+template <typename F>
+void reply_later(Impl& self, FSP_FSCTL_TRANSACT_RSP& response, F&& touch_buffer) {
+    std::shared_lock gate(self.replies);
+    if (!self.replies_open) return;
+    touch_buffer();
+    FspFileSystemSendResponse(self.fsp, &response);
+}
+
+// Starts an operation that answers later. It counts as pending from before it is handed to the
+// Filesystem, whose callback ends it, and stops counting if handing it over throws.
+template <typename Start>
+NTSTATUS start_pending(Impl& self, Start start) {
+    self.begin_pending();
+    try {
+        start();
+    } catch (...) {
+        self.end_pending();
+        throw;
+    }
+    return STATUS_PENDING;
 }
 
 NTSTATUS op_read(FSP_FILE_SYSTEM* fsp, PVOID context, PVOID buffer, UINT64 offset, ULONG length,
@@ -493,38 +571,106 @@ NTSTATUS op_read(FSP_FILE_SYSTEM* fsp, PVOID context, PVOID buffer, UINT64 offse
             return STATUS_SUCCESS;
         }
         const UINT64 hint = FspFileSystemGetOperationContext()->Request->Hint;
-        self.begin_pending();
         // Returns without answering; the callback answers from the Filesystem's executor, so
         // this dispatcher thread is free while the chunk is fetched and verified.
-        self.fs.read(
-            *node.handle, offset, length,
-            [&self, buffer, length, hint](core::Result<ReadReply> result) {
-                FSP_FSCTL_TRANSACT_RSP response{};
-                response.Size = sizeof(response);
-                response.Kind = FspFsctlTransactReadKind;
-                response.Hint = hint;
-                if (!result) {
-                    response.IoStatus.Status = static_cast<UINT32>(
-                        result.error().code == Errc::invalid_argument ? STATUS_INVALID_HANDLE
-                                                                      : STATUS_UNEXPECTED_IO_ERROR);
-                } else {
-                    auto* out = static_cast<std::byte*>(buffer);
-                    std::size_t used = 0;
-                    for (auto slice : result.value().slices) {
-                        const std::size_t n = std::min<std::size_t>(slice.size(), length - used);
-                        // COPY: into the request's read buffer, which WinFsp maps
-                        // from the reader (C8).
-                        std::memcpy(out + used, slice.data(), n);
-                        used += n;
-                    }
-                    response.IoStatus.Status =
-                        static_cast<UINT32>(used == 0 ? STATUS_END_OF_FILE : STATUS_SUCCESS);
-                    response.IoStatus.Information = static_cast<UINT32>(used);
-                }
-                FspFileSystemSendResponse(self.fsp, &response);
-                self.end_pending();
-            });
-        return STATUS_PENDING;
+        return start_pending(self, [&] {
+            self.fs.read(
+                *node.handle, offset, length,
+                [&self, buffer, length, hint](core::Result<ReadReply> result) {
+                    FSP_FSCTL_TRANSACT_RSP response{};
+                    response.Size = sizeof(response);
+                    response.Kind = FspFsctlTransactReadKind;
+                    response.Hint = hint;
+                    reply_later(self, response, [&] {
+                        if (!result) {
+                            response.IoStatus.Status =
+                                static_cast<UINT32>(result.error().code == Errc::invalid_argument
+                                                        ? STATUS_INVALID_HANDLE
+                                                        : STATUS_UNEXPECTED_IO_ERROR);
+                            return;
+                        }
+                        auto* out = static_cast<std::byte*>(buffer);
+                        std::size_t used = 0;
+                        for (auto slice : result.value().slices) {
+                            const std::size_t n =
+                                std::min<std::size_t>(slice.size(), length - used);
+                            // COPY: into the request's read buffer, which WinFsp maps from the
+                            // reader (C8).
+                            std::memcpy(out + used, slice.data(), n);
+                            used += n;
+                        }
+                        response.IoStatus.Status =
+                            static_cast<UINT32>(used == 0 ? STATUS_END_OF_FILE : STATUS_SUCCESS);
+                        response.IoStatus.Information = static_cast<UINT32>(used);
+                    });
+                    self.end_pending();
+                });
+        });
+    });
+}
+
+// Copies at most this much of a write request at a time, so a huge non-cached write does not
+// need a buffer of its size; the pieces go to the Filesystem in order.
+constexpr ULONG kMaxWritePiece = 4u << 20;
+
+struct PendingWrite {
+    std::uint64_t handle = 0;
+    Ino ino = 0;
+    Attr before;
+    const std::byte* source = nullptr;  // the request's buffer, mapped until it is answered
+    UINT64 offset = 0;
+    ULONG length = 0;
+    ULONG done = 0;
+    UINT64 hint = 0;
+};
+
+void write_next(Impl& self, std::shared_ptr<PendingWrite> job);
+
+void finish_write(Impl& self, const PendingWrite& job, const core::Status& st) {
+    FSP_FSCTL_TRANSACT_RSP response{};
+    response.Size = sizeof(response);
+    response.Kind = FspFsctlTransactWriteKind;
+    response.Hint = job.hint;
+    response.IoStatus.Status = static_cast<UINT32>(to_ntstatus(st));
+    if (st) {
+        response.IoStatus.Information = job.length;
+        auto attr = self.fs.getattr(job.ino);
+        if (!attr) {
+            attr = job.before;
+            attr->size = std::max<std::uint64_t>(attr->size, job.offset + job.length);
+        }
+        fill(self, *attr, &response.Rsp.Write.FileInfo);
+    }
+    reply_later(self, response, [] {});
+    self.end_pending();
+}
+
+void write_next(Impl& self, std::shared_ptr<PendingWrite> job) {
+    core::Bytes data;
+    {
+        std::shared_lock gate(self.replies);
+        if (!self.replies_open) {  // unmounting: the buffer may be gone, and no reply is wanted
+            self.end_pending();
+            return;
+        }
+        const ULONG n = std::min(job->length - job->done, kMaxWritePiece);
+        // COPY: the request buffer is only valid until the response, and the Filesystem takes
+        // the bytes by value to write them later on its executor.
+        data.assign(job->source + job->done, job->source + job->done + n);
+    }
+    const auto n = static_cast<ULONG>(data.size());
+    const UINT64 at = job->offset + job->done;
+    self.fs.write(job->handle, at, std::move(data), [&self, job, n](core::Status st) {
+        if (st) job->done += n;
+        if (!st || job->done == job->length) {
+            finish_write(self, *job, st);
+            return;
+        }
+        try {
+            write_next(self, job);
+        } catch (...) {
+            finish_write(self, *job, Error{Errc::io, "out of memory"});
+        }
     });
 }
 
@@ -548,33 +694,22 @@ NTSTATUS op_write(FSP_FILE_SYSTEM* fsp, PVOID context, PVOID buffer, UINT64 offs
         } else if (to_end) {
             offset = size;
         }
-        // COPY: the request buffer is only valid until the response, and the Filesystem takes
-        // the bytes by value to write them later on its executor.
-        auto bytes = std::as_bytes(std::span(static_cast<const char*>(buffer), length));
-        core::Bytes data(bytes.begin(), bytes.end());
-        const UINT64 hint = FspFileSystemGetOperationContext()->Request->Hint;
-        self.begin_pending();
-        self.fs.write(
-            *node.handle, offset, std::move(data),
-            [&self, ino = node.ino, before, end = offset + length, length, hint](core::Status st) {
-                FSP_FSCTL_TRANSACT_RSP response{};
-                response.Size = sizeof(response);
-                response.Kind = FspFsctlTransactWriteKind;
-                response.Hint = hint;
-                response.IoStatus.Status = static_cast<UINT32>(to_ntstatus(st));
-                if (st) {
-                    response.IoStatus.Information = length;
-                    auto attr = self.fs.getattr(ino);
-                    if (!attr) {
-                        attr = before;
-                        attr->size = std::max<std::uint64_t>(attr->size, end);
-                    }
-                    fill(self, *attr, &response.Rsp.Write.FileInfo);
-                }
-                FspFileSystemSendResponse(self.fsp, &response);
-                self.end_pending();
-            });
-        return STATUS_PENDING;
+        if (length == 0) {
+            *transferred = 0;
+            fill(self, before, info);
+            return STATUS_SUCCESS;
+        }
+        // Append-to-end takes the size seen here, so two handles appending at once are not
+        // atomic with respect to each other.
+        auto job = std::make_shared<PendingWrite>();
+        job->handle = *node.handle;
+        job->ino = node.ino;
+        job->before = before;
+        job->source = static_cast<const std::byte*>(buffer);
+        job->offset = offset;
+        job->length = length;
+        job->hint = FspFileSystemGetOperationContext()->Request->Hint;
+        return start_pending(self, [&] { write_next(self, std::move(job)); });
     });
 }
 
@@ -607,7 +742,10 @@ NTSTATUS op_set_basic_info(FSP_FILE_SYSTEM* fsp, PVOID context, UINT32, UINT64, 
         // Only the modification time is stored; attributes and the other times are not.
         SetAttr changes;
         if (last_write != 0 && last_write >= kUnixEpochAsFileTime) {
-            changes.mtime_ns = static_cast<std::int64_t>(last_write - kUnixEpochAsFileTime) * 100;
+            // Clamped: nanoseconds since 1970 in an int64 end in the year 2262.
+            constexpr UINT64 kMaxTicks = static_cast<UINT64>(INT64_MAX / 100);
+            const UINT64 ticks = std::min(last_write - kUnixEpochAsFileTime, kMaxTicks);
+            changes.mtime_ns = static_cast<std::int64_t>(ticks) * 100;
         }
         return set_attr(impl_of(fsp), node_of(context), changes, info);
     });
@@ -701,9 +839,12 @@ NTSTATUS op_read_directory(FSP_FILE_SYSTEM* fsp, PVOID context, PWSTR, PWSTR mar
             auto entries = self.fs.readdir(node.ino);
             if (!entries) return STATUS_OBJECT_NAME_NOT_FOUND;
             std::vector<std::pair<std::wstring, Ino>> listing;
+            // Only the first of names that differ only in case, as find_child resolves them.
+            std::unordered_set<std::wstring> seen;
             for (const auto& e : *entries) {
                 auto wide = to_wide(e.name);
-                if (wide && windows_name_ok(*wide)) listing.emplace_back(std::move(*wide), e.ino);
+                if (!wide || !seen.insert(fold(*wide)).second) continue;
+                if (windows_name_ok(*wide)) listing.emplace_back(std::move(*wide), e.ino);
             }
             std::sort(listing.begin(), listing.end());
             if (node.ino != kRootIno) {
@@ -800,6 +941,36 @@ bool is_drive_letter(const std::wstring& point) {
     return point.size() == 2 && std::iswalpha(point[0]) && point[1] == L':';
 }
 
+// Creates the missing directories of `dir` owner-only, from the top down, so no one else can
+// replace one of them (with a junction to elsewhere, say) before the mount exists. Existing
+// ones are left as they are.
+core::Status make_parents_private(const std::filesystem::path& dir) {
+    std::vector<std::filesystem::path> missing;
+    std::error_code ec;
+    for (auto p = dir;
+         !p.empty() && !std::filesystem::exists(std::filesystem::symlink_status(p, ec));
+         p = p.parent_path()) {
+        missing.push_back(p);
+        if (p == p.parent_path()) break;
+    }
+    for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+        if (auto st = core::make_private_dir(*it); !st) return st;
+    }
+    return {};
+}
+
+// True if `path` is `root` (which ends in a separator) or lies below it, ignoring case.
+bool lies_inside(const std::filesystem::path& path, const std::wstring& root) {
+    std::error_code ec;
+    auto full = std::filesystem::absolute(path, ec);
+    if (ec) return false;
+    full = full.lexically_normal();
+    full.make_preferred();
+    const std::wstring candidate = fold(full.native() + L"\\");
+    const std::wstring prefix = fold(root);
+    return candidate.compare(0, prefix.size(), prefix) == 0;
+}
+
 }  // namespace
 
 WinFspMount::WinFspMount(Private, std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -828,18 +999,29 @@ core::Result<std::unique_ptr<WinFspMount>> WinFspMount::mount(
     }
 
     std::wstring point = mountpoint.native();
+    std::wstring root = point + L"\\";
     if (!is_drive_letter(point)) {
-        // WinFsp creates the directory itself and removes it on unmount; one left empty by an
-        // earlier run is in the way.
         std::error_code ec;
         auto dir = std::filesystem::absolute(mountpoint, ec);
-        if (ec) dir = mountpoint;
+        if (ec) return Error{Errc::invalid_argument, "invalid mountpoint " + describe(mountpoint)};
+        dir = dir.lexically_normal();
         dir.make_preferred();
-        if (std::filesystem::is_directory(dir, ec) && std::filesystem::is_empty(dir, ec)) {
-            std::filesystem::remove(dir, ec);
+        if (!dir.has_filename()) dir = dir.parent_path();
+        // WinFsp creates the directory itself and removes it on unmount. Whatever is already
+        // there (a directory, a junction, a file) belongs to the user and is left alone.
+        if (std::filesystem::exists(std::filesystem::symlink_status(dir, ec))) {
+            return Error{Errc::already_exists,
+                         "cannot mount at " + describe(dir) +
+                             ": it exists; the mountpoint must be a free drive letter or a path "
+                             "that does not exist yet"};
         }
-        if (dir.has_parent_path()) std::filesystem::create_directories(dir.parent_path(), ec);
+        if (auto st = make_parents_private(dir.parent_path()); !st) return st.error();
         point = dir.native();
+        root = point + L"\\";
+    }
+    if (!options.data_dir.empty() && lies_inside(options.data_dir, root)) {
+        return Error{Errc::invalid_argument, "the data directory " + describe(options.data_dir) +
+                                                 " must not be inside the mount"};
     }
 
     FSP_FSCTL_VOLUME_PARAMS params{};
@@ -849,8 +1031,7 @@ core::Result<std::unique_ptr<WinFspMount>> WinFspMount::mount(
     params.MaxComponentLength = kMaxNameChars;
     params.VolumeCreationTime = impl->mounted_at;
     params.VolumeSerialNumber = static_cast<UINT32>(impl->mounted_at / (10000 * 1000));
-    // Not INFINITE, so WinFsp leaves the system cache off: every read and write reaches the
-    // Filesystem, and nothing is written back after Cleanup.
+    // Not INFINITE: with DisableCache on every open (see opened()), the system cache stays off.
     params.FileInfoTimeout = static_cast<UINT32>(options.info_timeout.count());
     params.CaseSensitiveSearch = 0;
     params.CasePreservedNames = 1;
@@ -885,11 +1066,32 @@ core::Result<std::unique_ptr<WinFspMount>> WinFspMount::mount(
 void WinFspMount::unmount() {
     if (!impl_ || !impl_->mounted) return;
     impl_->mounted = false;
+    // Stopping the dispatcher cancels the requests still pending (FSP_FSCTL_STOP) and unmaps
+    // their buffers, so late replies must stop touching them first.
+    {
+        std::unique_lock gate(impl_->replies);
+        impl_->replies_open = false;
+    }
     FspFileSystemStopDispatcher(impl_->fsp);
-    // Reads and writes still completing answer through the volume; it must outlive them.
     {
         std::unique_lock lock(impl_->pending_mutex);
         impl_->pending_done.wait(lock, [&] { return impl_->pending == 0; });
+    }
+    // WinFsp sends no Close for files still open now. Their writes are committed here rather
+    // than lost, and their handles released.
+    std::vector<std::unique_ptr<Node>> left;
+    {
+        std::lock_guard lock(impl_->nodes_mutex);
+        for (void* p : impl_->nodes) left.emplace_back(static_cast<Node*>(p));
+        impl_->nodes.clear();
+    }
+    for (auto& node : left) {
+        if (!node->handle) continue;
+        if (node->write) {
+            (void)wait_for<core::Status>(
+                [&](auto done) { impl_->fs.flush(*node->handle, std::move(done)); });
+        }
+        impl_->fs.release(*node->handle);
     }
     FspFileSystemDelete(impl_->fsp);  // also removes the mountpoint
     impl_->fsp = nullptr;
