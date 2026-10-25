@@ -59,10 +59,6 @@ GtkWidget* action_row(const char* title, const std::string& subtitle = "") {
     return row;
 }
 
-void set_title(GtkWidget* row, const std::string& title) {
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), title.c_str());
-}
-
 void set_subtitle(GtkWidget* row, const std::string& subtitle) {
     adw_action_row_set_subtitle(ADW_ACTION_ROW(row), subtitle.c_str());
 }
@@ -202,7 +198,7 @@ AppWindow::AppWindow(AdwApplication* app, Options options) : options_(std::move(
     refresh_settings();
     poll_timer_ = g_timeout_add_seconds(
         kPollSeconds,
-        [](gpointer self) {
+        [](gpointer self) -> gboolean {
             static_cast<AppWindow*>(self)->poll();
             return G_SOURCE_CONTINUE;
         },
@@ -745,7 +741,8 @@ void AppWindow::update_run_controls() {
     const bool hint = !running_ && invite_code_.empty();
     if (hint) {
         gtk_widget_remove_css_class(invite_message_, "error");
-        gtk_label_set_text(GTK_LABEL(invite_message_), "Start GhostDrive to create an invite code.");
+        gtk_label_set_text(GTK_LABEL(invite_message_),
+                           "Start GhostDrive to create an invite code.");
         gtk_widget_set_visible(invite_message_, TRUE);
     } else if (invite_hint_) {
         gtk_widget_set_visible(invite_message_, FALSE);
@@ -870,7 +867,7 @@ void AppWindow::start_ghostdrive() {
     // Poll soon instead of waiting for the next tick; ghostdrived answers within a second.
     g_timeout_add(
         800,
-        [](gpointer self) {
+        [](gpointer self) -> gboolean {
             static_cast<AppWindow*>(self)->poll();
             return G_SOURCE_REMOVE;
         },
@@ -954,7 +951,7 @@ void AppWindow::create_invite() {
         if (!invite_timer_) {
             invite_timer_ = g_timeout_add_seconds(
                 1,
-                [](gpointer self) {
+                [](gpointer self) -> gboolean {
                     auto* w = static_cast<AppWindow*>(self);
                     w->tick_invite();
                     if (!w->invite_code_.empty()) return G_SOURCE_CONTINUE;
