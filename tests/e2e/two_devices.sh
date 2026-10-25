@@ -31,13 +31,45 @@ wait_for() {
 
 rm -rf "$WORK" && mkdir -p "$WORK"
 "$GD" init --data "$A" --name desk >/dev/null || fail "init"
-"$GDD" --data "$A" --mount "$MA" --port 47301 >"$WORK/a.log" 2>&1 &
-PIDS+=($!)
-wait_for 10 "$GD" status --data "$A" || fail "daemon A did not start"
+# Ports are picked at runtime: other checkouts may run this test at the same time. The range is
+# below the macOS and Linux ephemeral ranges.
+free_port() {
+    local p
+    for _ in $(seq 50); do
+        p=$((20000 + RANDOM % 12000))
+        command -v lsof >/dev/null || { echo "$p"; return; }
+        lsof -nP -iUDP:"$p" >/dev/null 2>&1 || { echo "$p"; return; }
+    done
+    return 1
+}
+
+# Starts a daemon and waits until it answers. Returns 2 if its port was taken in the meantime.
+start_daemon() {
+    local data=$1 mount=$2 port=$3 log=$4
+    "$GDD" --data "$data" --mount "$mount" --port "$port" >"$log" 2>&1 &
+    local pid=$!
+    PIDS+=($pid)
+    for _ in $(seq 100); do
+        "$GD" status --data "$data" >/dev/null 2>&1 && return 0
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    grep -q "Address already in use" "$log" && return 2
+    return 1
+}
+
+for _ in $(seq 5); do
+    PORT_A=$(free_port) || fail "no free UDP port"
+    start_daemon "$A" "$MA" "$PORT_A" "$WORK/a.log"
+    started=$?
+    [ $started -ne 2 ] && break
+done
+[ $started -eq 0 ] || fail "daemon A did not start"
 
 CODE=$("$GD" invite --data "$A" | grep -o 'gd1-[A-Z0-9-]*') || fail "invite"
-"$GD" join "$CODE" --data "$B" --name laptop --port 47302 || fail "join"
-"$GDD" --data "$B" --mount "$MB" --port 47302 >"$WORK/b.log" 2>&1 &
+PORT_B=$(free_port) || fail "no free UDP port"
+"$GD" join "$CODE" --data "$B" --name laptop --port "$PORT_B" || fail "join"
+"$GDD" --data "$B" --mount "$MB" --port "$PORT_B" >"$WORK/b.log" 2>&1 &
 PIDS+=($!)
 wait_for 15 sh -c "'$GD' status --data '$B' | grep -q 'online   desk'" || fail "B never connected to A"
 
