@@ -191,5 +191,6 @@ int main(int argc, char** argv) {
     io.stop();
     io_thread.join();
     disk.join();
+    std::cout << "Stopped.\n" << std::flush;
     return 0;
 }

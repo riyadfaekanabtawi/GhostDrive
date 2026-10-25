@@ -13,11 +13,13 @@
 #include <asio/io_context.hpp>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "autostart.hpp"
@@ -334,6 +336,15 @@ int cmd_autostart(const Args& args) {
             if (run(disable, false) != 0) return fail("`" + join_command(disable) + "` failed");
         }
 #endif
+        // Stopping returns at once, but the daemon still has to unmount; wait so the mount is
+        // gone when this returns.
+        bool stopped = true;
+        for (int i = 0; i < 300; ++i) {
+            stopped = !daemon::control_request(daemon::DrivePaths(data).control, "ping");
+            if (stopped) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!stopped) std::cerr << "ghostdrive: the daemon is still shutting down\n";
         bool removed = std::filesystem::remove(file, ec);
         if (ec) return fail("remove " + file.string() + ": " + ec.message());
 #ifndef __APPLE__

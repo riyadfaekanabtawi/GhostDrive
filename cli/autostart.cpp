@@ -158,6 +158,9 @@ core::Result<std::string> launch_agent_plist(const std::string& label, const Spe
            "\t\t<key>SuccessfulExit</key>\n"
            "\t\t<false/>\n"
            "\t</dict>\n"
+           // Time to unmount after SIGTERM before launchd sends SIGKILL (the default is 20 s).
+           "\t<key>ExitTimeOut</key>\n"
+           "\t<integer>30</integer>\n"
            "\t<key>ProcessType</key>\n"
            "\t<string>Standard</string>\n"
            "\t<key>StandardOutPath</key>\n"
@@ -188,6 +191,7 @@ core::Result<std::string> systemd_unit(const Spec& spec) {
            "\n"
            "Restart=on-failure\n"
            "RestartSec=10\n"
+           "TimeoutStopSec=30\n"
            "\n"
            "[Install]\n"
            "WantedBy=default.target\n";

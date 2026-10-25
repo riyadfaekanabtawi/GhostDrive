@@ -85,6 +85,8 @@ TEST(Autostart, PlistRunsTheDaemonWithItsPaths) {
         "\t\t<key>SuccessfulExit</key>\n"
         "\t\t<false/>\n"
         "\t</dict>\n"
+        "\t<key>ExitTimeOut</key>\n"
+        "\t<integer>30</integer>\n"
         "\t<key>ProcessType</key>\n"
         "\t<string>Standard</string>\n"
         "\t<key>StandardOutPath</key>\n"
@@ -115,6 +117,7 @@ TEST(Autostart, UnitRunsTheDaemonWithItsPaths) {
         "$$x/data\" --mount \"/Users/me/My Drive %%h $$x/mnt\"\n"
         "Restart=on-failure\n"
         "RestartSec=10\n"
+        "TimeoutStopSec=30\n"
         "\n"
         "[Install]\n"
         "WantedBy=default.target\n";
