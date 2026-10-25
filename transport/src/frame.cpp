@@ -24,7 +24,7 @@ std::uint32_t get_u32(std::span<const std::byte> in) noexcept {
 
 bool known_type(std::uint8_t type) noexcept {
     return type >= static_cast<std::uint8_t>(FrameType::get_chunk) &&
-           type <= static_cast<std::uint8_t>(FrameType::discovery_keys);
+           type <= static_cast<std::uint8_t>(FrameType::index_batch2);
 }
 
 core::Bytes make_frame(FrameType type, std::span<const std::byte> payload) {

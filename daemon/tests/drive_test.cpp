@@ -173,5 +173,39 @@ TEST(Drive, OpenRefusesADataDirectoryOthersCanRead) {
     EXPECT_EQ(opened.error().code, core::Errc::permission);
 }
 
+TEST(Drive, PinningANewSignerRestartsIndexExchangeAndRemovalRetiresIt) {
+    test::TempDir dir;
+    auto created = Drive::create(dir.path() / "a", "desk");
+    ASSERT_TRUE(created);
+    auto& drive = *created.value();
+    auto x = core::DeviceKey::generate().value().public_key();
+    auto y = core::DeviceKey::generate().value().public_key();
+    ASSERT_TRUE(drive.membership().add(drive.key(), x, "x", false));
+    auto first = drive.apply_membership();
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first.value().pinned, std::vector<core::PublicKey>{x});
+    ASSERT_TRUE(drive.index().set_peer_progress(x, 5, 9));
+
+    // Records signed by y may have been skipped while y was unknown here.
+    ASSERT_TRUE(drive.membership().add(drive.key(), y, "y", false));
+    auto second = drive.apply_membership();
+    ASSERT_TRUE(second);
+    EXPECT_EQ(second.value().pinned, std::vector<core::PublicKey>{y});
+    auto devices = drive.index().devices();
+    ASSERT_TRUE(devices);
+    ASSERT_EQ(devices.value().size(), 2u);
+    for (const auto& d : devices.value()) {
+        EXPECT_EQ(d.peer_index_id, 0u);
+        EXPECT_EQ(d.peer_max_sequence, 0u);
+    }
+
+    ASSERT_TRUE(drive.membership().remove(drive.key(), x));
+    auto third = drive.apply_membership();
+    ASSERT_TRUE(third);
+    EXPECT_EQ(third.value().unpinned, std::vector<core::PublicKey>{x});
+    EXPECT_FALSE(drive.index().is_active_signer(core::short_id(x)));
+    EXPECT_TRUE(drive.index().is_active_signer(core::short_id(y)));
+}
+
 }  // namespace
 }  // namespace ghostdrive::daemon

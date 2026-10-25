@@ -51,7 +51,8 @@ protected:
     Mount()
         : secret_(core::generate_drive_secret().value()),
           store_(core::ChunkStore::open(dir_.path() / "store", core::ChunkHasher(secret_)).value()),
-          index_(core::MetadataIndex::open(dir_.path() / "index.db", 0xA1).value()),
+          index_(
+              core::MetadataIndex::open(dir_.path() / "index.db", core::DriveId{}, key_).value()),
           cache_(128 * 1024 * 1024) {
         mountpoint_ = dir_.path() / "mnt";
         std::filesystem::create_directories(mountpoint_);
@@ -130,6 +131,7 @@ protected:
     std::thread io_thread_;
     core::DriveSecret secret_;
     core::ChunkStore store_;
+    core::DeviceKey key_ = core::DeviceKey::generate().value();
     core::MetadataIndex index_;
     core::HybridClock clock_;
     core::ChunkCache cache_;

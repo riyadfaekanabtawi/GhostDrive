@@ -29,7 +29,8 @@ protected:
     WriteTest()
         : secret_(core::generate_drive_secret().value()),
           store_(core::ChunkStore::open(dir_.path() / "store", core::ChunkHasher(secret_)).value()),
-          index_(core::MetadataIndex::open(dir_.path() / "index.db", 0xA1).value()),
+          index_(
+              core::MetadataIndex::open(dir_.path() / "index.db", core::DriveId{}, key_).value()),
           cache_(64 * 1024 * 1024),
           fetcher_(io_.get_executor(), disk_.get_executor(), store_, index_, cache_, nullptr),
           fs_(io_.get_executor(), tree_, fetcher_, {},
@@ -109,6 +110,7 @@ protected:
     asio::thread_pool disk_{2};
     core::DriveSecret secret_;
     core::ChunkStore store_;
+    core::DeviceKey key_ = core::DeviceKey::generate().value();
     core::MetadataIndex index_;
     core::HybridClock clock_;
     core::ChunkCache cache_;
@@ -358,11 +360,15 @@ TEST_F(WriteTest, RemoteEditWhileOpenBecomesAConflictCopy) {
     ASSERT_TRUE(h);
 
     // Another device edits the file while it is open here.
+    auto other = core::DeviceKey::generate().value();
+    const auto other_id = core::short_id(other.public_key());
+    ASSERT_TRUE(index_.add_device(other.public_key(), "other"));
     auto remote = record_of("doc.txt");
-    remote.version.bump(0xB0B);
-    remote.modified_by = 0xB0B;
+    remote.version.bump(other_id);
+    remote.modified_by = other_id;
     remote.hlc = clock_.now() + 1000;
     remote.mtime_ns += 1;
+    remote.signature = other.sign(core::record_signed_bytes(core::DriveId{}, remote)).value();
     ASSERT_TRUE(index_.apply_remote(remote, clock_));
 
     ASSERT_TRUE(write(h.value(), 0, random_bytes(10, 21)));
@@ -370,7 +376,7 @@ TEST_F(WriteTest, RemoteEditWhileOpenBecomesAConflictCopy) {
     fs_.release(h.value());
 
     // The remote version kept the name; the local edit is a conflict copy beside it.
-    EXPECT_EQ(record_of("doc.txt").modified_by, 0xB0Bu);
+    EXPECT_EQ(record_of("doc.txt").modified_by, other_id);
     auto entries = tree_.readdir(kRootIno);
     ASSERT_TRUE(entries);
     std::vector<std::string> conflicts;

@@ -126,6 +126,9 @@ void put_record(Writer& w, const core::FileRecord& r) {
     w.u64(r.sequence);
     w.u32(static_cast<std::uint32_t>(r.chunks.size()));
     for (const auto& id : r.chunks) w.bytes(id.to_bytes());
+    // Only signed records are sent; an unsigned one goes out with zeros and fails to verify.
+    w.bytes(r.signature.value_or(core::Signature{}));
+    w.str16(r.origin_path);
 }
 
 std::optional<core::FileRecord> get_record(Reader& r) {
@@ -173,6 +176,11 @@ std::optional<core::FileRecord> get_record(Reader& r) {
         if (!id) return std::nullopt;
         rec.chunks.push_back(id.value());
     }
+    core::Signature signature{};
+    auto origin = r.fixed(signature) ? r.str16(kMaxPathBytes) : std::nullopt;
+    if (!origin) return std::nullopt;
+    rec.signature = signature;
+    rec.origin_path = std::move(*origin);
     return rec;
 }
 
@@ -333,7 +341,7 @@ core::Bytes encode_index_batch(std::span<const IndexEntry> entries) {
         w.u8(e.sender_holds ? 1 : 0);
         put_record(w, e.record);
     }
-    return w.frame(wire::FrameType::index_batch);
+    return w.frame(wire::FrameType::index_batch2);
 }
 
 core::Result<std::vector<IndexEntry>> decode_index_batch(std::span<const std::byte> payload) {

@@ -588,6 +588,7 @@ asio::awaitable<void> Service::run_member(std::shared_ptr<transport::Connection>
         asio::co_spawn(io_, handle_stream(conn, std::move(stream).value()), asio::detached);
     }
     member_conns_.erase(conn);
+    unknown_signer_conns_.erase(conn);
     if (auto it = live_.find(key); it != live_.end() && it->second == conn) live_.erase(it);
     if (--member_connections_[key] == 0) member_connections_.erase(key);
 }
@@ -645,7 +646,7 @@ asio::awaitable<void> Service::push_index(std::shared_ptr<transport::Connection>
     while (*alive && conn->is_open() && is_member(conn->peer_key())) {
         auto batch = co_await detail::run_on(
             disk_, [drive, after]() -> core::Result<std::vector<IndexEntry>> {
-                auto records = drive->index().records_since(after, kBatchRecords);
+                auto records = drive->index().records_since(after, kBatchRecords, true);
                 if (!records) return records.error();
                 std::vector<IndexEntry> entries;
                 entries.reserve(records.value().size());
@@ -695,7 +696,7 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
     for (;;) {
         auto frame = co_await wire::read_frame(*stream);
         if (!*alive || !frame) co_return;
-        if (frame.value().type != wire::FrameType::index_batch) {
+        if (frame.value().type != wire::FrameType::index_batch2) {
             conn->close();
             co_return;
         }
@@ -705,20 +706,28 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
             co_return;
         }
         if (!is_member(peer)) co_return;
+        bool unknown_signer = false;
         auto applied = co_await detail::run_on(
-            disk_, [drive, fs, peer, hello, entries = std::move(entries).value()]() -> Status {
+            disk_, [drive, fs, peer, hello, &unknown_signer,
+                    entries = std::move(entries).value()]() -> Status {
                 auto& index = drive->index();
                 std::uint64_t last = 0;
                 Status failure;
                 for (const auto& e : entries) {
-                    // apply_remote validates the record (paths, block size, clocks) first.
+                    // apply_remote validates the record (paths, block size, clocks) and its
+                    // signature first.
                     auto outcome = index.apply_remote(e.record, drive->clock());
                     if (!outcome && outcome.error().code != Errc::invalid_argument) {
                         // A database failure: stop here so the next exchange resends this record.
                         failure = outcome.error();
                         break;
                     }
-                    // A rejected record will never become valid; skip past it.
+                    // A rejected record is skipped for good, except one by a device not pinned
+                    // yet: pinning that device resets the progress and closes this connection,
+                    // so the next one sends the record again.
+                    if (!outcome && !index.is_active_signer(e.record.modified_by)) {
+                        unknown_signer = true;
+                    }
                     last = std::max(last, e.record.sequence);
                     if (!outcome || !e.sender_holds || e.record.deleted) continue;
                     // Only believe "I hold these chunks" for the version we now store, so a
@@ -740,6 +749,7 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
                 return {};
             });
         if (!*alive) co_return;
+        if (unknown_signer && conn->is_open()) unknown_signer_conns_.insert(conn);
         if (!applied) {
             conn->close();  // resume from the stored progress on the next connection
             co_return;
@@ -849,9 +859,14 @@ Status Service::refresh_membership(bool changed) {
         });
     if (!changed && (!countersigned || countersigned.value() == 0)) return {};
     if (auto st = drive_.save_membership(); !st) return st;
-    auto unpinned = drive_.apply_membership();
-    if (!unpinned) return unpinned.error();
-    for (const auto& key : unpinned.value()) {
+    auto applied = drive_.apply_membership();
+    if (!applied) return applied.error();
+    if (!applied.value().pinned.empty()) {
+        auto stale = std::move(unknown_signer_conns_);
+        unknown_signer_conns_.clear();
+        for (const auto& conn : stale) conn->close();
+    }
+    for (const auto& key : applied.value().unpinned) {
         live_.erase(key);
         member_since_.erase(key);
         bool told = false;

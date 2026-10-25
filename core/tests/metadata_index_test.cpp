@@ -1,6 +1,7 @@
 #include "ghostdrive/core/metadata_index.hpp"
 
 #include <gtest/gtest.h>
+#include <sqlite3.h>
 
 #include "ghostdrive/core/chunking.hpp"
 #include "temp_dir.hpp"
@@ -10,8 +11,11 @@ namespace {
 
 using Kind = ApplyOutcome::Kind;
 
-constexpr std::uint64_t kDeviceA = 0xAAAA000000000000ull;
-constexpr std::uint64_t kDeviceB = 0xBBBB000000000000ull;
+DeviceKey seeded_key(std::uint8_t fill) {
+    std::array<std::byte, kSeedSize> seed{};
+    seed.fill(std::byte{fill});
+    return DeviceKey::from_seed(seed).value();
+}
 
 PublicKey key_with(std::uint8_t fill) {
     PublicKey key{};
@@ -38,17 +42,33 @@ FileRecord file(std::string path, std::int64_t mtime_s, std::uint8_t chunk_fill)
 
 class MetadataIndexTest : public ::testing::Test {
 protected:
-    MetadataIndex open(std::string_view name, std::uint64_t device) {
-        auto index = MetadataIndex::open(dir_.path() / name, device);
+    MetadataIndex open(std::string_view name, const DeviceKey& key) {
+        auto index = MetadataIndex::open(dir_.path() / name, drive_, key);
         EXPECT_TRUE(index.ok()) << (index.ok() ? "" : index.error().message);
         return std::move(index).value();
+    }
+
+    // An index that has pinned the other test devices, A, B and C.
+    MetadataIndex open_peer(std::string_view name, const DeviceKey& key) {
+        MetadataIndex index = open(name, key);
+        for (const DeviceKey* other : {&key_a_, &key_b_, &key_c_}) {
+            if (other != &key) EXPECT_TRUE(index.add_device(other->public_key(), "peer"));
+        }
+        return index;
+    }
+
+    // A record as `key` would sign it.
+    FileRecord signed_by(const DeviceKey& key, FileRecord record) const {
+        record.modified_by = short_id(key.public_key());
+        record.signature = key.sign(record_signed_bytes(drive_, record)).value();
+        return record;
     }
 
     // Sends every record `to` has not yet seen from `from`, as an index exchange would.
     static std::vector<ApplyOutcome> sync(const MetadataIndex& from, MetadataIndex& to,
                                           std::uint64_t& cursor, HybridClock& clock) {
         std::vector<ApplyOutcome> outcomes;
-        auto records = from.records_since(cursor, 1000);
+        auto records = from.records_since(cursor, 1000, true);
         EXPECT_TRUE(records.ok());
         for (const FileRecord& r : records.value()) {
             auto outcome = to.apply_remote(r, clock);
@@ -73,25 +93,36 @@ protected:
     }
 
     test::TempDir dir_;
+    const DriveId drive_ = [] {
+        DriveId id{};
+        id.fill(std::byte{0x5A});
+        return id;
+    }();
+    const DeviceKey key_a_ = seeded_key(1);
+    const DeviceKey key_b_ = seeded_key(2);
+    const DeviceKey key_c_ = seeded_key(3);
+    const std::uint64_t id_a_ = short_id(key_a_.public_key());
+    const std::uint64_t id_b_ = short_id(key_b_.public_key());
+    const std::uint64_t id_c_ = short_id(key_c_.public_key());
     std::uint64_t pt_ = 1'000'000;
     HybridClock clock_a_{[this] { return pt_; }};
     HybridClock clock_b_{[this] { return pt_; }};
 };
 
 TEST_F(MetadataIndexTest, CommitLocalAssignsVersionAndSequence) {
-    MetadataIndex index = open("a.db", kDeviceA);
+    MetadataIndex index = open("a.db", key_a_);
     EXPECT_EQ(index.max_sequence().value(), 0u);
 
     auto first = index.commit_local(file("docs/a.txt", 10, 1), clock_a_);
     ASSERT_TRUE(first.ok()) << first.error().message;
     EXPECT_EQ(first.value().sequence, 1u);
-    EXPECT_EQ(first.value().version.get(kDeviceA), 1u);
-    EXPECT_EQ(first.value().modified_by, kDeviceA);
+    EXPECT_EQ(first.value().version.get(id_a_), 1u);
+    EXPECT_EQ(first.value().modified_by, id_a_);
 
     auto second = index.commit_local(file("docs/a.txt", 11, 2), clock_a_);
     ASSERT_TRUE(second.ok());
     EXPECT_EQ(second.value().sequence, 2u);
-    EXPECT_EQ(second.value().version.get(kDeviceA), 2u);
+    EXPECT_EQ(second.value().version.get(id_a_), 2u);
     EXPECT_GT(second.value().hlc, first.value().hlc);
 
     auto stored = index.get("docs/a.txt");
@@ -102,7 +133,7 @@ TEST_F(MetadataIndexTest, CommitLocalAssignsVersionAndSequence) {
 }
 
 TEST_F(MetadataIndexTest, RejectsInvalidRecords) {
-    MetadataIndex index = open("a.db", kDeviceA);
+    MetadataIndex index = open("a.db", key_a_);
     EXPECT_EQ(index.commit_local(file("../escape", 1, 1), clock_a_).error().code,
               Errc::invalid_argument);
     FileRecord bad = file("ok", 1, 1);
@@ -111,13 +142,13 @@ TEST_F(MetadataIndexTest, RejectsInvalidRecords) {
 }
 
 TEST_F(MetadataIndexTest, DeleteLeavesTombstone) {
-    MetadataIndex index = open("a.db", kDeviceA);
+    MetadataIndex index = open("a.db", key_a_);
     ASSERT_TRUE(index.commit_local(file("f", 1, 1), clock_a_).ok());
     auto tomb = index.delete_local("f", clock_a_);
     ASSERT_TRUE(tomb.ok());
     EXPECT_TRUE(tomb.value().deleted);
     EXPECT_TRUE(tomb.value().chunks.empty());
-    EXPECT_EQ(tomb.value().version.get(kDeviceA), 2u);
+    EXPECT_EQ(tomb.value().version.get(id_a_), 2u);
     EXPECT_EQ(index.delete_local("f", clock_a_).error().code, Errc::not_found);
 
     auto since = index.records_since(0, 10);
@@ -127,8 +158,8 @@ TEST_F(MetadataIndexTest, DeleteLeavesTombstone) {
 }
 
 TEST_F(MetadataIndexTest, ApplyRemoteNewerAndOlder) {
-    MetadataIndex a = open("a.db", kDeviceA);
-    MetadataIndex b = open("b.db", kDeviceB);
+    MetadataIndex a = open_peer("a.db", key_a_);
+    MetadataIndex b = open_peer("b.db", key_b_);
     std::uint64_t a_to_b = 0;
 
     ASSERT_TRUE(a.commit_local(file("f", 1, 1), clock_a_).ok());
@@ -150,8 +181,8 @@ TEST_F(MetadataIndexTest, ApplyRemoteNewerAndOlder) {
 }
 
 TEST_F(MetadataIndexTest, ConcurrentEditsConvergeWithConflictCopy) {
-    MetadataIndex a = open("a.db", kDeviceA);
-    MetadataIndex b = open("b.db", kDeviceB);
+    MetadataIndex a = open_peer("a.db", key_a_);
+    MetadataIndex b = open_peer("b.db", key_b_);
     std::uint64_t a_to_b = 0;
 
     ASSERT_TRUE(a.commit_local(file("doc.txt", 1, 1), clock_a_).ok());
@@ -190,8 +221,8 @@ TEST_F(MetadataIndexTest, ConcurrentEditsConvergeWithConflictCopy) {
 }
 
 TEST_F(MetadataIndexTest, ConcurrentEditBeatsDelete) {
-    MetadataIndex a = open("a.db", kDeviceA);
-    MetadataIndex b = open("b.db", kDeviceB);
+    MetadataIndex a = open_peer("a.db", key_a_);
+    MetadataIndex b = open_peer("b.db", key_b_);
     std::uint64_t a_to_b = 0;
 
     ASSERT_TRUE(a.commit_local(file("f", 1, 1), clock_a_).ok());
@@ -217,7 +248,7 @@ TEST_F(MetadataIndexTest, ConcurrentEditBeatsDelete) {
 }
 
 TEST_F(MetadataIndexTest, RecordsSinceIsOrderedAndLimited) {
-    MetadataIndex index = open("a.db", kDeviceA);
+    MetadataIndex index = open("a.db", key_a_);
     for (int i = 0; i < 5; ++i) {
         ASSERT_TRUE(index.commit_local(file("f" + std::to_string(i), i, 1), clock_a_).ok());
     }
@@ -232,22 +263,22 @@ TEST_F(MetadataIndexTest, RecordsSinceIsOrderedAndLimited) {
 TEST_F(MetadataIndexTest, ReopenPreservesStateAndChecksDevice) {
     std::uint64_t index_id = 0;
     {
-        MetadataIndex index = open("a.db", kDeviceA);
+        MetadataIndex index = open("a.db", key_a_);
         index_id = index.index_id();
         ASSERT_TRUE(index.commit_local(file("f", 1, 1), clock_a_).ok());
     }
-    MetadataIndex index = open("a.db", kDeviceA);
+    MetadataIndex index = open("a.db", key_a_);
     EXPECT_EQ(index.index_id(), index_id);
     EXPECT_EQ(index.max_sequence().value(), 1u);
     EXPECT_TRUE(index.get("f").value().has_value());
 
-    auto wrong = MetadataIndex::open(dir_.path() / "a.db", kDeviceB);
+    auto wrong = MetadataIndex::open(dir_.path() / "a.db", drive_, key_b_);
     ASSERT_FALSE(wrong.ok());
     EXPECT_EQ(wrong.error().code, Errc::invalid_argument);
 }
 
 TEST_F(MetadataIndexTest, PinnedDevices) {
-    MetadataIndex index = open("a.db", kDeviceA);
+    MetadataIndex index = open("a.db", key_a_);
     const PublicKey peer = key_with(0x11);
     EXPECT_FALSE(index.is_pinned(peer).value());
     ASSERT_TRUE(index.add_device(peer, "laptop").ok());
@@ -270,7 +301,7 @@ TEST_F(MetadataIndexTest, PinnedDevices) {
 }
 
 TEST_F(MetadataIndexTest, ChunkHolders) {
-    MetadataIndex index = open("a.db", kDeviceA);
+    MetadataIndex index = open("a.db", key_a_);
     const PublicKey p1 = key_with(0x11);
     const PublicKey p2 = key_with(0x22);
     ASSERT_TRUE(index.add_device(p1, "one").ok());
@@ -292,13 +323,12 @@ TEST_F(MetadataIndexTest, ChunkHolders) {
     EXPECT_TRUE(index.holders(c).value().empty());
 }
 
-
 TEST_F(MetadataIndexTest, RemoteRecordsCannotWrapClocksOrCounters) {
-    auto index = open("a.db", kDeviceA);
+    auto index = open_peer("a.db", key_a_);
     HybridClock clock;  // real time, so "far future" is measured against now
 
     auto huge = file("counter.txt", 1, 1);
-    for (int i = 0; i < 3; ++i) huge.version.bump(kDeviceB);
+    for (int i = 0; i < 3; ++i) huge.version.bump(id_b_);
     huge.version = VersionVector::parse(huge.version.serialize()).value();
     // Build a counter at the edge directly through the wire format.
     Bytes raw = huge.version.serialize();
@@ -308,14 +338,383 @@ TEST_F(MetadataIndexTest, RemoteRecordsCannotWrapClocksOrCounters) {
     EXPECT_EQ(index.apply_remote(huge, clock).error().code, Errc::invalid_argument);
 
     auto future = file("future.txt", 1, 2);
-    future.version.bump(kDeviceB);
+    future.version.bump(id_b_);
     future.hlc = (HybridClock::physical_ms(clock.now()) + 7ull * 24 * 3600 * 1000) << 16;
     EXPECT_EQ(index.apply_remote(future, clock).error().code, Errc::invalid_argument);
 
     auto fine = file("fine.txt", 1, 3);
-    fine.version.bump(kDeviceB);
+    fine.version.bump(id_b_);
     fine.hlc = clock.now();
-    EXPECT_TRUE(index.apply_remote(fine, clock));
+    EXPECT_TRUE(index.apply_remote(signed_by(key_b_, fine), clock));
+}
+
+TEST_F(MetadataIndexTest, LocalChangesAreSignedByThisDevice) {
+    MetadataIndex a = open("a.db", key_a_);
+    auto committed = a.commit_local(file("f", 1, 1), clock_a_);
+    ASSERT_TRUE(committed);
+    ASSERT_TRUE(committed.value().signature);
+    EXPECT_TRUE(verify_signature(key_a_.public_key(),
+                                 record_signed_bytes(drive_, committed.value()),
+                                 *committed.value().signature));
+    auto tomb = a.delete_local("f", clock_a_);
+    ASSERT_TRUE(tomb && tomb.value().signature);
+    EXPECT_TRUE(verify_signature(key_a_.public_key(), record_signed_bytes(drive_, tomb.value()),
+                                 *tomb.value().signature));
+}
+
+TEST_F(MetadataIndexTest, AForgedModifiedByIsRejected) {
+    MetadataIndex a = open_peer("a.db", key_a_);
+    MetadataIndex b = open_peer("b.db", key_b_);
+    auto genuine = a.commit_local(file("f", 1, 1), clock_a_).value();
+
+    // C relays A's record but claims it as its own.
+    auto claimed = genuine;
+    claimed.modified_by = id_c_;
+    EXPECT_EQ(b.apply_remote(claimed, clock_b_).error().code, Errc::invalid_argument);
+    // C makes up a change and attributes it to A, signing with its own key.
+    auto made_up = signed_by(key_c_, file("g", 2, 2));
+    made_up.modified_by = id_a_;
+    made_up.version.bump(id_a_);
+    EXPECT_EQ(b.apply_remote(made_up, clock_b_).error().code, Errc::invalid_argument);
+    // C alters A's record while relaying it.
+    auto altered = genuine;
+    altered.chunks = {chunk_with(9)};
+    EXPECT_EQ(b.apply_remote(altered, clock_b_).error().code, Errc::invalid_argument);
+    auto unsigned_record = genuine;
+    unsigned_record.signature.reset();
+    EXPECT_EQ(b.apply_remote(unsigned_record, clock_b_).error().code, Errc::invalid_argument);
+    EXPECT_FALSE(b.get("f").value().has_value());
+    EXPECT_FALSE(b.get("g").value().has_value());
+
+    // A record signed for another drive does not verify here either.
+    DriveId other{};
+    auto foreign = genuine;
+    foreign.signature = key_a_.sign(record_signed_bytes(other, genuine)).value();
+    EXPECT_EQ(b.apply_remote(foreign, clock_b_).error().code, Errc::invalid_argument);
+
+    EXPECT_EQ(b.apply_remote(genuine, clock_b_).value().kind, Kind::applied);
+}
+
+TEST_F(MetadataIndexTest, ARelayedRecordVerifiesAgainstItsAuthor) {
+    MetadataIndex a = open_peer("a.db", key_a_);
+    MetadataIndex b = open_peer("b.db", key_b_);
+    MetadataIndex c = open_peer("c.db", key_c_);
+    ASSERT_TRUE(a.commit_local(file("f", 1, 1), clock_a_));
+    std::uint64_t a_to_b = 0;
+    std::uint64_t b_to_c = 0;
+    sync(a, b, a_to_b, clock_b_);
+    auto out = sync(b, c, b_to_c, clock_a_);
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].kind, Kind::applied);
+    EXPECT_EQ(c.get("f").value()->modified_by, id_a_);
+    expect_same(a, c, "f");
+}
+
+TEST_F(MetadataIndexTest, AnUnknownSignerIsRejectedUntilPinned) {
+    MetadataIndex a = open("a.db", key_a_);
+    auto from_b = file("f", 1, 1);
+    from_b.version.bump(id_b_);
+    from_b = signed_by(key_b_, from_b);
+    EXPECT_FALSE(a.is_active_signer(id_b_));
+    EXPECT_EQ(a.apply_remote(from_b, clock_a_).error().code, Errc::invalid_argument);
+    EXPECT_FALSE(a.get("f").value().has_value());
+
+    ASSERT_TRUE(a.add_device(key_b_.public_key(), "b"));
+    EXPECT_TRUE(a.is_active_signer(id_b_));
+    EXPECT_EQ(a.apply_remote(from_b, clock_a_).value().kind, Kind::applied);
+}
+
+TEST_F(MetadataIndexTest, AShortIdStaysBoundToItsFirstKey) {
+    MetadataIndex a = open("a.db", key_a_);
+    ASSERT_TRUE(a.add_device(key_b_.public_key(), "b"));
+    ASSERT_TRUE(a.remove_device(key_b_.public_key()));
+    // Another key with B's short ID could otherwise sign records in B's name.
+    PublicKey twin = key_b_.public_key();
+    twin[31] ^= std::byte{1};
+    EXPECT_EQ(a.add_device(twin, "twin").error().code, Errc::already_exists);
+}
+
+TEST_F(MetadataIndexTest, ARetiredSignerIsRejectedButItsRecordsStay) {
+    MetadataIndex a = open_peer("a.db", key_a_);
+    MetadataIndex b = open_peer("b.db", key_b_);
+    ASSERT_TRUE(b.commit_local(file("kept", 1, 1), clock_b_));
+    ASSERT_TRUE(b.commit_local(file("gone", 1, 2), clock_b_));
+    ASSERT_TRUE(b.delete_local("gone", clock_b_));
+    std::uint64_t b_to_a = 0;
+    sync(b, a, b_to_a, clock_a_);
+    auto late = b.commit_local(file("late", 2, 3), clock_b_).value();
+
+    // B is removed from the drive.
+    ASSERT_TRUE(a.remove_device(key_b_.public_key()));
+    auto adopted = a.retire_signer(key_b_.public_key(), clock_a_);
+    ASSERT_TRUE(adopted) << adopted.error().message;
+    EXPECT_EQ(adopted.value(), 2u);  // the tombstone too
+    EXPECT_FALSE(a.is_active_signer(id_b_));
+    EXPECT_EQ(a.apply_remote(late, clock_a_).error().code, Errc::invalid_argument);
+    EXPECT_FALSE(a.get("late").value().has_value());
+
+    // Its records are still readable, now signed by A with the same content.
+    auto kept = a.get("kept").value();
+    ASSERT_TRUE(kept);
+    EXPECT_EQ(kept->chunks, std::vector<ChunkId>{chunk_with(1)});
+    EXPECT_EQ(kept->modified_by, id_a_);
+    EXPECT_EQ(kept->version.get(id_b_), 1u);
+    EXPECT_EQ(kept->version.get(id_a_), 1u);
+    EXPECT_TRUE(a.get("gone").value()->deleted);
+
+    // A device that joins later and never learns B's key still accepts them.
+    MetadataIndex c = open("c.db", key_c_);
+    ASSERT_TRUE(c.add_device(key_a_.public_key(), "a"));
+    std::uint64_t a_to_c = 0;
+    for (const auto& o : sync(a, c, a_to_c, clock_a_)) EXPECT_EQ(o.kind, Kind::applied);
+    expect_same(a, c, "kept");
+
+    // Pinned again (a device in doubt that became a member), B signs again.
+    ASSERT_TRUE(a.add_device(key_b_.public_key(), "b"));
+    EXPECT_TRUE(a.apply_remote(late, clock_a_));
+}
+
+TEST_F(MetadataIndexTest, AdoptionByEveryMemberConvergesWithoutAConflictCopy) {
+    MetadataIndex a = open_peer("a.db", key_a_);
+    MetadataIndex b = open_peer("b.db", key_b_);
+    MetadataIndex c = open_peer("c.db", key_c_);
+    ASSERT_TRUE(c.commit_local(file("doc.txt", 1, 1), clock_a_));
+    std::uint64_t c_to_a = 0;
+    std::uint64_t c_to_b = 0;
+    sync(c, a, c_to_a, clock_a_);
+    sync(c, b, c_to_b, clock_b_);
+
+    // A and B both retire C and adopt its record at once.
+    ASSERT_EQ(a.retire_signer(key_c_.public_key(), clock_a_).value(), 1u);
+    pt_ += 10;
+    ASSERT_EQ(b.retire_signer(key_c_.public_key(), clock_b_).value(), 1u);
+    std::uint64_t a_to_b = a.max_sequence().value() - 1;
+    std::uint64_t b_to_a = b.max_sequence().value() - 1;
+    for (int round = 0; round < 2; ++round) {
+        for (const auto& o : sync(a, b, a_to_b, clock_b_)) EXPECT_NE(o.kind, Kind::conflict);
+        for (const auto& o : sync(b, a, b_to_a, clock_a_)) EXPECT_NE(o.kind, Kind::conflict);
+    }
+    expect_same(a, b, "doc.txt");
+    const auto all = a.records_since(0, 100).value();
+    EXPECT_EQ(all.size(), 1u);
+    for (const auto& r : all) {
+        EXPECT_EQ(r.path.find(".sync-conflict-"), std::string::npos) << r.path;
+    }
+}
+
+TEST_F(MetadataIndexTest, AnEditConcurrentWithAnAdoptionKeepsTheName) {
+    MetadataIndex a = open_peer("a.db", key_a_);
+    MetadataIndex b = open_peer("b.db", key_b_);
+    MetadataIndex c = open_peer("c.db", key_c_);
+    ASSERT_TRUE(c.commit_local(file("doc.txt", 1, 1), clock_a_));
+    std::uint64_t c_to_a = 0;
+    std::uint64_t c_to_b = 0;
+    sync(c, a, c_to_a, clock_a_);
+    sync(c, b, c_to_b, clock_b_);
+    // B edits C's file; A has not seen the edit when it adopts C's version.
+    pt_ += 5000;
+    auto edit = b.commit_local(file("doc.txt", 2, 2), clock_b_).value();
+    ASSERT_EQ(a.retire_signer(key_c_.public_key(), clock_a_).value(), 1u);
+    EXPECT_EQ(a.apply_remote(edit, clock_a_).value().kind, Kind::conflict);
+    EXPECT_EQ(a.get("doc.txt").value()->chunks, std::vector<ChunkId>{chunk_with(2)});
+}
+
+TEST_F(MetadataIndexTest, ConcurrentResolutionRelaysTheSignedVersion) {
+    MetadataIndex a = open_peer("a.db", key_a_);
+    MetadataIndex b = open_peer("b.db", key_b_);
+    MetadataIndex c = open_peer("c.db", key_c_);
+    std::uint64_t a_to_b = 0;
+    ASSERT_TRUE(a.commit_local(file("doc.txt", 1, 1), clock_a_));
+    sync(a, b, a_to_b, clock_b_);
+
+    auto from_a = a.commit_local(file("doc.txt", 100, 2), clock_a_).value();
+    pt_ += 5000;
+    auto from_b = b.commit_local(file("doc.txt", 105, 3), clock_b_).value();
+    auto at_a = a.apply_remote(from_b, clock_a_);
+    ASSERT_TRUE(at_a);
+    ASSERT_EQ(at_a.value().kind, Kind::conflict);
+
+    // A stores B's winning record as B signed it; only the local effective version merges.
+    auto stored = a.get("doc.txt").value().value();
+    EXPECT_EQ(stored.version, from_b.version);
+    EXPECT_EQ(stored.signature, from_b.signature);
+    EXPECT_EQ(stored.effective_version, from_a.version.merged(from_b.version));
+    // A's own version is now ignored, and a later edit here supersedes both.
+    EXPECT_EQ(a.apply_remote(from_a, clock_a_).value().kind, Kind::ignored);
+
+    // What A relays verifies on a third device, the conflict copy included.
+    auto copy = a.get(at_a.value().conflict_path).value().value();
+    EXPECT_EQ(copy.origin_path, "doc.txt");
+    EXPECT_EQ(copy.modified_by, id_a_);
+    std::uint64_t a_to_c = 0;
+    for (const auto& o : sync(a, c, a_to_c, clock_a_)) EXPECT_NE(o.kind, Kind::conflict);
+    expect_same(a, c, "doc.txt");
+    expect_same(a, c, copy.path);
+    EXPECT_EQ(c.get(copy.path).value()->chunks, std::vector<ChunkId>{chunk_with(2)});
+
+    // A copy is valid only at the path derived from its origin.
+    auto moved = copy;
+    moved.path = "elsewhere.txt";
+    EXPECT_EQ(c.apply_remote(moved, clock_a_).error().code, Errc::invalid_argument);
+
+    auto edited = a.commit_local(file("doc.txt", 200, 4), clock_a_).value();
+    EXPECT_EQ(edited.version.compare(stored.effective_version), VersionVector::Order::after);
+    EXPECT_EQ(b.apply_remote(edited, clock_b_).value().kind, Kind::applied);
+}
+
+// The schema before signing, as of commit 15c3cc3.
+constexpr const char* kSchemaV1 = R"sql(
+CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE files (
+    path TEXT PRIMARY KEY, size INTEGER NOT NULL, mode INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL, hlc INTEGER NOT NULL, version BLOB NOT NULL,
+    modified_by INTEGER NOT NULL, block_size INTEGER NOT NULL, chunking INTEGER NOT NULL,
+    deleted INTEGER NOT NULL, sequence INTEGER NOT NULL UNIQUE
+) WITHOUT ROWID;
+CREATE TABLE chunks (
+    path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE, idx INTEGER NOT NULL,
+    chunk BLOB NOT NULL, PRIMARY KEY (path, idx)
+) WITHOUT ROWID;
+CREATE INDEX chunks_by_id ON chunks(chunk);
+CREATE TABLE devices (
+    key BLOB PRIMARY KEY, short_id INTEGER NOT NULL UNIQUE, name TEXT NOT NULL,
+    peer_index_id INTEGER NOT NULL DEFAULT 0, peer_max_sequence INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+CREATE TABLE holdings (
+    chunk BLOB NOT NULL, device BLOB NOT NULL REFERENCES devices(key) ON DELETE CASCADE,
+    PRIMARY KEY (chunk, device)
+) WITHOUT ROWID;
+PRAGMA user_version = 1;
+)sql";
+
+class V1Database {
+public:
+    explicit V1Database(const std::filesystem::path& path) {
+        sqlite3* raw = nullptr;
+        EXPECT_EQ(sqlite3_open(path.c_str(), &raw), SQLITE_OK);
+        db_.reset(raw);
+        exec(kSchemaV1);
+    }
+
+    void exec(const std::string& sql) {
+        EXPECT_EQ(sqlite3_exec(db_.get(), sql.c_str(), nullptr, nullptr, nullptr), SQLITE_OK)
+            << sqlite3_errmsg(db_.get());
+    }
+
+    void insert(const FileRecord& r) {
+        const Bytes version = r.version.serialize();
+        run("INSERT INTO files VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)", [&](sqlite3_stmt* s) {
+            sqlite3_bind_text(s, 1, r.path.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(s, 2, static_cast<sqlite3_int64>(r.size));
+            sqlite3_bind_int64(s, 3, r.mode);
+            sqlite3_bind_int64(s, 4, r.mtime_ns);
+            sqlite3_bind_int64(s, 5, static_cast<sqlite3_int64>(r.hlc));
+            sqlite3_bind_blob(s, 6, version.data(), static_cast<int>(version.size()),
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_int64(s, 7, static_cast<sqlite3_int64>(r.modified_by));
+            sqlite3_bind_int64(s, 8, r.block_size);
+            sqlite3_bind_int64(s, 9, r.deleted ? 1 : 0);
+            sqlite3_bind_int64(s, 10, static_cast<sqlite3_int64>(r.sequence));
+        });
+        for (std::size_t i = 0; i < r.chunks.size(); ++i) {
+            const auto id = r.chunks[i].to_bytes();
+            run("INSERT INTO chunks VALUES(?, ?, ?)", [&](sqlite3_stmt* s) {
+                sqlite3_bind_text(s, 1, r.path.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(s, 2, static_cast<sqlite3_int64>(i));
+                sqlite3_bind_blob(s, 3, id.data(), static_cast<int>(id.size()), SQLITE_TRANSIENT);
+            });
+        }
+    }
+
+    void insert_device(const PublicKey& key) {
+        run("INSERT INTO devices(key, short_id, name, peer_index_id, peer_max_sequence) "
+            "VALUES(?, ?, 'peer', 99, 7)",
+            [&](sqlite3_stmt* s) {
+                sqlite3_bind_blob(s, 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
+                sqlite3_bind_int64(s, 2, static_cast<sqlite3_int64>(short_id(key)));
+            });
+    }
+
+private:
+    template <typename Bind>
+    void run(const char* sql, Bind bind) {
+        sqlite3_stmt* raw = nullptr;
+        ASSERT_EQ(sqlite3_prepare_v2(db_.get(), sql, -1, &raw, nullptr), SQLITE_OK)
+            << sqlite3_errmsg(db_.get());
+        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> stmt(raw, &sqlite3_finalize);
+        bind(raw);
+        EXPECT_EQ(sqlite3_step(raw), SQLITE_DONE) << sqlite3_errmsg(db_.get());
+    }
+
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db_{nullptr, &sqlite3_close};
+};
+
+TEST_F(MetadataIndexTest, AVersionOneIndexMigrates) {
+    // B's own index holds the same record for theirs.txt, signed.
+    MetadataIndex b = open_peer("b.db", key_b_);
+    auto theirs = b.commit_local(file("theirs.txt", 2, 2), clock_b_).value();
+
+    const std::uint64_t removed = 0xDDDD000000000000ull;
+    {
+        V1Database v1(dir_.path() / "a.db");
+        auto mine = file("mine.txt", 1, 1);
+        mine.version.bump(id_a_);
+        mine.modified_by = id_a_;
+        mine.hlc = 5;
+        mine.sequence = 1;
+        v1.insert(mine);
+        auto stored_theirs = theirs;
+        stored_theirs.sequence = 2;
+        v1.insert(stored_theirs);
+        auto gone = file("gone.txt", 3, 3);
+        gone.version.bump(removed);  // a device removed before signing
+        gone.modified_by = removed;
+        gone.hlc = 6;
+        gone.sequence = 3;
+        v1.insert(gone);
+        v1.insert_device(key_b_.public_key());
+        v1.exec("INSERT INTO meta VALUES('index_id', 1234), ('sequence', 3), ('local_device', " +
+                std::to_string(static_cast<std::int64_t>(id_a_)) + ")");
+    }
+
+    MetadataIndex a = open("a.db", key_a_);
+    EXPECT_NE(a.index_id(), 1234u);
+    // Every file is still there and readable.
+    auto all = a.records_since(0, 100).value();
+    ASSERT_EQ(all.size(), 3u);
+    EXPECT_EQ(a.get("theirs.txt").value()->chunks, std::vector<ChunkId>{chunk_with(2)});
+    EXPECT_TRUE(a.is_pinned(key_b_.public_key()).value());
+
+    // A's own record is signed as it was; B takes it without a version change.
+    auto mine = a.get("mine.txt").value().value();
+    ASSERT_TRUE(mine.signature);
+    EXPECT_EQ(mine.version.get(id_a_), 1u);
+    EXPECT_EQ(b.apply_remote(mine, clock_b_).value().kind, Kind::applied);
+    // The removed device's record is adopted.
+    auto gone = a.get("gone.txt").value().value();
+    EXPECT_EQ(gone.modified_by, id_a_);
+    EXPECT_EQ(gone.version.get(removed), 1u);
+    ASSERT_TRUE(gone.signature);
+    EXPECT_EQ(b.apply_remote(gone, clock_b_).value().kind, Kind::applied);
+
+    // B's record stays unsigned and is not sent on until B's signature arrives.
+    auto unsigned_theirs = a.get("theirs.txt").value().value();
+    EXPECT_FALSE(unsigned_theirs.signature);
+    auto sendable = a.records_since(0, 100, true).value();
+    EXPECT_EQ(sendable.size(), 2u);
+    auto forged = theirs;
+    forged.signature = key_c_.sign(record_signed_bytes(drive_, theirs)).value();
+    EXPECT_EQ(a.apply_remote(forged, clock_a_).error().code, Errc::invalid_argument);
+    EXPECT_EQ(a.apply_remote(theirs, clock_a_).value().kind, Kind::ignored);
+    EXPECT_EQ(a.get("theirs.txt").value()->signature, theirs.signature);
+    EXPECT_EQ(a.records_since(0, 100, true).value().size(), 3u);
+    EXPECT_EQ(a.apply_remote(theirs, clock_a_).value().kind, Kind::ignored);
+
+    // Reopening does not migrate again.
+    const auto index_id = a.index_id();
+    a = open("a.db", key_a_);
+    EXPECT_EQ(a.index_id(), index_id);
+    EXPECT_EQ(a.records_since(0, 100, true).value().size(), 3u);
 }
 
 }  // namespace

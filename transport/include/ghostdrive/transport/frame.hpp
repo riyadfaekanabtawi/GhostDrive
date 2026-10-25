@@ -32,7 +32,7 @@ enum class FrameType : std::uint8_t {
     // Index exchange (one stream per direction, opened by the sender of the records).
     hello = 4,
     index_request = 5,
-    index_batch = 6,
+    index_batch = 6,  // unsigned records; no longer sent or accepted
     // Pairing a new device by invite code.
     join = 7,
     drive_info = 8,
@@ -45,6 +45,8 @@ enum class FrameType : std::uint8_t {
     membership = 13,
     // Discovery keys between members (one stream per direction).
     discovery_keys = 14,
+    // Index records with their author's signature. A new type, so an older peer fails cleanly.
+    index_batch2 = 15,
 };
 
 enum class ErrorCode : std::uint16_t {

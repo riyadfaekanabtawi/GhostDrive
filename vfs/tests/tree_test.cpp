@@ -114,7 +114,8 @@ TEST(Tree, InvalidPathsAreIgnored) {
 
 TEST(Tree, RefreshAppliesOnlyNewIndexRecords) {
     test::TempDir dir;
-    auto index = core::MetadataIndex::open(dir.path() / "index.db", 0xA1);
+    auto key = core::DeviceKey::generate().value();
+    auto index = core::MetadataIndex::open(dir.path() / "index.db", core::DriveId{}, key);
     ASSERT_TRUE(index);
     core::HybridClock clock;
     ASSERT_TRUE(index.value().commit_local(file("one"), clock));

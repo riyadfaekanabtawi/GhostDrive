@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <tuple>
 
@@ -13,7 +14,7 @@ namespace ghostdrive::core {
 
 namespace {
 
-constexpr int kSchemaVersion = 1;
+constexpr int kSchemaVersion = 2;
 
 constexpr const char* kSchema = R"sql(
 CREATE TABLE meta (
@@ -54,6 +55,22 @@ CREATE TABLE holdings (
 ) WITHOUT ROWID;
 )sql";
 
+// Version 2 adds record signatures. A new index runs it right after kSchema, so new and
+// migrated indexes have the same tables. Rows of signers are never deleted: a removed device's
+// key stays known, and its short ID is never bound to another key.
+constexpr const char* kSchemaV2 = R"sql(
+ALTER TABLE files ADD COLUMN signature BLOB;
+ALTER TABLE files ADD COLUMN origin_path TEXT NOT NULL DEFAULT '';
+ALTER TABLE files ADD COLUMN effective_version BLOB;
+UPDATE files SET effective_version = version;
+CREATE TABLE signers (
+    short_id INTEGER PRIMARY KEY,
+    key BLOB NOT NULL UNIQUE,
+    retired_seq INTEGER
+);
+INSERT INTO signers(short_id, key) SELECT short_id, key FROM devices;
+)sql";
+
 // SQLite integers are signed 64-bit; unsigned values are stored by bit pattern.
 sqlite3_int64 to_db(std::uint64_t v) noexcept {
     return static_cast<sqlite3_int64>(v);
@@ -89,6 +106,10 @@ public:
                                   SQLITE_UTF8));
         return *this;
     }
+    Stmt& bind_null(int index) {
+        check(sqlite3_bind_null(stmt_.get(), index));
+        return *this;
+    }
     Stmt& bind_blob(int index, std::span<const std::byte> blob) {
         // A zero-length blob with a null pointer binds as NULL; use a non-null pointer instead.
         static const std::byte kEmpty{};
@@ -120,6 +141,7 @@ public:
                    ? std::string(reinterpret_cast<const char*>(text), static_cast<std::size_t>(len))
                    : std::string();
     }
+    bool col_null(int col) const { return sqlite3_column_type(stmt_.get(), col) == SQLITE_NULL; }
     std::span<const std::byte> col_blob(int col) const {
         const void* data = sqlite3_column_blob(stmt_.get(), col);
         const int len = sqlite3_column_bytes(stmt_.get(), col);
@@ -197,16 +219,45 @@ Status write_meta(sqlite3* db, std::string_view key, std::uint64_t value) {
     return stmt.value().bind_text(1, key).bind_u64(2, value).run();
 }
 
+Result<std::uint64_t> random_u64() {
+    std::array<std::byte, 8> random{};
+    if (auto st = random_bytes(random); !st) return st.error();
+    std::uint64_t value = 0;
+    for (std::byte b : random) value = (value << 8) | std::to_integer<std::uint64_t>(b);
+    return value;
+}
+
+bool same_content(const FileRecord& a, const FileRecord& b) {
+    return a.size == b.size && a.mode == b.mode && a.mtime_ns == b.mtime_ns &&
+           a.deleted == b.deleted && a.chunks == b.chunks;
+}
+
 }  // namespace
 
 struct MetadataIndex::Impl {
+    struct Signer {
+        PublicKey key{};
+        bool retired = false;
+    };
+
     Db db;
+    const DeviceKey* key = nullptr;
+    DriveId drive{};
     std::uint64_t local_device = 0;
     std::uint64_t index_id = 0;
+    std::map<std::uint64_t, Signer> signers;  // by short ID, mirrors the signers table
     mutable std::mutex mutex;
 
     Result<std::optional<FileRecord>> read_record(std::string_view path) const;
+    Result<std::vector<std::string>> paths_where(const char* sql, std::uint64_t arg) const;
     Result<FileRecord> write_record(FileRecord record);
+    Status sign(FileRecord& record) const;
+    Status verify(const FileRecord& record) const;
+    Status load_signers();
+    Status migrate_to_v2(HybridClock& clock);
+    // The caller holds a transaction. Adopting keeps the record's HLC, so an edit made elsewhere
+    // that the adopted version turns out concurrent with is newer and keeps the name.
+    Result<FileRecord> commit_in_tx(FileRecord record, HybridClock& clock, bool adopt = false);
     Result<FileRecord> commit(FileRecord record, HybridClock& clock);
     Result<ApplyOutcome> resolve_concurrent(const FileRecord& local, const FileRecord& remote);
 };
@@ -214,7 +265,8 @@ struct MetadataIndex::Impl {
 Result<std::optional<FileRecord>> MetadataIndex::Impl::read_record(std::string_view path) const {
     auto stmt = prepare(db.get(),
                         "SELECT size, mode, mtime_ns, hlc, version, modified_by, block_size, "
-                        "chunking, deleted, sequence FROM files WHERE path = ?");
+                        "chunking, deleted, sequence, signature, origin_path, effective_version "
+                        "FROM files WHERE path = ?");
     if (!stmt) return stmt.error();
     Stmt& s = stmt.value();
     s.bind_text(1, path);
@@ -236,6 +288,17 @@ Result<std::optional<FileRecord>> MetadataIndex::Impl::read_record(std::string_v
     record.chunking = static_cast<Chunking>(s.col_i64(7));
     record.deleted = s.col_i64(8) != 0;
     record.sequence = s.col_u64(9);
+    if (!s.col_null(10)) {
+        const auto signature = s.col_blob(10);
+        if (signature.size() != kSignatureSize) return Error{Errc::corrupt, "bad stored signature"};
+        Signature sig{};
+        std::copy(signature.begin(), signature.end(), sig.begin());
+        record.signature = sig;
+    }
+    record.origin_path = s.col_text(11);
+    auto effective = VersionVector::parse(s.col_blob(12));
+    if (!effective) return effective.error();
+    record.effective_version = std::move(effective).value();
 
     auto chunks = prepare(db.get(), "SELECT chunk FROM chunks WHERE path = ? ORDER BY idx");
     if (!chunks) return chunks.error();
@@ -263,10 +326,16 @@ Result<FileRecord> MetadataIndex::Impl::write_record(FileRecord record) {
 
     auto ins = prepare(db.get(),
                        "INSERT INTO files(path, size, mode, mtime_ns, hlc, version, modified_by, "
-                       "block_size, chunking, deleted, sequence) "
-                       "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                       "block_size, chunking, deleted, sequence, signature, origin_path, "
+                       "effective_version) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     if (!ins) return ins.error();
     const Bytes version = record.version.serialize();
+    const Bytes effective = record.effective_version.serialize();
+    if (record.signature) {
+        ins.value().bind_blob(12, *record.signature);
+    } else {
+        ins.value().bind_null(12);
+    }
     auto st = ins.value()
                   .bind_text(1, record.path)
                   .bind_u64(2, record.size)
@@ -279,6 +348,8 @@ Result<FileRecord> MetadataIndex::Impl::write_record(FileRecord record) {
                   .bind_i64(9, static_cast<std::int64_t>(record.chunking))
                   .bind_i64(10, record.deleted ? 1 : 0)
                   .bind_u64(11, record.sequence)
+                  .bind_text(13, record.origin_path)
+                  .bind_blob(14, effective)
                   .run();
     if (!st) return st.error();
 
@@ -296,24 +367,134 @@ Result<FileRecord> MetadataIndex::Impl::write_record(FileRecord record) {
     return record;
 }
 
-Result<FileRecord> MetadataIndex::Impl::commit(FileRecord record, HybridClock& clock) {
+Result<std::vector<std::string>> MetadataIndex::Impl::paths_where(const char* sql,
+                                                                  std::uint64_t arg) const {
+    auto stmt = prepare(db.get(), sql);
+    if (!stmt) return stmt.error();
+    stmt.value().bind_u64(1, arg);
+    std::vector<std::string> paths;
+    for (;;) {
+        auto row = stmt.value().step();
+        if (!row) return row.error();
+        if (!row.value()) break;
+        paths.push_back(stmt.value().col_text(0));
+    }
+    return paths;
+}
+
+Status MetadataIndex::Impl::sign(FileRecord& record) const {
+    auto signature = key->sign(record_signed_bytes(drive, record));
+    if (!signature) return signature.error();
+    record.signature = signature.value();
+    return {};
+}
+
+Status MetadataIndex::Impl::verify(const FileRecord& record) const {
+    auto it = signers.find(record.modified_by);
+    if (it == signers.end()) {
+        return Error{Errc::invalid_argument, "record by an unknown device: " + record.path};
+    }
+    if (it->second.retired) {
+        return Error{Errc::invalid_argument, "record by a removed device: " + record.path};
+    }
+    if (!record.signature ||
+        !verify_signature(it->second.key, record_signed_bytes(drive, record), *record.signature)) {
+        return Error{Errc::invalid_argument, "record signature does not verify: " + record.path};
+    }
+    return {};
+}
+
+Status MetadataIndex::Impl::load_signers() {
+    auto stmt = prepare(db.get(), "SELECT short_id, key, retired_seq FROM signers");
+    if (!stmt) return stmt.error();
+    std::map<std::uint64_t, Signer> loaded;
+    for (;;) {
+        auto row = stmt.value().step();
+        if (!row) return row.error();
+        if (!row.value()) break;
+        const Stmt& s = stmt.value();
+        const auto blob = s.col_blob(1);
+        if (blob.size() != kPublicKeySize) return Error{Errc::corrupt, "signer key has wrong size"};
+        Signer signer;
+        std::copy(blob.begin(), blob.end(), signer.key.begin());
+        signer.retired = !s.col_null(2);
+        loaded[s.col_u64(0)] = signer;
+    }
+    signers = std::move(loaded);
+    return {};
+}
+
+Result<FileRecord> MetadataIndex::Impl::commit_in_tx(FileRecord record, HybridClock& clock,
+                                                     bool adopt) {
     if (record.deleted) {
         record.size = 0;
         record.chunks.clear();
     }
+    // Changing a conflict copy here makes it an ordinary file at its own path.
+    record.origin_path.clear();
     if (auto st = validate(record); !st) return st.error();
-    Transaction tx(db.get());
-    if (auto st = tx.begin(); !st) return st.error();
     auto existing = read_record(record.path);
     if (!existing) return existing.error();
-    record.version = existing.value() ? existing.value()->version : VersionVector{};
+    record.version = existing.value() ? existing.value()->effective_version : VersionVector{};
     record.version.bump(local_device);
-    record.hlc = clock.now();
+    record.effective_version = record.version;
+    if (!adopt) record.hlc = clock.now();
     record.modified_by = local_device;
-    auto written = write_record(std::move(record));
+    if (auto st = sign(record); !st) return st.error();
+    return write_record(std::move(record));
+}
+
+Result<FileRecord> MetadataIndex::Impl::commit(FileRecord record, HybridClock& clock) {
+    Transaction tx(db.get());
+    if (auto st = tx.begin(); !st) return st.error();
+    auto written = commit_in_tx(std::move(record), clock);
     if (!written) return written.error();
     if (auto st = tx.commit(); !st) return st.error();
     return written;
+}
+
+Status MetadataIndex::Impl::migrate_to_v2(HybridClock& clock) {
+    if (auto st = exec(db.get(), kSchemaV2); !st) return st;
+    auto self = prepare(db.get(), "INSERT INTO signers(short_id, key) VALUES(?, ?)");
+    if (!self) return self.error();
+    if (auto st = self.value().bind_u64(1, local_device).bind_blob(2, key->public_key()).run();
+        !st) {
+        return st;
+    }
+    // Records this device wrote before signing are signed as they are, version unchanged.
+    // Peers holding the same version store the signature when it reaches them.
+    auto own = paths_where("SELECT path FROM files WHERE modified_by = ?", local_device);
+    if (!own) return own.error();
+    for (const auto& path : own.value()) {
+        auto record = read_record(path);
+        if (!record) return record.error();
+        if (!record.value()) continue;
+        if (auto st = sign(*record.value()); !st) return st;
+        auto update = prepare(db.get(), "UPDATE files SET signature = ? WHERE path = ?");
+        if (!update) return update.error();
+        auto st = update.value().bind_blob(1, *record.value()->signature).bind_text(2, path).run();
+        if (!st) return st;
+    }
+    // The authors of these are no longer pinned and will never sign them: adopt them.
+    auto orphans = paths_where(
+        "SELECT path FROM files WHERE modified_by <> ? AND modified_by NOT IN "
+        "(SELECT short_id FROM signers)",
+        local_device);
+    if (!orphans) return orphans.error();
+    for (const auto& path : orphans.value()) {
+        auto record = read_record(path);
+        if (!record) return record.error();
+        if (!record.value()) continue;
+        auto c = commit_in_tx(std::move(*record.value()), clock, true);
+        // A record no longer valid stays as it is rather than block opening the drive.
+        if (!c && c.error().code != Errc::invalid_argument) return c.error();
+    }
+    // Peers already passed these records unsigned; a new index_id makes them fetch them again.
+    auto id = random_u64();
+    if (!id) return id.error();
+    if (auto st = write_meta(db.get(), "index_id", id.value()); !st) return st;
+    const std::string pragma = "PRAGMA user_version = " + std::to_string(kSchemaVersion);
+    return exec(db.get(), pragma.c_str());
 }
 
 Result<ApplyOutcome> MetadataIndex::Impl::resolve_concurrent(const FileRecord& local,
@@ -328,23 +509,31 @@ Result<ApplyOutcome> MetadataIndex::Impl::resolve_concurrent(const FileRecord& l
     }
     const FileRecord& loser = remote_wins ? local : remote;
     FileRecord winner = remote_wins ? remote : local;
-    // Absorbing both histories makes the winner dominate the loser on every device.
-    winner.version = local.version.merged(remote.version);
+    // The winner keeps its signed version and is relayed unchanged. Only the local effective
+    // version absorbs both histories, so the loser is ignored here from now on; every device
+    // picks the same winner, so they converge without anyone signing the merge.
+    winner.effective_version = local.effective_version.merged(remote.version);
     if (auto w = write_record(std::move(winner)); !w) return w.error();
 
-    if (local.deleted || remote.deleted) {
+    // Deletes lose to edits outright. Equal content (devices adopting the same records at
+    // once in retire_signer) needs no copy either. A loser that is itself a conflict
+    // copy cannot be copied again: its signature covers only its origin.
+    if (local.deleted || remote.deleted || same_content(local, remote) ||
+        !loser.origin_path.empty()) {
         return ApplyOutcome{
             remote_wins ? ApplyOutcome::Kind::applied : ApplyOutcome::Kind::kept_local, {}};
     }
 
     // Built only from the loser, so both devices create an identical record (same path, same
-    // version) and it converges without a second conflict.
+    // version, the loser's signature) and it converges without a second conflict.
     FileRecord copy = loser;
+    copy.origin_path = loser.path;
     copy.path = conflict_copy_path(loser.path, loser.mtime_ns, loser.modified_by);
+    copy.effective_version = copy.version;
     auto existing = read_record(copy.path);
     if (!existing) return existing.error();
     if (!existing.value() ||
-        existing.value()->version.compare(copy.version) == VersionVector::Order::before) {
+        existing.value()->effective_version.compare(copy.version) == VersionVector::Order::before) {
         if (auto c = write_record(copy); !c) return c.error();
     }
     return ApplyOutcome{ApplyOutcome::Kind::conflict, copy.path};
@@ -356,7 +545,8 @@ MetadataIndex& MetadataIndex::operator=(MetadataIndex&&) noexcept = default;
 MetadataIndex::~MetadataIndex() = default;
 
 Result<MetadataIndex> MetadataIndex::open(const std::filesystem::path& db_path,
-                                          std::uint64_t local_device) {
+                                          const DriveId& drive, const DeviceKey& key) {
+    const std::uint64_t local_device = short_id(key.public_key());
     sqlite3* raw = nullptr;
     const int rc =
         sqlite3_open_v2(db_path.c_str(), &raw,
@@ -373,44 +563,52 @@ Result<MetadataIndex> MetadataIndex::open(const std::filesystem::path& db_path,
         return st.error();
     }
 
-    auto version_stmt = prepare(db.get(), "PRAGMA user_version");
-    if (!version_stmt) return version_stmt.error();
-    auto version_row = version_stmt.value().step();
-    if (!version_row) return version_row.error();
-    const std::int64_t schema = version_row.value() ? version_stmt.value().col_i64(0) : 0;
-
-    auto impl = std::make_unique<Impl>();
-    if (schema == 0) {
-        std::array<std::byte, 8> random{};
-        if (auto st = random_bytes(random); !st) return st.error();
-        std::uint64_t index_id = 0;
-        for (std::byte b : random) index_id = (index_id << 8) | std::to_integer<std::uint64_t>(b);
-
-        Transaction tx(db.get());
-        if (auto st = tx.begin(); !st) return st.error();
-        if (auto st = exec(db.get(), kSchema); !st) return st.error();
-        if (auto st = write_meta(db.get(), "index_id", index_id); !st) return st.error();
-        if (auto st = write_meta(db.get(), "sequence", 0); !st) return st.error();
-        if (auto st = write_meta(db.get(), "local_device", local_device); !st) return st.error();
-        const std::string pragma = "PRAGMA user_version = " + std::to_string(kSchemaVersion);
-        if (auto st = exec(db.get(), pragma.c_str()); !st) return st.error();
-        if (auto st = tx.commit(); !st) return st.error();
-    } else if (schema != kSchemaVersion) {
+    std::int64_t schema = 0;
+    {
+        auto version_stmt = prepare(db.get(), "PRAGMA user_version");
+        if (!version_stmt) return version_stmt.error();
+        auto version_row = version_stmt.value().step();
+        if (!version_row) return version_row.error();
+        if (version_row.value()) schema = version_stmt.value().col_i64(0);
+    }
+    if (schema != 0 && schema != 1 && schema != kSchemaVersion) {
         return Error{Errc::corrupt, "unsupported index schema version " + std::to_string(schema)};
     }
 
-    auto stored_device = read_meta(db.get(), "local_device");
-    if (!stored_device) return stored_device.error();
-    if (stored_device.value() != local_device) {
-        return Error{Errc::invalid_argument,
-                     "index " + db_path.string() + " belongs to a different device"};
-    }
-    auto index_id = read_meta(db.get(), "index_id");
-    if (!index_id) return index_id.error();
-
+    auto impl = std::make_unique<Impl>();
     impl->db = std::move(db);
+    impl->key = &key;
+    impl->drive = drive;
     impl->local_device = local_device;
+    sqlite3* handle = impl->db.get();
+    auto check_device = [&]() -> Status {
+        auto stored_device = read_meta(handle, "local_device");
+        if (!stored_device) return stored_device.error();
+        if (stored_device.value() != local_device) {
+            return Error{Errc::invalid_argument,
+                         "index " + db_path.string() + " belongs to a different device"};
+        }
+        return {};
+    };
+    if (schema != kSchemaVersion) {
+        Transaction tx(handle);
+        if (auto st = tx.begin(); !st) return st.error();
+        if (schema == 0) {
+            if (auto st = exec(handle, kSchema); !st) return st.error();
+            if (auto st = write_meta(handle, "sequence", 0); !st) return st.error();
+            if (auto st = write_meta(handle, "local_device", local_device); !st) return st.error();
+        }
+        // Before migrating, which signs records as this device.
+        if (auto st = check_device(); !st) return st.error();
+        HybridClock clock;
+        if (auto st = impl->migrate_to_v2(clock); !st) return st.error();
+        if (auto st = tx.commit(); !st) return st.error();
+    }
+    if (auto st = check_device(); !st) return st.error();
+    auto index_id = read_meta(handle, "index_id");
+    if (!index_id) return index_id.error();
     impl->index_id = index_id.value();
+    if (auto st = impl->load_signers(); !st) return st.error();
     return MetadataIndex(std::move(impl));
 }
 
@@ -432,13 +630,17 @@ Result<std::optional<FileRecord>> MetadataIndex::get(std::string_view path) cons
     return impl_->read_record(path);
 }
 
-Result<std::vector<FileRecord>> MetadataIndex::records_since(std::uint64_t after,
-                                                             std::size_t limit) const {
+Result<std::vector<FileRecord>> MetadataIndex::records_since(std::uint64_t after, std::size_t limit,
+                                                             bool signed_only) const {
     std::lock_guard lock(impl_->mutex);
     auto stmt = prepare(impl_->db.get(),
-                        "SELECT path FROM files WHERE sequence > ? ORDER BY sequence LIMIT ?");
+                        "SELECT path FROM files WHERE sequence > ? AND "
+                        "(? = 0 OR signature IS NOT NULL) ORDER BY sequence LIMIT ?");
     if (!stmt) return stmt.error();
-    stmt.value().bind_u64(1, after).bind_i64(2, static_cast<std::int64_t>(limit));
+    stmt.value()
+        .bind_u64(1, after)
+        .bind_i64(2, signed_only ? 1 : 0)
+        .bind_i64(3, static_cast<std::int64_t>(limit));
     std::vector<std::string> paths;
     for (;;) {
         auto row = stmt.value().step();
@@ -492,28 +694,41 @@ Result<ApplyOutcome> MetadataIndex::apply_remote(const FileRecord& record, Hybri
         return Error{Errc::invalid_argument, "remote record is timestamped too far in the future"};
     }
     std::lock_guard lock(impl_->mutex);
-    clock.update(record.hlc);
 
     Transaction tx(impl_->db.get());
     if (auto st = tx.begin(); !st) return st.error();
     auto local = impl_->read_record(record.path);
     if (!local) return local.error();
 
+    // Only records that change something here are verified; ignored ones cost no signature
+    // check. The signed version is stored as sent, beside the local effective version.
+    FileRecord incoming = record;
+    incoming.effective_version = record.version;
     ApplyOutcome outcome{ApplyOutcome::Kind::ignored, {}};
     if (!local.value()) {
-        if (auto w = impl_->write_record(record); !w) return w.error();
+        if (auto st = impl_->verify(incoming); !st) return st.error();
+        if (auto w = impl_->write_record(std::move(incoming)); !w) return w.error();
         outcome.kind = ApplyOutcome::Kind::applied;
     } else {
-        switch (record.version.compare(local.value()->version)) {
+        const FileRecord& stored = *local.value();
+        switch (record.version.compare(stored.effective_version)) {
             case VersionVector::Order::equal:
+                // A record stored unsigned before signing takes the author's signature.
+                if (stored.signature || record.version != stored.version) return outcome;
+                if (auto st = impl_->verify(incoming); !st) return st.error();
+                incoming.effective_version = stored.effective_version;
+                if (auto w = impl_->write_record(std::move(incoming)); !w) return w.error();
+                break;
             case VersionVector::Order::before:
                 return outcome;
             case VersionVector::Order::after:
-                if (auto w = impl_->write_record(record); !w) return w.error();
+                if (auto st = impl_->verify(incoming); !st) return st.error();
+                if (auto w = impl_->write_record(std::move(incoming)); !w) return w.error();
                 outcome.kind = ApplyOutcome::Kind::applied;
                 break;
             case VersionVector::Order::concurrent: {
-                auto resolved = impl_->resolve_concurrent(*local.value(), record);
+                if (auto st = impl_->verify(incoming); !st) return st.error();
+                auto resolved = impl_->resolve_concurrent(stored, incoming);
                 if (!resolved) return resolved.error();
                 outcome = std::move(resolved).value();
                 break;
@@ -521,20 +736,82 @@ Result<ApplyOutcome> MetadataIndex::apply_remote(const FileRecord& record, Hybri
         }
     }
     if (auto st = tx.commit(); !st) return st.error();
+    clock.update(record.hlc);
     return outcome;
 }
 
 Status MetadataIndex::add_device(const PublicKey& key, std::string_view name) {
     std::lock_guard lock(impl_->mutex);
-    auto stmt =
-        prepare(impl_->db.get(), "INSERT INTO devices(key, short_id, name) VALUES(?, ?, ?)");
+    sqlite3* db = impl_->db.get();
+    const std::uint64_t id = short_id(key);
+    const Error clash{Errc::already_exists, "device already pinned: " + fingerprint(key)};
+    auto known = impl_->signers.find(id);
+    if (known != impl_->signers.end() && known->second.key != key) return clash;
+
+    Transaction tx(db);
+    if (auto st = tx.begin(); !st) return st;
+    auto stmt = prepare(db, "INSERT INTO devices(key, short_id, name) VALUES(?, ?, ?)");
     if (!stmt) return stmt.error();
-    auto st = stmt.value().bind_blob(1, key).bind_u64(2, short_id(key)).bind_text(3, name).run();
+    auto st = stmt.value().bind_blob(1, key).bind_u64(2, id).bind_text(3, name).run();
     // Either the key or its 64-bit short ID is already present.
-    if (!st && sqlite3_errcode(impl_->db.get()) == SQLITE_CONSTRAINT) {
-        return Error{Errc::already_exists, "device already pinned: " + fingerprint(key)};
+    if (!st && sqlite3_errcode(db) == SQLITE_CONSTRAINT) return clash;
+    if (!st) return st;
+    // A device pinned again (one in doubt that became a member) signs again.
+    auto signer = prepare(db, known == impl_->signers.end()
+                                  ? "INSERT INTO signers(short_id, key) VALUES(?, ?)"
+                                  : "UPDATE signers SET retired_seq = NULL WHERE short_id = ? AND "
+                                    "key = ?");
+    if (!signer) return signer.error();
+    if (auto sst = signer.value().bind_u64(1, id).bind_blob(2, key).run(); !sst) return sst;
+    if (auto cst = tx.commit(); !cst) return cst;
+    impl_->signers[id] = Impl::Signer{key, false};
+    return {};
+}
+
+Result<std::size_t> MetadataIndex::retire_signer(const PublicKey& key, HybridClock& clock) {
+    std::lock_guard lock(impl_->mutex);
+    sqlite3* db = impl_->db.get();
+    const std::uint64_t id = short_id(key);
+    if (id == impl_->local_device) {
+        return Error{Errc::invalid_argument, "this device cannot retire its own key"};
     }
-    return st;
+    auto known = impl_->signers.find(id);
+    // Records under this short ID were signed by another key; they are not this key's to give up.
+    if (known != impl_->signers.end() && known->second.key != key) return std::size_t{0};
+
+    Transaction tx(db);
+    if (auto st = tx.begin(); !st) return st.error();
+    auto sequence = read_meta(db, "sequence");
+    if (!sequence) return sequence.error();
+    auto signer = prepare(db,
+                          "INSERT INTO signers(short_id, key, retired_seq) VALUES(?, ?, ?) "
+                          "ON CONFLICT(short_id) DO UPDATE SET retired_seq = excluded.retired_seq");
+    if (!signer) return signer.error();
+    auto st = signer.value().bind_u64(1, id).bind_blob(2, key).bind_u64(3, sequence.value()).run();
+    if (!st) return st.error();
+
+    // Adoption: a device that joins later never learns the retired key, so the records it
+    // signed would be rejected there. Each member commits them again unchanged under its own
+    // key. Members adopting at once make concurrent versions with equal content, which
+    // resolve_concurrent settles without a conflict copy.
+    auto paths = impl_->paths_where("SELECT path FROM files WHERE modified_by = ?", id);
+    if (!paths) return paths.error();
+    for (const auto& path : paths.value()) {
+        auto record = impl_->read_record(path);
+        if (!record) return record.error();
+        if (!record.value()) continue;
+        auto c = impl_->commit_in_tx(std::move(*record.value()), clock, true);
+        if (!c && c.error().code != Errc::invalid_argument) return c.error();
+    }
+    if (auto cst = tx.commit(); !cst) return cst.error();
+    impl_->signers[id] = Impl::Signer{key, true};
+    return paths.value().size();
+}
+
+bool MetadataIndex::is_active_signer(std::uint64_t id) const {
+    std::lock_guard lock(impl_->mutex);
+    auto it = impl_->signers.find(id);
+    return it != impl_->signers.end() && !it->second.retired;
 }
 
 Status MetadataIndex::remove_device(const PublicKey& key) {
