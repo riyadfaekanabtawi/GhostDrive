@@ -23,7 +23,8 @@ enum class Chunking : std::uint8_t {
 };
 
 // One entry of the replicated index. `path` is drive-relative with '/' separators. The device in
-// `modified_by` signs the record (record_signed_bytes); relays pass it on unchanged.
+// `signer` signs the record (record_signed_bytes); relays pass it on unchanged. The signer is
+// the author in `modified_by`, except for a record of a removed device adopted by a member.
 struct FileRecord {
     std::string path;
     std::uint64_t size = 0;
@@ -32,6 +33,7 @@ struct FileRecord {
     std::uint64_t hlc = 0;
     VersionVector version;
     std::uint64_t modified_by = 0;
+    std::uint64_t signer = 0;
     std::uint32_t block_size = 0;
     Chunking chunking = Chunking::fixed;
     bool deleted = false;
@@ -60,7 +62,7 @@ Status validate(const FileRecord& record);
 std::string conflict_copy_path(std::string_view path, std::int64_t mtime_ns, std::uint64_t device);
 
 // The bytes the author's signature covers: a context string, the drive ID, the signed path
-// (origin_path if set, else path), and every replicated field except sequence.
+// (origin_path if set, else path), and every replicated field except sequence, signer included.
 Bytes record_signed_bytes(const DriveId& drive, const FileRecord& record);
 
 }  // namespace ghostdrive::core

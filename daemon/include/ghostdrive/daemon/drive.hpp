@@ -54,6 +54,7 @@ struct RendezvousConfig {
 struct MembershipChange {
     std::vector<core::PublicKey> unpinned;
     std::vector<core::PublicKey> pinned;
+    std::vector<core::PublicKey> retired;  // signers retired by this change
 };
 
 // One device's membership of one drive: identity, secret, index, chunks and peer addresses.
@@ -84,9 +85,8 @@ public:
     // Not thread-safe; the daemon uses it from its I/O executor only.
     Membership& membership() noexcept { return membership_; }
     core::Status save_membership();
-    // Brings the pinned devices in the index in line with the membership view. Unpinned
-    // devices' keys are retired as signers and their records adopted; pinning a device resets
-    // every peer's index progress.
+    // Brings the pinned devices in the index in line with the membership view. Keys of devices
+    // removed for good are retired as signers and their records adopted.
     core::Result<MembershipChange> apply_membership();
     // The same, from the I/O executor only.
     DiscoveryKeys& discovery_keys() noexcept { return discovery_keys_; }
@@ -108,6 +108,10 @@ public:
     ~Drive();
 
 private:
+    // Retires the signer keys of devices removed for good; also run on open, so a crash
+    // between a removal and its retirement is repaired.
+    core::Status retire_removed(std::vector<core::PublicKey>* newly);
+
     DrivePaths paths_;
     std::unique_ptr<core::DeviceKey> key_;
     DriveId drive_id_;

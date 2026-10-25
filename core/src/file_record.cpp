@@ -104,6 +104,7 @@ Bytes record_signed_bytes(const DriveId& drive, const FileRecord& record) {
     put(record.hlc, 8);
     out.insert(out.end(), version.begin(), version.end());
     put(record.modified_by, 8);
+    put(record.signer, 8);
     put(record.block_size, 4);
     put(static_cast<std::uint8_t>(record.chunking), 1);
     put(record.deleted ? 1 : 0, 1);

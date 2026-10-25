@@ -110,7 +110,7 @@ protected:
             addr.address().to_string() + ":" + std::to_string(addr.port())));
         drive_b_ = std::move(drive).value();
         b_ = std::make_unique<Service>(io_.get_executor(), disk_.get_executor(), *drive_b_,
-                                       loopback_options());
+                                       options());
         ASSERT_TRUE(b_->start());
         ASSERT_TRUE(drain([&] {
             return a_->connected_to(drive_b_->key().public_key()) &&
@@ -137,7 +137,7 @@ protected:
 
     std::unique_ptr<Service> start_service(Drive& drive) {
         auto service = std::make_unique<Service>(io_.get_executor(), disk_.get_executor(), drive,
-                                                 loopback_options());
+                                                 options());
         EXPECT_TRUE(service->start());
         return service;
     }
@@ -193,6 +193,13 @@ protected:
     std::unique_ptr<Service> b_;
     std::unique_ptr<Service> c_;
     std::unique_ptr<Service> d_;
+    std::chrono::milliseconds countersign_after_ = loopback_options().countersign_after;
+
+    ServiceOptions options() const {
+        auto o = loopback_options();
+        o.countersign_after = countersign_after_;
+        return o;
+    }
 };
 
 TEST_F(TwoDevices, JoinedDeviceSharesTheDriveSecret) {
@@ -423,6 +430,7 @@ TEST_F(TwoDevices, ForgedRecordsFromAMemberAreDropped) {
     const auto a_id = core::short_id(drive_a_->key().public_key());
     const auto& drive = drive_a_->drive_id();
     auto sign_as_c = [&](core::FileRecord r) {
+        r.signer = core::short_id(c);
         r.signature = drive_c_->key().sign(core::record_signed_bytes(drive, r)).value();
         return r;
     };
@@ -492,8 +500,75 @@ TEST_F(TwoDevices, ForgedRecordsFromAMemberAreDropped) {
     endpoint->close();
 }
 
-TEST_F(TwoDevices, ANewMemberReadsTheFilesOfARemovedDevice) {
+TEST_F(TwoDevices, RecordsByADeviceNotKnownYetAreFetchedAgain) {
     start_a();
+    start_b();
+    join_by_invite("c", drive_c_);
+    ASSERT_TRUE(drive_c_);
+    const auto c = drive_c_->key().public_key();
+    ASSERT_TRUE(drain([&] { return drive_b_->index().is_pinned(c).value(); }));
+    // E is not a member yet: the membership entries adding it can lag behind its records.
+    auto e_key = Drive::load_or_create_key(dir_.path() / "e").value();
+    const auto& drive = drive_a_->drive_id();
+    auto make = [&](const core::DeviceKey& key, const char* path, std::uint64_t sequence) {
+        core::FileRecord r;
+        r.path = path;
+        r.modified_by = r.signer = core::short_id(key.public_key());
+        r.version.bump(r.modified_by);
+        r.hlc = drive_c_->clock().now();
+        r.sequence = sequence;
+        r.signature = key.sign(core::record_signed_bytes(drive, r)).value();
+        return r;
+    };
+    std::vector<IndexEntry> batch{{make(e_key, "from-e.txt", 1), false},
+                                  {make(drive_c_->key(), "from-c.txt", 2), false}};
+
+    auto endpoint = transport::Endpoint::create(io_.get_executor(), drive_c_->key(), {}).value();
+    std::optional<bool> sent;
+    std::shared_ptr<transport::Connection> held;
+    asio::co_spawn(
+        io_,
+        [&]() -> asio::awaitable<void> {
+            auto conn = co_await endpoint->connect(
+                asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), b_->port()),
+                drive_b_->key().public_key());
+            if (!conn) {
+                sent = false;
+                co_return;
+            }
+            held = conn.value();
+            auto stream = co_await conn.value()->open_stream();
+            if (!stream || !co_await stream.value()->write(encode_hello(Hello{7, 2})) ||
+                !co_await transport::wire::read_frame(*stream.value(), 64)) {
+                sent = false;
+                co_return;
+            }
+            sent = static_cast<bool>(co_await stream.value()->write(encode_index_batch(batch)));
+        },
+        asio::detached);
+    ASSERT_TRUE(drain([&] { return sent.has_value(); }));
+    ASSERT_TRUE(*sent);
+    ASSERT_TRUE(
+        drain([&] { return b_->filesystem().lookup(vfs::kRootIno, "from-c.txt").has_value(); }));
+    EXPECT_FALSE(drive_b_->index().get("from-e.txt").value().has_value());
+    // B's progress stops before E's record, so the next exchange sends it again.
+    auto devices = drive_b_->index().devices();
+    ASSERT_TRUE(devices);
+    for (const auto& d : devices.value()) {
+        if (d.key == c) EXPECT_EQ(d.peer_max_sequence, 0u);
+    }
+
+    // When E is pinned, B drops the connection so the records come again.
+    join_by_invite("e", drive_d_);
+    ASSERT_TRUE(drain([&] { return drive_b_->index().is_pinned(e_key.public_key()).value(); }));
+    EXPECT_TRUE(drain([&] { return !held->is_open(); }));
+    endpoint->close();
+}
+
+TEST_F(TwoDevices, ANewMemberReadsTheFilesOfARemovedDevice) {
+    // A removal counts for good, and records are adopted, once it has stood this long.
+    countersign_after_ = 1s;
+    start_a(options());
     start_b();
     start_c();
     auto c = drive_c_->key().public_key();
@@ -512,12 +587,12 @@ TEST_F(TwoDevices, ANewMemberReadsTheFilesOfARemovedDevice) {
     ASSERT_TRUE(a_->remove_member("c"));
     ASSERT_TRUE(drain([&] { return !drive_b_->index().is_pinned(c).value(); }));
     c_->stop();
-    // Both remaining members adopt C's record.
+    // Both remaining members adopt C's record once its removal stands.
     const auto c_id = core::short_id(c);
     ASSERT_TRUE(drain([&] {
         auto at_a = drive_a_->index().get("from-c.bin").value();
         auto at_b = drive_b_->index().get("from-c.bin").value();
-        return at_a && at_b && at_a->modified_by != c_id && at_b->modified_by != c_id;
+        return at_a && at_b && at_a->signer != c_id && at_b->signer != c_id;
     }));
 
     // D joins after the removal and never learns C's key.

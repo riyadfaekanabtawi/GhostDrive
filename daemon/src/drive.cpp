@@ -358,6 +358,7 @@ core::Result<std::unique_ptr<Drive>> Drive::open(const std::filesystem::path& ro
     } else if (keys.error().code != Errc::not_found) {
         return keys.error();
     }
+    if (auto st = opened.retire_removed(nullptr); !st) return st.error();
     return drive;
 }
 
@@ -377,14 +378,11 @@ core::Result<MembershipChange> Drive::apply_membership() {
     auto devices = index_.devices();
     if (!devices) return devices.error();
     MembershipChange change;
+    // Before unpinning, so a crash in between never leaves a removed key accepted.
+    if (auto st = retire_removed(&change.retired); !st) return st.error();
     for (const auto& device : devices.value()) {
         if (view.members.contains(device.key)) continue;
         if (auto st = index_.remove_device(device.key); !st) return st.error();
-        // Its records stay readable here and are adopted, so devices that never knew its key
-        // can verify them.
-        if (auto adopted = index_.retire_signer(device.key, clock_); !adopted) {
-            return adopted.error();
-        }
         change.unpinned.push_back(device.key);
     }
     for (const auto& [key, name] : view.members) {
@@ -396,17 +394,21 @@ core::Result<MembershipChange> Drive::apply_membership() {
         if (!st && st.error().code != Errc::already_exists) return st.error();
         if (st) change.pinned.push_back(key);
     }
-    if (!change.pinned.empty()) {
-        // Records signed by the new keys may have been rejected already, when they arrived
-        // before the membership entries did: fetch every peer's index again from the start.
-        // Records already stored compare equal and are not verified again.
-        auto all = index_.devices();
-        if (!all) return all.error();
-        for (const auto& device : all.value()) {
-            if (auto st = index_.set_peer_progress(device.key, 0, 0); !st) return st.error();
-        }
-    }
     return change;
+}
+
+Status Drive::retire_removed(std::vector<core::PublicKey>* newly) {
+    // Only devices removed for good: one merely in doubt, or whose removal may still be
+    // undone, must not have its records rewritten.
+    auto view = membership_.view();
+    for (const auto& key : view.removed) {
+        if (view.removal_pending.contains(key)) continue;
+        const auto id = core::short_id(key);
+        if (index_.is_retired_signer(id)) continue;
+        if (auto adopted = index_.retire_signer(key); !adopted) return adopted.error();
+        if (newly && index_.is_retired_signer(id)) newly->push_back(key);
+    }
+    return {};
 }
 
 std::map<core::PublicKey, std::string> Drive::peer_addresses() const {

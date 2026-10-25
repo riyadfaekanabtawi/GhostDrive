@@ -173,7 +173,7 @@ TEST(Drive, OpenRefusesADataDirectoryOthersCanRead) {
     EXPECT_EQ(opened.error().code, core::Errc::permission);
 }
 
-TEST(Drive, PinningANewSignerRestartsIndexExchangeAndRemovalRetiresIt) {
+TEST(Drive, PinningADeviceLeavesOtherPeersProgressAlone) {
     test::TempDir dir;
     auto created = Drive::create(dir.path() / "a", "desk");
     ASSERT_TRUE(created);
@@ -186,7 +186,7 @@ TEST(Drive, PinningANewSignerRestartsIndexExchangeAndRemovalRetiresIt) {
     EXPECT_EQ(first.value().pinned, std::vector<core::PublicKey>{x});
     ASSERT_TRUE(drive.index().set_peer_progress(x, 5, 9));
 
-    // Records signed by y may have been skipped while y was unknown here.
+    // A member minting keys must not make everyone fetch every index again.
     ASSERT_TRUE(drive.membership().add(drive.key(), y, "y", false));
     auto second = drive.apply_membership();
     ASSERT_TRUE(second);
@@ -195,16 +195,57 @@ TEST(Drive, PinningANewSignerRestartsIndexExchangeAndRemovalRetiresIt) {
     ASSERT_TRUE(devices);
     ASSERT_EQ(devices.value().size(), 2u);
     for (const auto& d : devices.value()) {
-        EXPECT_EQ(d.peer_index_id, 0u);
-        EXPECT_EQ(d.peer_max_sequence, 0u);
+        if (d.key != x) continue;
+        EXPECT_EQ(d.peer_index_id, 5u);
+        EXPECT_EQ(d.peer_max_sequence, 9u);
     }
+}
 
-    ASSERT_TRUE(drive.membership().remove(drive.key(), x));
-    auto third = drive.apply_membership();
-    ASSERT_TRUE(third);
-    EXPECT_EQ(third.value().unpinned, std::vector<core::PublicKey>{x});
-    EXPECT_FALSE(drive.index().is_active_signer(core::short_id(x)));
-    EXPECT_TRUE(drive.index().is_active_signer(core::short_id(y)));
+TEST(Drive, OnlyDevicesRemovedForGoodAreRetired) {
+    test::TempDir dir;
+    auto created = Drive::create(dir.path() / "a", "desk");
+    ASSERT_TRUE(created);
+    auto& drive = *created.value();
+    auto y_key = core::DeviceKey::generate().value();
+    auto y = y_key.public_key();
+    auto x = core::DeviceKey::generate().value().public_key();
+    ASSERT_TRUE(drive.membership().add(drive.key(), y, "y", false));
+    // Y vouches for X; nobody else does.
+    Membership by_y(drive.drive_id(), y);
+    ASSERT_TRUE(by_y.add(y_key, x, "x", false));
+    drive.membership().merge(by_y.entries());
+    ASSERT_TRUE(drive.apply_membership());
+    ASSERT_TRUE(drive.index().is_pinned(x).value());
+
+    // Removing Y leaves X out of the drive, unpinned, but not removed: its records stay.
+    ASSERT_TRUE(drive.membership().remove(drive.key(), y));
+    ASSERT_TRUE(drive.membership().countersign(drive.key()));  // removed for good
+    auto change = drive.apply_membership();
+    ASSERT_TRUE(change);
+    EXPECT_EQ(change.value().retired, std::vector<core::PublicKey>{y});
+    EXPECT_FALSE(drive.index().is_pinned(x).value());
+    EXPECT_TRUE(drive.index().is_retired_signer(core::short_id(y)));
+    EXPECT_FALSE(drive.index().is_retired_signer(core::short_id(x)));
+}
+
+TEST(Drive, OpeningRetiresDevicesRemovedBeforeACrash) {
+    test::TempDir dir;
+    auto root = dir.path() / "a";
+    auto y = core::DeviceKey::generate().value().public_key();
+    {
+        auto created = Drive::create(root, "desk");
+        ASSERT_TRUE(created);
+        auto& drive = *created.value();
+        ASSERT_TRUE(drive.membership().add(drive.key(), y, "y", false));
+        ASSERT_TRUE(drive.apply_membership());
+        // The removal is saved, but the daemon stops before applying it.
+        ASSERT_TRUE(drive.membership().remove(drive.key(), y));
+        ASSERT_TRUE(drive.membership().countersign(drive.key()));
+        ASSERT_TRUE(drive.save_membership());
+    }
+    auto opened = Drive::open(root);
+    ASSERT_TRUE(opened) << opened.error().message;
+    EXPECT_TRUE(opened.value()->index().is_retired_signer(core::short_id(y)));
 }
 
 }  // namespace

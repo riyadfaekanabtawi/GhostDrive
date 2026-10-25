@@ -693,6 +693,9 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
     auto request = encode_index_request(IndexRequest{after});
     if (!co_await stream->write(request)) co_return;
 
+    // Progress on this stream never passes a record that may still become valid (its signer
+    // is not known yet), so the next connection sends it again.
+    std::optional<std::uint64_t> cap;
     for (;;) {
         auto frame = co_await wire::read_frame(*stream);
         if (!*alive || !frame) co_return;
@@ -706,9 +709,10 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
             co_return;
         }
         if (!is_member(peer)) co_return;
-        bool unknown_signer = false;
+        bool pending = false;
+        const auto epoch = signer_epoch_;
         auto applied = co_await detail::run_on(
-            disk_, [drive, fs, peer, hello, &unknown_signer,
+            disk_, [drive, fs, peer, hello, &pending, &cap,
                     entries = std::move(entries).value()]() -> Status {
                 auto& index = drive->index();
                 std::uint64_t last = 0;
@@ -717,17 +721,15 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
                     // apply_remote validates the record (paths, block size, clocks) and its
                     // signature first.
                     auto outcome = index.apply_remote(e.record, drive->clock());
-                    if (!outcome && outcome.error().code != Errc::invalid_argument) {
+                    if (!outcome && outcome.error().code == Errc::not_found) {
+                        pending = true;
+                        if (!cap) cap = e.record.sequence - 1;
+                    } else if (!outcome && outcome.error().code != Errc::invalid_argument) {
                         // A database failure: stop here so the next exchange resends this record.
                         failure = outcome.error();
                         break;
                     }
-                    // A rejected record is skipped for good, except one by a device not pinned
-                    // yet: pinning that device resets the progress and closes this connection,
-                    // so the next one sends the record again.
-                    if (!outcome && !index.is_active_signer(e.record.modified_by)) {
-                        unknown_signer = true;
-                    }
+                    // Any other rejected record will never become valid; skip past it.
                     last = std::max(last, e.record.sequence);
                     if (!outcome || !e.sender_holds || e.record.deleted) continue;
                     // Only believe "I hold these chunks" for the version we now store, so a
@@ -738,8 +740,9 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
                     }
                     for (const auto& id : e.record.chunks) (void)index.set_holds(peer, id, true);
                 }
-                if (last > 0) {
-                    if (auto st = index.set_peer_progress(peer, hello.index_id, last); !st) {
+                const std::uint64_t progress = cap ? std::min(last, *cap) : last;
+                if (progress > 0) {
+                    if (auto st = index.set_peer_progress(peer, hello.index_id, progress); !st) {
                         return st;
                     }
                 }
@@ -749,7 +752,15 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
                 return {};
             });
         if (!*alive) co_return;
-        if (unknown_signer && conn->is_open()) unknown_signer_conns_.insert(conn);
+        if (pending && conn->is_open()) {
+            // A device pinned or retired while the batch was applied may make those records
+            // valid already; otherwise wait for one.
+            if (signer_epoch_ != epoch) {
+                conn->close();
+            } else {
+                unknown_signer_conns_.insert(conn);
+            }
+        }
         if (!applied) {
             conn->close();  // resume from the stored progress on the next connection
             co_return;
@@ -861,7 +872,8 @@ Status Service::refresh_membership(bool changed) {
     if (auto st = drive_.save_membership(); !st) return st;
     auto applied = drive_.apply_membership();
     if (!applied) return applied.error();
-    if (!applied.value().pinned.empty()) {
+    if (!applied.value().pinned.empty() || !applied.value().retired.empty()) {
+        ++signer_epoch_;
         auto stale = std::move(unknown_signer_conns_);
         unknown_signer_conns_.clear();
         for (const auto& conn : stale) conn->close();
