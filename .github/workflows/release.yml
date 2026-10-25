@@ -158,8 +158,8 @@ jobs:
       # The programs must start from a folder of their own with nothing but Windows: every DLL
       # they import (not counting the delay-loaded WinFsp DLL) has to be a system DLL, and none
       # may be the Visual C++ runtime. The desktop app in app\ may also import DLLs that it
-      # carries in app\ (the .NET and Windows App SDK runtimes), but no Visual C++ runtime from
-      # the system. Then the app is started from the zip's layout against a --no-mount daemon,
+      # carries in app\ (the .NET and Windows App SDK runtimes) and the UCRT that Windows 10
+      # includes, but no Visual C++ runtime from the system. Then the app is started from the zip's layout against a --no-mount daemon,
       # which proves it found ..\ghostdrive.exe, and closed through its window.
       - name: Check the zip runs from a clean folder
         run: |
@@ -212,8 +212,9 @@ jobs:
             foreach ($dll in $dlls) {
               $name = $dll.ToLowerInvariant()
               if ($bundled.ContainsKey($name)) { continue }
-              # API sets are resolved by the loader, not files; the UCRT is part of Windows 10.
-              if ($name -match '^(api-ms-win-|ext-ms-)' -and $name -notmatch '^api-ms-win-crt-') { continue }
+              # API sets are resolved by the loader, not files. That includes the UCRT's
+              # (api-ms-win-crt-*), which the .NET runtime uses: it is part of Windows 10.
+              if ($name -match '^(api-ms-win-|ext-ms-)' -or $name -eq 'ucrtbase.dll') { continue }
               if ($name -match '^(vcruntime|msvcp|concrt|vccorlib)' -or -not (Test-Path (Join-Path $env:SystemRoot "System32\$dll"))) {
                 throw "app\$($pe.Name) needs $dll, which is neither in app\ nor part of Windows"
               }
