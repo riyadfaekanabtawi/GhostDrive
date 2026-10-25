@@ -31,15 +31,21 @@ if(APPLE)
         PROPERTIES LABELS integration TIMEOUT 60 ENVIRONMENT "MallocScribble=1")
 endif()
 
-# End to end with the real binaries: two daemons, two FUSE mounts on this machine.
-if(TARGET ghostdrive_vfs_fuse)
+# End to end with the real binaries: two daemons, two FUSE or WinFsp mounts on this machine.
+# On Windows the scripts run in Git Bash (not the WSL bash.exe in System32).
+set(e2e_shell)
+if(WIN32)
+    find_program(GHOSTDRIVE_GIT_BASH bash PATHS "$ENV{ProgramFiles}/Git/bin" NO_DEFAULT_PATH)
+    set(e2e_shell ${GHOSTDRIVE_GIT_BASH})
+endif()
+if(TARGET ghostdrive_vfs_fuse OR (TARGET ghostdrive_vfs_winfsp AND GHOSTDRIVE_GIT_BASH))
     add_test(NAME e2e.two_devices
-        COMMAND ${PROJECT_SOURCE_DIR}/tests/e2e/two_devices.sh ${PROJECT_BINARY_DIR}
+        COMMAND ${e2e_shell} ${PROJECT_SOURCE_DIR}/tests/e2e/two_devices.sh ${PROJECT_BINARY_DIR}
                 ${CMAKE_CURRENT_BINARY_DIR}/e2e)
     set_tests_properties(e2e.two_devices PROPERTIES
         LABELS "e2e;mount" RUN_SERIAL TRUE TIMEOUT 180 PASS_REGULAR_EXPRESSION "PASS")
     add_test(NAME e2e.via_rendezvous
-        COMMAND ${PROJECT_SOURCE_DIR}/tests/e2e/via_rendezvous.sh ${PROJECT_BINARY_DIR}
+        COMMAND ${e2e_shell} ${PROJECT_SOURCE_DIR}/tests/e2e/via_rendezvous.sh ${PROJECT_BINARY_DIR}
                 ${CMAKE_CURRENT_BINARY_DIR}/e2e-rendezvous)
     set_tests_properties(e2e.via_rendezvous PROPERTIES
         LABELS "e2e;mount" RUN_SERIAL TRUE TIMEOUT 180 PASS_REGULAR_EXPRESSION "PASS")

@@ -31,3 +31,19 @@ if(TARGET ghostdrive_vfs_fuse)
     gtest_discover_tests(ghostdrive_mount_tests DISCOVERY_TIMEOUT 30
         PROPERTIES LABELS mount RUN_SERIAL TRUE TIMEOUT 120)
 endif()
+
+if(TARGET ghostdrive_vfs_winfsp)
+    add_executable(ghostdrive_winfsp_tests winfsp_mount_test.cpp)
+    target_include_directories(ghostdrive_winfsp_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/tests)
+    target_link_libraries(ghostdrive_winfsp_tests
+        PRIVATE
+            ghostdrive::vfs_winfsp
+            GTest::gtest_main
+            ghostdrive_warnings
+    )
+    target_compile_definitions(ghostdrive_winfsp_tests
+        PRIVATE GHOSTDRIVE_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}/tmp")
+    # Real mounts through the WinFsp driver: run serially, and skip with `ctest -LE mount`.
+    gtest_discover_tests(ghostdrive_winfsp_tests DISCOVERY_TIMEOUT 30
+        PROPERTIES LABELS mount RUN_SERIAL TRUE TIMEOUT 120)
+endif()
