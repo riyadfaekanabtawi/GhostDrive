@@ -10,6 +10,7 @@ GD="$BIN/cli/ghostdrive"
 GDD="$BIN/daemon/ghostdrived"
 A="$WORK/a" B="$WORK/b" MA="$WORK/mnt-a" MB="$WORK/mnt-b"
 PIDS=()
+source "$(dirname "$0")/lib.sh"
 
 cleanup() {
     [ -n "${RDV:-}" ] && kill "$RDV" 2>/dev/null
@@ -32,25 +33,28 @@ wait_for() {
 }
 
 rm -rf "$WORK" && mkdir -p "$WORK"
-"$BIN/rendezvous/ghostdrive-rendezvous" --key "$WORK/server.key" --port 47320 >"$WORK/server.log" 2>&1 &
+# Port 0: the server binds a port the system picks and prints it.
+"$BIN/rendezvous/ghostdrive-rendezvous" --key "$WORK/server.key" --port 0 >"$WORK/server.log" 2>&1 &
 RDV=$!
 wait_for 10 grep -q Fingerprint "$WORK/server.log" || fail "rendezvous server did not start"
 FPR=$(awk '/^Fingerprint:/{print $2}' "$WORK/server.log")
+RDV_PORT=$(awk '/listening on UDP port/{print $NF}' "$WORK/server.log")
 "$GD" init --data "$A" --name desk >/dev/null || fail "init"
-"$GD" rendezvous 127.0.0.1:47320 "$FPR" --data "$A" >/dev/null || fail "set rendezvous"
-"$GDD" --data "$A" --mount "$MA" --port 47331 --no-lan >"$WORK/a.log" 2>&1 &
-PIDS+=($!)
-wait_for 10 "$GD" status --data "$A" || fail "daemon A did not start"
+"$GD" rendezvous 127.0.0.1:"$RDV_PORT" "$FPR" --data "$A" >/dev/null || fail "set rendezvous"
+start_daemon_any_port "$A" "$MA" "$WORK/a.log" --no-lan || fail "daemon A did not start"
+PORT_A=$PORT
 
 CODE=$("$GD" invite --data "$A" | grep -o 'gd1-[A-Z0-9-]*') || fail "invite"
-"$GD" join "$CODE" --data "$B" --name laptop --port 47332 || fail "join"
-"$GD" rendezvous --data "$B" | grep -q 47320 || fail "the invite did not carry the rendezvous setting"
+PORT_B=$(free_port) || fail "no free UDP port"
+"$GD" join "$CODE" --data "$B" --name laptop --port "$PORT_B" || fail "join"
+"$GD" rendezvous --data "$B" | grep -q ":$RDV_PORT" || fail "the invite did not carry the rendezvous setting"
 # Kill the address learned from the invite: only the rendezvous can connect the devices now.
-sed -i '' -E 's/ [0-9.]+:47331$/ 127.0.0.1:9/' "$B/peers"
-"$GDD" --data "$B" --mount "$MB" --port 47332 --no-lan >"$WORK/b.log" 2>&1 &
+sed -i '' -E "s/ [0-9.]+:$PORT_A\$/ 127.0.0.1:9/" "$B/peers"
+grep -q " 127.0.0.1:9$" "$B/peers" || fail "could not replace A's address in B's peers"
+"$GDD" --data "$B" --mount "$MB" --port "$PORT_B" --no-lan >"$WORK/b.log" 2>&1 &
 PIDS+=($!)
 wait_for 20 sh -c "'$GD' status --data '$B' | grep -q 'online   desk'" || fail "B never connected to A"
-"$GD" status --data "$B" | grep -q "Rendezvous: 127.0.0.1:47320 (connected" || fail "B is not registered with the server"
+"$GD" status --data "$B" | grep -q "Rendezvous: 127.0.0.1:$RDV_PORT (connected" || fail "B is not registered with the server"
 
 echo "hello from the desk" >"$MA/greeting.txt" || fail "write through A's mount"
 head -c 3000000 /dev/urandom >"$WORK/big.bin"
