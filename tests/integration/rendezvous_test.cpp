@@ -527,8 +527,6 @@ TEST_F(RelayRules, TheServerForwardsOnlyWithinTheGroupRules) {
 TEST_F(RelayRules, BudgetsCountWholeFramesPerSenderAndPerReceiver) {
     // Budgets that do not refill during the test: the sender's covers 7 frames of 132 bytes,
     // the receiver's 11, so a second sender gets only the receiver's remaining 4 through.
-    // The fixture's server is replaced; its accept loop must have started before it goes.
-    drain([] { return false; }, 50ms);
     server_->stop();
     rendezvous::ServerOptions options;
     options.listen = asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0);
@@ -707,6 +705,23 @@ TEST_F(Rendezvous, AllowListedServersServeOnlyTheirGroups) {
     EXPECT_FALSE(try_register(theirs, theirs));
     EXPECT_FALSE(try_register(mine, theirs)) << "admission, not the group, is checked";
     server->stop();
+}
+
+TEST(RendezvousServer, CanBeDestroyedBeforeItsExecutorRuns) {
+    // The accept loop is spawned in start() but first runs inside run(), after the server is
+    // gone. The ".scribbled" ctest entry runs this with MallocScribble so a read of the freed
+    // server crashes instead of passing by luck.
+    asio::io_context io;
+    auto key = core::DeviceKey::generate().value();
+    for (int i = 0; i < 8; ++i) {
+        rendezvous::ServerOptions options;
+        options.listen = asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0);
+        auto server = rendezvous::Server::start(io.get_executor(), key, options);
+        ASSERT_TRUE(server.ok());
+        server.value().reset();
+    }
+    io.run_for(500ms);
+    EXPECT_TRUE(io.stopped()) << "work outlived the destroyed servers";
 }
 
 }  // namespace

@@ -21,6 +21,16 @@ target_compile_definitions(ghostdrive_integration_tests
 gtest_discover_tests(ghostdrive_integration_tests DISCOVERY_TIMEOUT 30
     PROPERTIES LABELS integration TIMEOUT 120)
 
+# macOS fills freed memory with 0x55 under MallocScribble, so a coroutine that reads a destroyed
+# object dereferences garbage and crashes rather than reading stale but intact bytes.
+if(APPLE)
+    add_test(NAME RendezvousServer.CanBeDestroyedBeforeItsExecutorRuns.scribbled
+        COMMAND ghostdrive_integration_tests
+                --gtest_filter=RendezvousServer.CanBeDestroyedBeforeItsExecutorRuns)
+    set_tests_properties(RendezvousServer.CanBeDestroyedBeforeItsExecutorRuns.scribbled
+        PROPERTIES LABELS integration TIMEOUT 60 ENVIRONMENT "MallocScribble=1")
+endif()
+
 # End to end with the real binaries: two daemons, two FUSE mounts on this machine.
 if(TARGET ghostdrive_vfs_fuse)
     add_test(NAME e2e.two_devices

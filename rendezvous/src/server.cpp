@@ -101,7 +101,8 @@ core::Result<std::unique_ptr<Server>> Server::start(asio::any_io_executor execut
     auto endpoint = transport::Endpoint::create(executor, key, endpoint_options);
     if (!endpoint) return endpoint.error();
     server->endpoint_ = std::move(endpoint).value();
-    asio::co_spawn(executor, server->accept_loop(), asio::detached);
+    asio::co_spawn(executor, server->accept_loop(server->alive_, server->endpoint_),
+                   asio::detached);
     return server;
 }
 
@@ -115,10 +116,13 @@ void Server::stop() {
     if (endpoint_) endpoint_->close();
 }
 
-asio::awaitable<void> Server::accept_loop() {
-    auto alive = alive_;
-    auto endpoint = endpoint_;
+// The guard and endpoint are parameters, copied into the frame at the call: the body first runs
+// on the executor, possibly after the server is gone, so it must not read members before the
+// alive check.
+asio::awaitable<void> Server::accept_loop(std::shared_ptr<bool> alive,
+                                          std::shared_ptr<transport::Endpoint> endpoint) {
     for (;;) {
+        if (!*alive) co_return;
         auto conn = co_await endpoint->accept();
         if (!*alive || !conn) co_return;
         auto ip = ip_bucket(conn.value()->remote_endpoint().address());
@@ -127,12 +131,17 @@ asio::awaitable<void> Server::accept_loop() {
             continue;
         }
         ++per_ip_[ip];
-        asio::co_spawn(executor_, serve(std::move(conn).value()), asio::detached);
+        asio::co_spawn(executor_, serve(alive, std::move(conn).value()), asio::detached);
     }
 }
 
-asio::awaitable<void> Server::serve(std::shared_ptr<transport::Connection> conn) {
-    auto alive = alive_;
+// Spawned, so it too may first run after the server is gone.
+asio::awaitable<void> Server::serve(std::shared_ptr<bool> alive,
+                                    std::shared_ptr<transport::Connection> conn) {
+    if (!*alive) {
+        conn->close();
+        co_return;
+    }
     auto ip = ip_bucket(conn->remote_endpoint().address());
     auto client = std::make_shared<Client>();
     client->key = conn->peer_key();
