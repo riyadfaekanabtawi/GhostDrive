@@ -203,7 +203,7 @@ jobs:
 
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: 8.0.x
+          global-json-file: windows/GhostDriveApp/global.json
 
       - name: Test GhostDriveApp.Core
         working-directory: windows/GhostDriveApp
@@ -216,6 +216,26 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $files = Get-ChildItem -Recurse -File "$env:RUNNER_TEMP\GhostDriveApp"
           "{0} files, {1:N1} MB" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: Measure publish variants (temporary)
+        working-directory: windows/GhostDriveApp
+        run: |
+          $variants = [ordered]@{
+            'untrimmed, all languages' = @('-p:PublishTrimmed=false', '-p:SatelliteResourceLanguages=')
+            'untrimmed, en' = @('-p:PublishTrimmed=false')
+            'trimmed, en' = @()
+            'trimmed, en, ReadyToRun' = @('-p:PublishReadyToRun=true')
+          }
+          $i = 0
+          foreach ($v in $variants.GetEnumerator()) {
+            $out = "$env:RUNNER_TEMP\variant$i"; $i++
+            dotnet publish GhostDriveApp -c Release -o $out @($v.Value) | Out-Null
+            if ($LASTEXITCODE) { "$($v.Key): publish failed"; continue }
+            $files = Get-ChildItem -Recurse -File $out
+            Compress-Archive -Path "$out\*" -DestinationPath "$out.zip"
+            "{0}: {1} files, {2:N1} MB, zipped {3:N1} MB" -f $v.Key, $files.Count,
+              (($files | Measure-Object Length -Sum).Sum / 1MB), ((Get-Item "$out.zip").Length / 1MB)
+          }
 
       # ghostdrive.exe and ghostdrived.exe for the UI check, from the windows preset with the
       # vcpkg tree the windows job caches (restored only; that job saves it).

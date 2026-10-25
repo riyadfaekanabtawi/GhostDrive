@@ -19,8 +19,9 @@ public static class Commands
     public static IReadOnlyList<string> Invite(AppSettings s, int seconds = InviteSeconds) =>
         WithData(s, "invite", "--ttl", seconds.ToString(System.Globalization.CultureInfo.InvariantCulture));
 
-    // By ID: two devices can share a name, and an ID names exactly one.
-    public static IReadOnlyList<string> Remove(AppSettings s, string id) =>
+    // By ID: two devices can share a name, and an ID names exactly one. Internal: only
+    // RemoveFlow, after a confirmation, builds this command.
+    internal static IReadOnlyList<string> Remove(AppSettings s, string id) =>
         WithData(s, "remove", Positional(id));
 
     public static IReadOnlyList<string> Stop(AppSettings s) => WithData(s, "stop");

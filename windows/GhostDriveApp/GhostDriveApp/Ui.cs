@@ -45,18 +45,20 @@ internal static class Ui
         using var _ = Process.Start(info);
     }
 
-    public static async Task<bool> ConfirmAsync(XamlRoot root, string title, string text,
-        string confirm)
+    // Only the Remove button confirms. The default button is Cancel, so Enter cancels, and
+    // Escape or closing the dialog give ContentDialogResult.None, which is Cancelled too.
+    public static async Task<DialogAnswer> ConfirmAsync(XamlRoot root, RemoveFlow.Prompt prompt)
     {
         var dialog = new ContentDialog
         {
             XamlRoot = root,
-            Title = title,
-            Content = new TextBlock { Text = text, TextWrapping = TextWrapping.Wrap },
-            PrimaryButtonText = confirm,
-            CloseButtonText = "Cancel",
-            DefaultButton = ContentDialogButton.Close,
+            Title = prompt.Title,
+            Content = new TextBlock { Text = prompt.Text, TextWrapping = TextWrapping.Wrap },
+            PrimaryButtonText = prompt.ConfirmText,
+            CloseButtonText = prompt.CancelText,
+            DefaultButton = prompt.ConfirmIsDefault ? ContentDialogButton.Primary : ContentDialogButton.Close,
         };
-        return await dialog.ShowAsync() == ContentDialogResult.Primary;
+        var result = await dialog.ShowAsync();
+        return result == ContentDialogResult.Primary ? DialogAnswer.Confirmed : DialogAnswer.Cancelled;
     }
 }

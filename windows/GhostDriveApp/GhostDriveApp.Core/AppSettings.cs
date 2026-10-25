@@ -23,8 +23,6 @@ public sealed record AppSettings
         return string.IsNullOrEmpty(t) ? null : t;
     }
 
-    private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
-
     public static string DefaultFile(Func<string, string?> environment)
     {
         var local = environment("LOCALAPPDATA");
@@ -42,7 +40,7 @@ public sealed record AppSettings
         try
         {
             if (!File.Exists(file)) return new AppSettings();
-            var parsed = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(file), Options);
+            var parsed = JsonSerializer.Deserialize(File.ReadAllText(file), SettingsJson.Default.AppSettings);
             return parsed is null
                 ? new AppSettings()
                 : parsed with
@@ -64,7 +62,14 @@ public sealed record AppSettings
         var dir = Path.GetDirectoryName(file);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
         var temp = file + ".tmp";
-        File.WriteAllText(temp, JsonSerializer.Serialize(this, Options));
+        File.WriteAllText(temp, JsonSerializer.Serialize(this, SettingsJson.Default.AppSettings));
         File.Move(temp, file, overwrite: true);
     }
+}
+
+// Source-generated serialization, so the trimmed app needs no reflection.
+[JsonSerializable(typeof(AppSettings))]
+[JsonSourceGenerationOptions(WriteIndented = true)]
+internal sealed partial class SettingsJson : JsonSerializerContext
+{
 }

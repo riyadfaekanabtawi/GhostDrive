@@ -97,30 +97,27 @@ public sealed partial class DevicesView : UserControl, IPage
         return grid;
     }
 
+    // The remove command runs only from RemoveFlow's confirmed path (GhostDriveApp.Core).
     private async Task RemoveAsync(PeerStatus peer, Button button)
     {
         if (model is null || removing) return;
-        var confirmed = await Ui.ConfirmAsync(XamlRoot, $"Remove {peer.Name}?",
-            $"{peer.Name} will be taken out of the drive for good, on every device. Use this for a lost or stolen device. " +
-            "To use it again, it needs a new identity and a new invite.",
-            "Remove");
-        if (!confirmed) return;
         removing = true;
         button.IsEnabled = false;
         Ui.Hide(Result);
         try
         {
-            var output = await model.RunAsync(Commands.Remove(model.Settings, peer.Id), TimeSpan.FromSeconds(30));
-            if (output.Succeeded)
+            var outcome = await RemoveFlow.RunAsync(peer, model.Settings,
+                prompt => Ui.ConfirmAsync(XamlRoot, prompt),
+                args => model.RunAsync(args, TimeSpan.FromSeconds(30)));
+            if (!outcome.Ran) return;
+            if (outcome.Succeeded)
             {
-                // The CLI's own text, including any devices the removed one added.
-                var lines = DisplayText.Lines(output.Stdout, maxLines: 12, maxLength: 300);
-                Ui.Show(Result, lines.Count > 1 ? InfoBarSeverity.Warning : InfoBarSeverity.Success,
-                    string.Join(Environment.NewLine, lines), "Removed");
+                Ui.Show(Result, outcome.HasHint ? InfoBarSeverity.Warning : InfoBarSeverity.Success,
+                    outcome.Message, "Removed");
             }
             else
             {
-                Ui.Show(Result, InfoBarSeverity.Error, DisplayText.Failure(null, output), "Could not remove " + peer.Name);
+                Ui.Show(Result, InfoBarSeverity.Error, outcome.Message, "Could not remove " + peer.Name);
             }
             await model.RefreshAsync();
         }

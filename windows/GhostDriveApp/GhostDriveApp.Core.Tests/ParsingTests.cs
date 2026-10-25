@@ -280,6 +280,20 @@ public class LocationsTests
     }
 
     [Fact]
+    public void FindsTheCliAboveAnAppSubfolder()
+    {
+        // The release zip layout: ghostdrive.exe, and the app in app\.
+        var zip = Path.Combine("gd", "ghostdrive.exe");
+        var appDir = Path.Combine("gd", "app") + Path.DirectorySeparatorChar;  // as AppContext.BaseDirectory
+        Assert.Equal(zip, Locations.Cli(new AppSettings(), appDir, Exists(zip)).Path);
+        // One next to the app comes first.
+        var next = Path.Combine("gd", "app", "ghostdrive.exe");
+        Assert.Equal(next, Locations.Cli(new AppSettings(), appDir, Exists(zip, next)).Path);
+        // Only one level up.
+        Assert.Null(Locations.Cli(new AppSettings(), Path.Combine("gd", "app", "sub"), Exists(zip)).Path);
+    }
+
+    [Fact]
     public void TheSettingWins()
     {
         var settings = new AppSettings { CliPath = @"C:\tools\ghostdrive.exe" };

@@ -9,8 +9,9 @@ public static class Locations
     public const string CliName = "ghostdrive.exe";
     public const string DaemonName = "ghostdrived.exe";
 
-    // The ghostdrive.exe set in Settings, or else the one next to the app (the release zip
-    // layout). No PATH search: a ghostdrive.exe found there could be anyone's.
+    // The ghostdrive.exe set in Settings, or else the one next to the app, or else the one in
+    // the app folder's parent (the app in an app\ subfolder of the release zip). No PATH
+    // search: a ghostdrive.exe found there could be anyone's.
     public static Located Cli(AppSettings settings, string appDirectory, Func<string, bool> fileExists)
     {
         if (settings.CliOverride is { } configured)
@@ -23,11 +24,18 @@ public static class Locations
                 ? new Located(configured, null)
                 : new Located(null, $"The ghostdrive tool set in Settings does not exist: {DisplayText.Clean(configured, 160)}");
         }
-        var nextToApp = System.IO.Path.Combine(appDirectory, CliName);
-        return fileExists(nextToApp)
-            ? new Located(nextToApp, null)
-            : new Located(null,
-                $"{CliName} was not found next to the app. Keep the app in the GhostDrive folder, or set the tool's location in Settings.");
+        // AppContext.BaseDirectory ends with a separator, which GetDirectoryName would only strip.
+        var dir = System.IO.Path.TrimEndingDirectorySeparator(appDirectory);
+        var nextToApp = System.IO.Path.Combine(dir, CliName);
+        if (fileExists(nextToApp)) return new Located(nextToApp, null);
+        var parent = System.IO.Path.GetDirectoryName(dir);
+        if (!string.IsNullOrEmpty(parent))
+        {
+            var inParent = System.IO.Path.Combine(parent, CliName);
+            if (fileExists(inParent)) return new Located(inParent, null);
+        }
+        return new Located(null,
+            $"{CliName} was not found next to the app or in the folder above it. Keep the app in the GhostDrive folder, or set the tool's location in Settings.");
     }
 
     // ghostdrived.exe next to the ghostdrive.exe in use, or else in a build tree's daemon

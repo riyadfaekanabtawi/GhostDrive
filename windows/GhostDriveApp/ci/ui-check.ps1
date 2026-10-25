@@ -109,37 +109,103 @@ try {
             Set-Content -Encoding utf8 (Join-Path $settingsDir 'settings.json')
     }
 
-    # Starts the app on a page, optionally clicks a button by its name through UI Automation,
-    # saves a screenshot and closes the app.
-    function Show-Page([string] $page, [string] $shot, [string] $click = '') {
+    function Find-Named([System.Diagnostics.Process] $p, [string] $name) {
+        $p.Refresh()
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($p.MainWindowHandle)
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::NameProperty, $name)
+        return $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+    }
+
+    function Invoke-Named([System.Diagnostics.Process] $p, [string] $name) {
+        $e = Find-Named $p $name
+        if (-not $e) { throw "no element named '$name'" }
+        $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    }
+
+    function Start-App([string] $page) {
         $p = Start-Process -FilePath (Join-Path $App 'GhostDriveApp.exe') -ArgumentList '--page', $page -PassThru
         Start-Sleep -Seconds 12
-        if ($p.HasExited) { throw "GhostDriveApp exited on its own with code $($p.ExitCode) ($shot)" }
-        if ($click) {
-            try {
-                $p.Refresh()
-                $root = [System.Windows.Automation.AutomationElement]::FromHandle($p.MainWindowHandle)
-                $cond = New-Object System.Windows.Automation.PropertyCondition(
-                    [System.Windows.Automation.AutomationElement]::NameProperty, $click)
-                $button = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
-                $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-                Start-Sleep -Seconds 4
-            } catch {
-                Write-Warning "could not click '$click': $_"
-            }
-        }
-        Save-Window $p (Join-Path $OutDir "$shot.png")
-        Write-Host "saved $shot.png"
+        if ($p.HasExited) { throw "GhostDriveApp exited on its own with code $($p.ExitCode) (page $page)" }
+        return $p
+    }
+
+    function Stop-App([System.Diagnostics.Process] $p) {
+        if ($p.HasExited) { throw "GhostDriveApp exited on its own with code $($p.ExitCode)" }
         if (-not $p.CloseMainWindow() -or -not $p.WaitForExit(10000)) {
             Write-Warning "GhostDriveApp did not close; stopping it"
             $p.Kill()
         }
-        if ($p.ExitCode -ne 0 -and $p.ExitCode -ne -1) { Write-Warning "GhostDriveApp exit code $($p.ExitCode)" }
+    }
+
+    # Starts the app on a page, optionally clicks a button by its name through UI Automation,
+    # saves a screenshot and closes the app.
+    function Show-Page([string] $page, [string] $shot, [string] $click = '') {
+        $p = Start-App $page
+        try {
+            if ($click) {
+                try {
+                    Invoke-Named $p $click
+                    Start-Sleep -Seconds 4
+                } catch {
+                    Write-Warning "could not click '$click': $_"
+                }
+            }
+            Save-Window $p (Join-Path $OutDir "$shot.png")
+            Write-Host "saved $shot.png"
+        } finally {
+            Stop-App $p
+        }
+    }
+
+    # Opens the Remove dialog for ci-laptop and dismisses it with Escape, then with Cancel;
+    # afterwards the daemon must still list ci-laptop.
+    function Test-RemoveDialog {
+        $title = 'Remove ci-laptop?'
+        $p = Start-App devices
+        try {
+            Invoke-Named $p 'Remove'
+            Start-Sleep -Seconds 2
+            if (-not (Find-Named $p $title)) { throw 'the Remove dialog did not open' }
+            Save-Window $p (Join-Path $OutDir 'remove-dialog.png')
+            Write-Host 'saved remove-dialog.png'
+            [Win]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+            Start-Sleep -Milliseconds 500
+            [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+            Start-Sleep -Seconds 2
+            if (Find-Named $p $title) {
+                Write-Warning 'Escape did not close the dialog (the key may not have reached the window); cancelling'
+                Invoke-Named $p 'Cancel'
+                Start-Sleep -Seconds 2
+            } else {
+                Write-Host 'Escape closed the Remove dialog'
+            }
+
+            Invoke-Named $p 'Remove'
+            Start-Sleep -Seconds 2
+            if (-not (Find-Named $p $title)) { throw 'the Remove dialog did not open a second time' }
+            Invoke-Named $p 'Cancel'
+            Start-Sleep -Seconds 2
+            if (Find-Named $p $title) { throw 'Cancel did not close the Remove dialog' }
+            Write-Host 'Cancel closed the Remove dialog'
+            # Time for a remove command, had one been started, to reach the daemon.
+            Start-Sleep -Seconds 5
+        } finally {
+            Stop-App $p
+        }
+        # A removed device may stay listed, but its connection is cut and refused from then on,
+        # so it must still be listed and online, and the laptop's daemon must not be removed.
+        $s = Wait-Status $a { param($s) @($s.peers | Where-Object { $_.name -eq 'ci-laptop' -and $_.online }).Count -gt 0 } 30
+        if (-not $s) { throw 'ci-laptop is not listed online after the Remove dialog was dismissed' }
+        $l = Wait-Status $b { $true } 15
+        if (-not $l -or $l.removed_by) { throw "ci-laptop reports it was removed (by $($l.removed_by))" }
+        Write-Host 'ci-laptop is still in the drive and online after Escape and Cancel'
     }
 
     Set-AppData $a
     Show-Page home home
     Show-Page devices devices
+    Test-RemoveDialog
     Show-Page add add-invite 'Create invite code'
     Show-Page settings settings
 
