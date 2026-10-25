@@ -1,0 +1,84 @@
+name: Release
+
+# Pushing a tag such as v0.1.0 builds the release tarballs on macOS and Linux and publishes them,
+# with their .sha256 files, as a GitHub release for that tag.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: package-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+          - name: macos
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Install system packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libfuse3-dev libavahi-client-dev
+
+      - name: Install system packages (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja pkgconf
+
+      - name: Install FUSE-T (macOS)
+        if: runner.os == 'macOS'
+        # Needed so the released ghostdrived has the FUSE front end; unlike CI this must succeed.
+        run: brew install --cask fuse-t
+
+      - name: Bootstrap vcpkg
+        run: ./external/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Package
+        run: scripts/package.sh
+
+      - name: Check the version matches the tag
+        run: |
+          version="$(sed -n 's/^CMAKE_PROJECT_VERSION:STATIC=//p' build/release/CMakeCache.txt)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match project version $version" >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tarball-${{ matrix.name }}
+          path: |
+            build/release/ghostdrive-*.tar.gz
+            build/release/ghostdrive-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: tarball-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag \
+            --title "GhostDrive ${GITHUB_REF_NAME#v}" --generate-notes

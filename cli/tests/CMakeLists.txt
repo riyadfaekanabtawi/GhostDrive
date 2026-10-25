@@ -10,3 +10,9 @@ target_compile_definitions(ghostdrive_cli_tests
     PRIVATE GHOSTDRIVE_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}/tmp")
 
 gtest_discover_tests(ghostdrive_cli_tests DISCOVERY_TIMEOUT 30 PROPERTIES LABELS unit)
+
+# The output must be exactly the project() version; the Homebrew formula's test relies on it.
+string(REPLACE "." "\\." version_regex "${PROJECT_VERSION}")
+add_test(NAME cli.version COMMAND ghostdrive --version)
+set_tests_properties(cli.version PROPERTIES
+    LABELS unit PASS_REGULAR_EXPRESSION "^ghostdrive ${version_regex}\n$")

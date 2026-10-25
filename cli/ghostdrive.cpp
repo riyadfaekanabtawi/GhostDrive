@@ -27,6 +27,7 @@
 #include "ghostdrive/daemon/drive.hpp"
 #include "ghostdrive/daemon/invite.hpp"
 #include "ghostdrive/daemon/service.hpp"
+#include "ghostdrive/version.hpp"
 
 extern char** environ;
 
@@ -56,7 +57,8 @@ constexpr const char* kUsage =
     "  autostart off                    stop starting it at login, and stop it now\n"
     "  autostart status                 show whether it is set up and running\n"
     "\n"
-    "Every command accepts --data DIR to use a data directory other than the default.\n";
+    "Every command accepts --data DIR to use a data directory other than the default.\n"
+    "`ghostdrive --version` prints the version.\n";
 
 std::string host_name() {
     char buf[256] = {};
@@ -278,6 +280,19 @@ std::optional<std::filesystem::path> self_path() {
     return resolved;
 }
 
+// The ghostdrived that `autostart on` runs: the one next to this binary (an installed layout),
+// or else, in a build tree, the one in the sibling daemon/ directory.
+std::optional<std::filesystem::path> daemon_path() {
+    auto self = self_path();
+    if (!self) return std::nullopt;
+    auto daemon = self->parent_path() / "ghostdrived";
+    if (auto built = self->parent_path().parent_path() / "daemon" / "ghostdrived";
+        ::access(daemon.c_str(), X_OK) != 0 && ::access(built.c_str(), X_OK) == 0) {
+        daemon = built;
+    }
+    return daemon;
+}
+
 std::filesystem::path absolute_path(const std::filesystem::path& p) {
     std::error_code ec;
     auto out = std::filesystem::weakly_canonical(std::filesystem::absolute(p, ec), ec);
@@ -318,12 +333,17 @@ int cmd_autostart(const Args& args) {
     if (action == "status") {
         bool exists = std::filesystem::exists(file, ec);
         bool running = loaded();
+        auto daemon = daemon_path();
         std::cout << "login item: " << (exists ? file.string() : std::string("not set up")) << "\n"
 #ifdef __APPLE__
-                  << "launchd:    " << (running ? "loaded" : "not loaded") << "\n";
+                  << "launchd:    " << (running ? "loaded" : "not loaded") << "\n"
 #else
-                  << "systemd:    " << (running ? "active" : "inactive") << "\n";
+                  << "systemd:    " << (running ? "active" : "inactive") << "\n"
 #endif
+                  << "daemon:     "
+                  << (daemon && ::access(daemon->c_str(), X_OK) == 0 ? daemon->string()
+                                                                     : std::string("not found"))
+                  << "\n";
         return 0;
     }
 
@@ -362,15 +382,10 @@ int cmd_autostart(const Args& args) {
         return fail("no drive at " + data.string() +
                     "; run `ghostdrive init` or `ghostdrive join` first");
     }
-    auto self = self_path();
-    if (!self) return fail("cannot find the path of the running ghostdrive binary");
+    auto daemon = daemon_path();
+    if (!daemon) return fail("cannot find the path of the running ghostdrive binary");
     autostart::Spec spec;
-    spec.daemon = self->parent_path() / "ghostdrived";
-    // In a build tree the two binaries sit in sibling directories (cli/ and daemon/).
-    if (auto built = self->parent_path().parent_path() / "daemon" / "ghostdrived";
-        ::access(spec.daemon.c_str(), X_OK) != 0 && ::access(built.c_str(), X_OK) == 0) {
-        spec.daemon = built;
-    }
+    spec.daemon = *daemon;
     spec.data = data;
     spec.mount = absolute_path(args.mount);
     spec.log = data / "ghostdrived.log";
@@ -409,6 +424,10 @@ int cmd_autostart(const Args& args) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--version") {
+        std::cout << "ghostdrive " << kVersion << "\n";
+        return 0;
+    }
     Args args;
     if (!parse_args(argc, argv, args)) {
         std::cerr << kUsage;

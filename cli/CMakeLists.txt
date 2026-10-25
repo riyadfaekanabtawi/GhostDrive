@@ -5,7 +5,8 @@ target_link_libraries(ghostdrive_autostart
     PRIVATE BLAKE3::blake3 ghostdrive_warnings)
 
 add_executable(ghostdrive ghostdrive.cpp)
-target_link_libraries(ghostdrive PRIVATE ghostdrive::daemon ghostdrive_autostart ghostdrive_warnings)
+target_link_libraries(ghostdrive
+    PRIVATE ghostdrive::daemon ghostdrive_autostart ghostdrive_version ghostdrive_warnings)
 
 if(GHOSTDRIVE_BUILD_TESTS)
     add_subdirectory(tests)

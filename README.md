@@ -77,7 +77,7 @@ works and otherwise through the server's relay, which forwards only encrypted pa
 
 ```
 ghostdrive autostart on        # start ghostdrived now and at every login
-ghostdrive autostart status    # is it set up, and is it running?
+ghostdrive autostart status    # is it set up, is it running, and which ghostdrived?
 ghostdrive autostart off       # stop it and remove the login item
 ```
 
@@ -140,6 +140,60 @@ is also usable from scripts.
   them on the local network or reaches an address it has stored.
 - MVP consistency is single writer per file. Concurrent edits from two devices produce a
   conflict copy rather than a merge.
+
+## Installing
+
+GhostDrive installs three programs: `ghostdrive` (the CLI), `ghostdrived` (the daemon) and
+`ghostdrive-rendezvous` (the optional server). Keep `ghostdrive` and `ghostdrived` in the same
+directory; `ghostdrive autostart on` runs the `ghostdrived` next to it. `ghostdrive --version`
+prints the installed version.
+
+Mounting needs FUSE-T on macOS (`brew install --cask fuse-t`) and libfuse3 on Linux (the
+`libfuse3-3` or `fuse3` package). Install it before GhostDrive.
+
+### From a release tarball
+
+Each [release](https://github.com/riyadfaekanabtawi/GhostDrive/releases) has
+`ghostdrive-<version>-<os>-<arch>.tar.gz` for macOS (arm64) and Linux (x86_64), with a
+`.sha256` file next to it.
+
+```
+shasum -a 256 -c ghostdrive-0.1.0-macos-arm64.tar.gz.sha256   # sha256sum -c on Linux
+tar -xzf ghostdrive-0.1.0-macos-arm64.tar.gz
+cp ghostdrive-0.1.0-macos-arm64/bin/* ~/.local/bin/            # or any directory on PATH
+```
+
+The macOS tarball also holds `GhostDrive Menu.app` with its own copy of `ghostdrive` and
+`ghostdrived`; move it to `/Applications`. Its signature is ad-hoc, so macOS asks for
+confirmation the first time it opens (Control-click, Open), and a browser download is
+quarantined (`xattr -dr com.apple.quarantine "GhostDrive Menu.app"`). The Linux binaries also
+need avahi-client (`libavahi-client3`) for LAN discovery.
+
+### From Homebrew
+
+The formula is in `packaging/homebrew/ghostdrive.rb`; put it in a tap of your own (it is not in
+homebrew-core). It builds the tagged release from source, with vcpkg fetching and building the
+pinned dependencies, so the first install takes a while.
+
+```
+brew install --cask fuse-t           # first: formulae cannot depend on casks
+brew tap-new you/ghostdrive
+cp packaging/homebrew/ghostdrive.rb "$(brew --repository you/ghostdrive)/Formula/"
+brew install you/ghostdrive/ghostdrive
+```
+
+### From source
+
+Build as described under [Building](#building), then install the release preset:
+
+```
+cmake --preset release
+cmake --build --preset release
+cmake --install build/release --prefix ~/.local     # bin/, plus share/doc/ghostdrive
+```
+
+`scripts/package.sh` does the release build and writes the tarball described above into
+`build/release/`, including the menu-bar app on macOS; it writes nothing outside `build/release`.
 
 ## Building
 

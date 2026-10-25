@@ -1,17 +1,28 @@
 #!/bin/sh
-# Builds "GhostDrive Menu.app" under .build/ in this directory and writes nothing elsewhere.
+# Builds "GhostDrive Menu.app" under .build/ in this directory and writes nothing elsewhere,
+# then prints the app's path.
 # Usage: ./make-app.sh [debug|release]
 # The app finds `ghostdrive` on PATH or next to the app. To bundle the tools instead, set
 # GHOSTDRIVE_BUILD_DIR to a CMake build directory (for example ../../build/release); its
 # cli/ghostdrive and daemon/ghostdrived are copied into the app.
+# GHOSTDRIVE_SWIFT_SCRATCH, an absolute path, moves .build and SwiftPM's caches and
+# configuration there instead (scripts/package.sh points it into the CMake build tree).
 set -eu
 
 cd "$(dirname "$0")"
 config="${1:-release}"
-swift build -c "$config"
-bin="$(swift build -c "$config" --show-bin-path)"
+scratch="${GHOSTDRIVE_SWIFT_SCRATCH:-}"
+if [ -n "$scratch" ]; then
+    set -- --scratch-path "$scratch" --cache-path "$scratch/cache" \
+        --config-path "$scratch/config" --security-path "$scratch/security" --manifest-cache local
+else
+    set --
+    scratch="$PWD/.build"
+fi
+swift build -c "$config" "$@"
+bin="$(swift build -c "$config" "$@" --show-bin-path)"
 
-app=".build/GhostDrive Menu.app"
+app="$scratch/GhostDrive Menu.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin/GhostDriveMenu" "$app/Contents/MacOS/GhostDriveMenu"
@@ -48,4 +59,4 @@ EOF
 
 # Ad-hoc signature so the bundle launches on Apple silicon; not for distribution.
 codesign --force --sign - "$app" >/dev/null 2>&1 || true
-echo "$PWD/$app"
+echo "$app"

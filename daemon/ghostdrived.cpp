@@ -16,6 +16,7 @@
 #include "ghostdrive/daemon/control.hpp"
 #include "ghostdrive/daemon/drive.hpp"
 #include "ghostdrive/daemon/service.hpp"
+#include "ghostdrive/version.hpp"
 #include "status_json.hpp"
 #include "status_text.hpp"
 #ifdef GHOSTDRIVE_HAVE_FUSE
@@ -28,6 +29,7 @@ using namespace ghostdrive;
 
 constexpr const char* kUsage =
     "usage: ghostdrived [--data DIR] [--mount PATH | --no-mount] [--port N] [--no-lan]\n"
+    "       ghostdrived --version\n"
     "\n"
     "Runs this device of the drive in DIR (default: the per-user data directory) and mounts\n"
     "it at PATH (default: ~/GhostDrive). Stop with Ctrl-C or `ghostdrive stop`.\n";
@@ -72,6 +74,10 @@ bool parse_args(int argc, char** argv, Args& args) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--version") {
+        std::cout << "ghostdrived " << kVersion << "\n";
+        return 0;
+    }
     Args args;
     if (!parse_args(argc, argv, args)) {
         std::cerr << kUsage;
