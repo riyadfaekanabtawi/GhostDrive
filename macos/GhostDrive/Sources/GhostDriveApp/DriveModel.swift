@@ -40,6 +40,7 @@ final class DriveModel: ObservableObject {
     @Published private(set) var invite: ActiveInvite?
     @Published private(set) var joinedSinceInvite: [String] = []  // names, cleaned
     @Published private(set) var removal: RemoveOutput?
+    @Published private(set) var removalFlow = RemovalFlow()
     @Published private(set) var rendezvousSetting: RendezvousServer??  // nil: not read yet
     @Published private(set) var autostart: AutostartState?
     @Published private(set) var settings = AppSettings(defaults: .standard)
@@ -238,9 +239,22 @@ final class DriveModel: ObservableObject {
 
     // MARK: - Devices
 
-    func remove(id: String) {
+    // Shows the confirmation; nothing runs until confirmRemoval.
+    func requestRemoval(_ device: RemoveOutput.Device) {
+        removalFlow.request(device)
+    }
+
+    // Cancel, Escape and dismissing the dialog all end here.
+    func cancelRemoval() {
+        removalFlow.cancel()
+    }
+
+    // Only the dialog's Remove button calls this. The command comes from RemovalFlow, so
+    // there is no other way for the app to run `ghostdrive remove`.
+    func confirmRemoval() {
+        guard let args = removalFlow.confirm(settings) else { return }
         removal = nil
-        perform(.remove, Commands.remove(settings, id: id), heading: "Could not remove the device",
+        perform(.remove, args, heading: "Could not remove the device",
                 progress: ["Removing the device..."], maxLength: 400) { [weak self] output in
             let parsed = RemoveOutput.parse(output.stdout)
             self?.removal = parsed

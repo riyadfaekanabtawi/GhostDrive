@@ -212,3 +212,28 @@ extension DriveStatus {
         return "Not connected to \(rv.address)"
     }
 }
+
+// Removing a device is permanent, so the app builds the `remove` command only here, from a
+// request the user then confirmed. Asking, cancelling and dismissing build nothing.
+public struct RemovalFlow: Equatable, Sendable {
+    public private(set) var pending: RemoveOutput.Device?
+
+    public init() {}
+
+    // Asks about `device`; replaces an earlier request that was not confirmed.
+    public mutating func request(_ device: RemoveOutput.Device) {
+        pending = device
+    }
+
+    public mutating func cancel() {
+        pending = nil
+    }
+
+    // The arguments that remove the device asked about, or nil when nothing is pending. Clears
+    // the request, so one confirmation removes one device once.
+    public mutating func confirm(_ settings: AppSettings) -> [String]? {
+        guard let device = pending else { return nil }
+        pending = nil
+        return Commands.remove(settings, id: device.id)
+    }
+}

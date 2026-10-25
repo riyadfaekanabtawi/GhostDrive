@@ -33,9 +33,11 @@ struct SettingsView: View {
                         Spacer()
                         if model.status != nil {
                             Button("Stop GhostDrive") { model.stop() }
+                                .accessibilityLabel("Stop GhostDrive")
                                 .disabled(model.isBusy(.startStop))
                         } else {
                             Button("Start GhostDrive") { model.start() }
+                                .accessibilityLabel("Start GhostDrive")
                                 .disabled(model.isBusy(.startStop) || !hasDrive)
                         }
                     }
@@ -71,6 +73,7 @@ struct SettingsView: View {
                         Button("Set Server") {
                             model.setRendezvous(address: rvAddress, fingerprint: rvFingerprint)
                         }
+                        .accessibilityLabel("Set rendezvous server")
                         .disabled(model.isBusy(.rendezvous) || !hasDrive
                                   || rvAddress.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
@@ -126,7 +129,9 @@ private struct PathRow: View {
             HStack {
                 TextField(title, text: $value, prompt: Text(placeholder))
                 Button("Choose...") { choose() }
+                    .accessibilityLabel("Choose \(title)")
                 Button("Default") { value = "" }
+                    .accessibilityLabel("Use default \(title)")
                     .disabled(value.isEmpty)
             }
             if let problem {

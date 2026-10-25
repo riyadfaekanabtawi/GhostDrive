@@ -126,6 +126,7 @@ struct NotAvailableView: View {
             default:
                 Text("GhostDrive is not running. Start it to \(what).")
                 Button("Start GhostDrive") { model.start() }
+                    .accessibilityLabel("Start GhostDrive")
                     .disabled(model.isBusy(.startStop))
                 FeedbackView(feedback: model.feedback[.startStop],
                              busy: model.isBusy(.startStop))
@@ -191,6 +192,7 @@ struct FirstRunView: View {
                     }
                 }
                 .keyboardShortcut(.defaultAction)
+                .accessibilityLabel(mode == .create ? "Create Drive" : "Join Drive")
                 .disabled(model.isBusy(.setup) || name.trimmingCharacters(in: .whitespaces).isEmpty
                           || (mode == .join && code.trimmingCharacters(in: .whitespaces).isEmpty))
             }
@@ -241,6 +243,7 @@ struct HomeView: View {
                         HStack {
                             Text(devicesText(status))
                             Button("Show") { navigation.section = .devices }
+                                .accessibilityLabel("Show devices")
                                 .buttonStyle(.link)
                         }
                     }
@@ -270,6 +273,7 @@ struct HomeView: View {
                 StatusDot(color: .green)
                 Text("Running")
                 Button("Stop") { model.stop() }.disabled(model.isBusy(.startStop))
+                    .accessibilityLabel("Stop GhostDrive")
             }
         case .notRunning(let reason):
             VStack(alignment: .leading, spacing: 6) {
@@ -277,6 +281,7 @@ struct HomeView: View {
                     StatusDot(color: .secondary)
                     Text("Not running")
                     Button("Start GhostDrive") { model.start() }
+                        .accessibilityLabel("Start GhostDrive")
                         .disabled(model.isBusy(.startStop))
                 }
                 if !reason.contains("not running") {
@@ -299,6 +304,7 @@ struct HomeView: View {
         HStack {
             Text(shown).textSelection(.enabled)
             Button("Open drive") { model.openDrive() }
+                .accessibilityLabel("Open drive")
                 .disabled(model.mountedAt == nil)
             if model.status != nil && model.mountedAt == nil {
                 Text("(not mounted)").foregroundStyle(.secondary)
@@ -327,7 +333,6 @@ struct HomeView: View {
 
 struct DevicesView: View {
     @ObservedObject var model: DriveModel
-    @State private var confirming: RemoveOutput.Device?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -340,7 +345,7 @@ struct DevicesView: View {
                     VStack(spacing: 0) {
                         ForEach(status.peers) { peer in
                             PeerRow(peer: peer, disabled: model.isBusy(.remove)) {
-                                confirming = RemoveOutput.Device(name: peer.name, id: peer.id)
+                                model.requestRemoval(.init(name: peer.name, id: peer.id))
                             }
                             if peer.id != status.peers.last?.id { Divider() }
                         }
@@ -351,7 +356,8 @@ struct DevicesView: View {
                 FeedbackView(feedback: model.feedback[.remove], busy: model.isBusy(.remove))
                 if let removal = model.removal {
                     ForEach(removal.addedByRemoved) { device in
-                        Button("Remove \(device.name) too...") { confirming = device }
+                        Button("Remove \(device.name) too...") { model.requestRemoval(device) }
+                            .accessibilityLabel("Remove \(device.name) too")
                             .disabled(model.isBusy(.remove))
                     }
                 }
@@ -359,12 +365,15 @@ struct DevicesView: View {
                 NotAvailableView(model: model, what: "see the devices")
             }
         }
-        .confirmationDialog(confirming.map { "Remove \($0.name)?" } ?? "",
-                            isPresented: Binding(get: { confirming != nil },
-                                                 set: { if !$0 { confirming = nil } }),
-                            presenting: confirming) { device in
-            Button("Remove", role: .destructive) { model.remove(id: device.id) }
-            Button("Cancel", role: .cancel) {}
+        // Neither button is the default, so Return does nothing; Escape and Cancel cancel.
+        .confirmationDialog(model.removalFlow.pending.map { "Remove \($0.name)?" } ?? "",
+                            isPresented: Binding(get: { model.removalFlow.pending != nil },
+                                                 set: { if !$0 { model.cancelRemoval() } }),
+                            presenting: model.removalFlow.pending) { device in
+            Button("Remove", role: .destructive) { model.confirmRemoval() }
+                .accessibilityLabel("Remove")
+            Button("Cancel", role: .cancel) { model.cancelRemoval() }
+                .accessibilityLabel("Cancel")
         } message: { device in
             Text("\(device.name) will no longer be able to connect to this drive's devices. Use "
                  + "this for a lost or stolen device. This cannot be undone: to use it again, "
@@ -394,6 +403,7 @@ struct PeerRow: View {
             }
             Spacer()
             Button("Remove...", action: onRemove).disabled(disabled)
+                .accessibilityLabel("Remove \(peer.name)")
         }
         .padding(12)
     }
@@ -431,6 +441,7 @@ struct AddDeviceView: View {
                     InviteCard(model: model, invite: invite)
                 } else {
                     Button("Create Invite Code") { model.createInvite() }
+                        .accessibilityLabel("Create invite code")
                         .keyboardShortcut(.defaultAction)
                         .disabled(model.isBusy(.invite))
                 }
@@ -475,10 +486,13 @@ struct InviteCard: View {
                     .accessibilityIdentifier("inviteCode")
                 HStack(spacing: 12) {
                     Button("Copy") { model.copyInviteCode() }
+                        .accessibilityLabel("Copy invite code")
                         .disabled(left == 0 || !model.joinedSinceInvite.isEmpty)
                     Button("New Code") { model.createInvite() }
+                        .accessibilityLabel("New invite code")
                         .disabled(model.isBusy(.invite))
                     Button("Done") { model.discardInvite() }
+                        .accessibilityLabel("Done with invite code")
                 }
                 if !model.joinedSinceInvite.isEmpty {
                     Label(model.joinedSinceInvite.joined(separator: ", ")

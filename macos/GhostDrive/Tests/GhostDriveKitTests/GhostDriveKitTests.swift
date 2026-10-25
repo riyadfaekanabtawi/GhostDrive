@@ -325,6 +325,31 @@ final class ParserTests: XCTestCase {
         XCTAssertNil(RemoveOutput.parse("something else\n").removed)
     }
 
+    func testRemovalRunsOnlyWhenConfirmed() {
+        let settings = AppSettings(dataDir: "/d")
+        let b = RemoveOutput.Device(name: "phone-b", id: "BBBB")
+        var flow = RemovalFlow()
+        XCTAssertNil(flow.confirm(settings))  // nothing asked
+
+        flow.request(b)
+        XCTAssertEqual(flow.pending, b)
+        flow.cancel()  // Cancel, Escape and dismissing the dialog
+        XCTAssertNil(flow.pending)
+        XCTAssertNil(flow.confirm(settings))
+
+        flow.request(b)
+        XCTAssertEqual(flow.confirm(settings), ["remove", "BBBB", "--data", "/d"])
+        XCTAssertNil(flow.pending)
+        XCTAssertNil(flow.confirm(settings))  // one confirmation, one removal
+        flow.cancel()  // the dialog closing after Remove changes nothing
+        XCTAssertNil(flow.confirm(settings))
+
+        // A newer request replaces an unconfirmed one: only the device last asked about.
+        flow.request(b)
+        flow.request(.init(name: "tablet", id: "CCCC"))
+        XCTAssertEqual(flow.confirm(settings), ["remove", "CCCC", "--data", "/d"])
+    }
+
     func testRendezvousShown() {
         XCTAssertEqual(RendezvousServer.parseShown("none\n"), .some(nil))
         XCTAssertEqual(RendezvousServer.parseShown("rv.example:7374 AAAA-BBBB\n"),
