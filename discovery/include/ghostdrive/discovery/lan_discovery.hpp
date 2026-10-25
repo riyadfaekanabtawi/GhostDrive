@@ -46,6 +46,8 @@ public:
     ~LanDiscovery();
 
     const std::string& instance_name() const noexcept { return instance_; }
+    // Advertises the current ID now, for when it changed other than by the epoch turning.
+    void refresh();
 
     struct Op;
     struct Private {};

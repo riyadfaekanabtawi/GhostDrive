@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include "ghostdrive/core/bytes.hpp"
 #include "ghostdrive/core/chunk_id.hpp"
@@ -13,20 +14,30 @@
 
 // The rendezvous control stream, between a device and its rendezvous server (ARCHITECTURE.md
 // section 3.5). The device opens one stream and sends Register; the server answers Registered
-// with the address it sees. The device asks for peers with Connect; the server answers PeerAt
-// to both sides, so both can start hole punching at once.
+// with the address it sees. A later Register on the same stream moves the device to other
+// groups, keeping its relay token. The device asks for peers with Connect; the server answers
+// PeerAt to both sides, so both can start hole punching at once.
 namespace ghostdrive::discovery {
 
 inline constexpr std::size_t kGroupIdSize = 32;
 using GroupId = std::array<std::byte, kGroupIdSize>;
 
-// HMAC-SHA256(drive_secret, "ghostdrive-rendezvous-group-v1"). Only members can compute it, and
-// it reveals nothing about the secret to the server. Fails only if OpenSSL cannot compute it.
-core::Result<GroupId> rendezvous_group(const core::DriveSecret& secret);
+// HMAC-SHA256(key, "ghostdrive-rendezvous-group-v1"), where the key is the drive's current
+// discovery key. Only members can compute it, and it reveals nothing about the key to the
+// server. Fails only if OpenSSL cannot compute it.
+core::Result<GroupId> rendezvous_group(const core::DriveSecret& key);
 
 struct Register {
     GroupId group{};
+    // What a server's --allow-group list is checked against: the group derived from the drive
+    // secret, which stays the same when the discovery key is replaced. A Register without it
+    // (from an older client) uses `group`.
+    GroupId admission{};
+    // Groups of earlier discovery keys, where members that have not caught up still are. The
+    // client may Connect to devices in them, but nobody finds the client there.
+    std::vector<GroupId> hidden;
 };
+inline constexpr std::size_t kMaxHiddenGroups = 4;
 inline constexpr std::size_t kRelayTokenSize = 16;
 using RelayToken = std::array<std::byte, kRelayTokenSize>;
 

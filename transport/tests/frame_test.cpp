@@ -42,7 +42,7 @@ TEST(Frame, RejectsUnknownType) {
     auto header = encode_header(FrameType::get_chunk, 33);
     header[5] = std::byte{0};
     EXPECT_FALSE(decode_header(header));
-    header[5] = std::byte{14};
+    header[5] = std::byte{15};
     EXPECT_FALSE(decode_header(header));
 }
 

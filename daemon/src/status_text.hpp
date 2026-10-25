@@ -18,6 +18,10 @@ inline std::string format_status(const ServiceStatus& status, const std::string&
         out << "Removed:   " << status.removed_by
             << " removed this device from the drive; the other devices no longer accept it\n";
     }
+    if (!status.discovery_error.empty()) {
+        out << "Warning:   could not replace the discovery key (" << status.discovery_error
+            << "); removed devices may still find this one\n";
+    }
     if (!status.rendezvous.empty()) {
         out << "Rendezvous: " << status.rendezvous;
         if (status.observed) {

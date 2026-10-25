@@ -1,5 +1,6 @@
 add_executable(ghostdrive_daemon_tests
     codec_test.cpp
+    discovery_keys_test.cpp
     drive_test.cpp
     invite_test.cpp
     membership_test.cpp

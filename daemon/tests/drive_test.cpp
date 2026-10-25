@@ -40,6 +40,7 @@ TEST(Drive, SecretsArePrivate) {
     DrivePaths paths(root);
     EXPECT_EQ(mode_of(paths.drive), 0600u);
     EXPECT_EQ(mode_of(paths.key), 0600u);
+    EXPECT_EQ(mode_of(paths.discovery), 0600u);
     EXPECT_EQ(mode_of(paths.root), 0700u);
 
     ASSERT_EQ(::chmod(paths.drive.c_str(), 0644), 0);
@@ -76,6 +77,11 @@ TEST(Drive, JoinPinsTheMembersTheInviterVouchesFor) {
     // Listed, but no member vouches for it.
     info.members.push_back(Member{stranger, "stranger", "10.0.0.10:7373"});
     info.membership = a.membership().entries();
+    // The inviter replaced its discovery key after removing a device.
+    core::PublicKey gone{};
+    gone.fill(std::byte{8});
+    ASSERT_TRUE(a.discovery_keys().update(a.key(), {phone.value().public_key()}, {gone}));
+    info.discovery_keys = a.discovery_keys().keys();
 
     auto joined = Drive::join(dir.path() / "b", "laptop", info, a.key().public_key());
     ASSERT_TRUE(joined) << joined.error().message;
@@ -86,8 +92,9 @@ TEST(Drive, JoinPinsTheMembersTheInviterVouchesFor) {
     EXPECT_FALSE(b.index().is_pinned(stranger).value());
     EXPECT_EQ(b.peer_addresses().at(phone.value().public_key()), "10.0.0.9:7373");
     EXPECT_FALSE(b.peer_addresses().contains(stranger));
+    EXPECT_EQ(b.discovery_keys().current(), a.discovery_keys().current());
 
-    // The membership is stored and survives reopening.
+    // The membership and the discovery keys are stored and survive reopening.
     auto key_b = b.key().public_key();
     joined.value().reset();
     auto reopened = Drive::open(dir.path() / "b");
@@ -97,6 +104,7 @@ TEST(Drive, JoinPinsTheMembersTheInviterVouchesFor) {
     EXPECT_TRUE(view.members.contains(phone.value().public_key()));
     EXPECT_EQ(view.members.size(), 2u);
     EXPECT_EQ(reopened.value()->key().public_key(), key_b);
+    EXPECT_EQ(reopened.value()->discovery_keys().current(), a.discovery_keys().current());
 }
 
 TEST(Drive, OpeningAnOlderDriveVouchesForItsPinnedDevices) {

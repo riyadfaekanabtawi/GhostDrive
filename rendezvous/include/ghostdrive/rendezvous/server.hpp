@@ -26,8 +26,9 @@ struct ServerOptions {
     // Per IPv4 address, or per IPv6 /64 (a single host usually holds a whole /64).
     std::size_t max_clients_per_ip = 16;
     std::size_t max_group_size = 256;
-    // When not empty, only these groups may register: an operator serving only their own
-    // drives lists them here (`ghostdrive status` shows a drive's group).
+    // When not empty, only drives with these admission IDs may register: an operator serving
+    // only their own drives lists them here (`ghostdrive status` shows a drive's ID as its
+    // group).
     std::set<discovery::GroupId> allowed_groups;
     // Relay budget per client, as a token bucket.
     std::size_t relay_bytes_per_second = 4u * 1024 * 1024;
@@ -75,6 +76,10 @@ private:
     void send(const std::shared_ptr<Client>& client, core::Bytes frame);
     void on_datagram(std::span<const std::byte> datagram, const asio::ip::udp::endpoint& from);
     void drop(const std::shared_ptr<Client>& client);
+    // Whether `reg` may register: admitted by the allow list, and every group in it has room.
+    bool admits(const discovery::Register& reg);
+    void place(const std::shared_ptr<Client>& client, const discovery::Register& reg);
+    void unplace(const std::shared_ptr<Client>& client);
 
     asio::any_io_executor executor_;
     ServerOptions options_;

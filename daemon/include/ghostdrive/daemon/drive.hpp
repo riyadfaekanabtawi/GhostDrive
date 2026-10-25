@@ -14,6 +14,7 @@
 #include "ghostdrive/core/metadata_index.hpp"
 #include "ghostdrive/core/result.hpp"
 #include "ghostdrive/daemon/codec.hpp"
+#include "ghostdrive/daemon/discovery_keys.hpp"
 #include "ghostdrive/daemon/membership.hpp"
 
 namespace ghostdrive::daemon {
@@ -32,6 +33,7 @@ struct DrivePaths {
     std::filesystem::path control;  // Unix socket of the running daemon
     std::filesystem::path rendezvous;  // "host:port FINGERPRINT" of the rendezvous server
     std::filesystem::path membership;  // signed membership entries, 0600
+    std::filesystem::path discovery;   // discovery keys, 0600
 };
 
 // Default data directory: ~/Library/Application Support/GhostDrive on macOS,
@@ -80,6 +82,9 @@ public:
     // Brings the pinned devices in the index in line with the membership view. Returns the
     // devices that were unpinned.
     core::Result<std::vector<core::PublicKey>> apply_membership();
+    // The same, from the I/O executor only.
+    DiscoveryKeys& discovery_keys() noexcept { return discovery_keys_; }
+    core::Status save_discovery_keys();
 
     // Thread-safe.
     std::map<core::PublicKey, std::string> peer_addresses() const;
@@ -92,7 +97,7 @@ public:
 
     Drive(DrivePaths paths, core::DeviceKey key, DriveId drive_id, core::DriveSecret secret,
           std::string device_name, core::MetadataIndex index, core::ChunkStore store,
-          Membership membership);
+          Membership membership, DiscoveryKeys discovery_keys);
     ~Drive();
 
 private:
@@ -105,6 +110,7 @@ private:
     core::ChunkStore store_;
     core::HybridClock clock_;
     Membership membership_;
+    DiscoveryKeys discovery_keys_;
     mutable std::mutex peers_mutex_;
 };
 

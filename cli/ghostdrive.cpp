@@ -192,6 +192,7 @@ int cmd_join(const Args& args) {
     auto drive =
         daemon::Drive::join(args.data, args.name, result->value().info, invite.value().inviter);
     core::secure_zero(result->value().info.secret);
+    for (auto& k : result->value().info.discovery_keys) core::secure_zero(k.key);
     if (!drive) return fail(drive.error().message);
     auto address = result->value().inviter_address;
     auto text = address.address().to_string() + ":" + std::to_string(address.port());

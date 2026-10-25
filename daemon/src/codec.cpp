@@ -43,7 +43,9 @@ public:
 
     core::Bytes frame(wire::FrameType type) const {
         auto header = wire::encode_header(type, static_cast<std::uint32_t>(out_.size()));
-        core::Bytes frame(header.begin(), header.end());
+        core::Bytes frame;
+        frame.reserve(header.size() + out_.size());  // one allocation: no stray copies
+        frame.insert(frame.end(), header.begin(), header.end());
         frame.insert(frame.end(), out_.begin(), out_.end());
         return frame;
     }
@@ -227,6 +229,39 @@ std::optional<std::vector<MembershipEntry>> get_entries(Reader& r) {
     return out;
 }
 
+constexpr std::string_view kDiscoveryKeyContext = "ghostdrive-discovery-key-v1";
+
+void put_discovery_keys(Writer& w, std::span<const DiscoveryKey> keys) {
+    w.u32(static_cast<std::uint32_t>(keys.size()));
+    for (const auto& k : keys) {
+        w.u64(k.generation);
+        w.bytes(k.author);
+        w.bytes(k.key);
+        w.bytes(k.signature);
+    }
+}
+
+std::optional<std::vector<DiscoveryKey>> get_discovery_keys(Reader& r) {
+    auto count = r.u32();
+    if (!count || *count > kMaxDiscoveryKeys) return std::nullopt;
+    std::vector<DiscoveryKey> out;
+    out.reserve(*count);
+    for (std::uint32_t i = 0; i < *count; ++i) {
+        DiscoveryKey k;
+        auto generation = r.u64();
+        if (!generation || *generation == 0 || *generation >= kMaxDiscoveryGeneration ||
+            !r.fixed(k.author) || !r.fixed(k.key) || !r.fixed(k.signature)) {
+            for (auto& done : out) core::secure_zero(done.key);
+            core::secure_zero(k.key);
+            return std::nullopt;
+        }
+        k.generation = *generation;
+        out.push_back(k);
+        core::secure_zero(k.key);
+    }
+    return out;
+}
+
 }  // namespace
 
 std::string printable_name(std::string_view name) {
@@ -351,6 +386,7 @@ core::Bytes encode_drive_info(const DriveInfo& info) {
     }
     w.str16(info.rendezvous);
     put_entries(w, info.membership);
+    put_discovery_keys(w, info.discovery_keys);
     return w.frame(wire::FrameType::drive_info);
 }
 
@@ -374,8 +410,15 @@ core::Result<DriveInfo> decode_drive_info(std::span<const std::byte> payload) {
     if (!rendezvous) return malformed("DriveInfo");
     info.rendezvous = std::move(*rendezvous);
     auto entries = get_entries(r);
-    if (!entries || !r.done()) return malformed("DriveInfo membership");
+    if (!entries) return malformed("DriveInfo membership");
     info.membership = std::move(*entries);
+    auto keys = get_discovery_keys(r);
+    if (!keys) return malformed("DriveInfo discovery keys");
+    info.discovery_keys = std::move(*keys);
+    if (!r.done()) {
+        for (auto& k : info.discovery_keys) core::secure_zero(k.key);
+        return malformed("DriveInfo");
+    }
     return info;
 }
 
@@ -404,6 +447,41 @@ core::Result<std::vector<MembershipEntry>> decode_membership(std::span<const std
     auto entries = get_entries(r);
     if (!entries || !r.done()) return malformed("Membership");
     return std::move(*entries);
+}
+
+core::Bytes discovery_key_signed_bytes(const DriveId& drive, const DiscoveryKey& key) {
+    Writer w;
+    w.bytes(core::as_bytes(kDiscoveryKeyContext));
+    w.bytes(drive);
+    w.u64(key.generation);
+    w.bytes(key.author);
+    w.bytes(key.key);
+    return w.payload();
+}
+
+core::Bytes encode_discovery_keys(std::span<const DiscoveryKey> keys) {
+    Writer w(16 + keys.size() *
+                      (8 + core::kPublicKeySize + core::kDriveSecretSize + core::kSignatureSize));
+    put_discovery_keys(w, keys);
+    return w.frame(wire::FrameType::discovery_keys);
+}
+
+core::Bytes encode_discovery_keys_payload(std::span<const DiscoveryKey> keys) {
+    Writer w(16 + keys.size() *
+                      (8 + core::kPublicKeySize + core::kDriveSecretSize + core::kSignatureSize));
+    put_discovery_keys(w, keys);
+    return w.payload();
+}
+
+core::Result<std::vector<DiscoveryKey>> decode_discovery_keys(std::span<const std::byte> payload) {
+    Reader r(payload);
+    auto keys = get_discovery_keys(r);
+    if (!keys) return malformed("DiscoveryKeys");
+    if (!r.done()) {
+        for (auto& k : *keys) core::secure_zero(k.key);
+        return malformed("DiscoveryKeys");
+    }
+    return std::move(*keys);
 }
 
 }  // namespace ghostdrive::daemon

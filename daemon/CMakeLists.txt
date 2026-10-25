@@ -1,6 +1,7 @@
 add_library(ghostdrive_daemon
     src/codec.cpp
     src/control.cpp
+    src/discovery_keys.cpp
     src/drive.cpp
     src/invite.cpp
     src/membership.cpp

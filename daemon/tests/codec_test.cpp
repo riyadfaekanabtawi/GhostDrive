@@ -153,6 +153,52 @@ TEST(Codec, JoinAndDriveInfoRoundTrip) {
     EXPECT_EQ(b.value(), info.membership);
 }
 
+TEST(Codec, DiscoveryKeysRoundTripAndBadOnesAreRejected) {
+    DiscoveryKey k;
+    k.generation = 3;
+    k.author.fill(std::byte{1});
+    k.key.fill(std::byte{2});
+    k.signature.fill(std::byte{3});
+    auto frame = encode_discovery_keys(std::span(&k, 1));
+    auto decoded = decode_discovery_keys(payload_of(frame, wire::FrameType::discovery_keys));
+    ASSERT_TRUE(decoded);
+    ASSERT_EQ(decoded.value().size(), 1u);
+    EXPECT_EQ(decoded.value()[0], k);
+    auto payload = payload_of(frame, wire::FrameType::discovery_keys);
+    EXPECT_FALSE(decode_discovery_keys(payload.first(payload.size() - 1)));
+
+    DriveInfo info;
+    info.discovery_keys = {k};
+    auto df = encode_drive_info(info);
+    auto d = decode_drive_info(payload_of(df, wire::FrameType::drive_info));
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d.value().discovery_keys, info.discovery_keys);
+
+    // Generation 0 is the drive secret, never sent; generations near the top are refused so
+    // they cannot run out.
+    for (std::uint64_t generation : {std::uint64_t{0}, kMaxDiscoveryGeneration}) {
+        auto bad = k;
+        bad.generation = generation;
+        auto bf = encode_discovery_keys(std::span(&bad, 1));
+        EXPECT_FALSE(decode_discovery_keys(payload_of(bf, wire::FrameType::discovery_keys)));
+    }
+    std::vector<DiscoveryKey> many(kMaxDiscoveryKeys + 1, k);
+    auto mf = encode_discovery_keys(many);
+    EXPECT_FALSE(decode_discovery_keys(payload_of(mf, wire::FrameType::discovery_keys)));
+
+    // The signature covers the drive, the generation, the author and the key.
+    DriveId drive{};
+    auto base = discovery_key_signed_bytes(drive, k);
+    auto other = k;
+    other.generation = 4;
+    EXPECT_NE(discovery_key_signed_bytes(drive, other), base);
+    other = k;
+    other.key[0] = std::byte{9};
+    EXPECT_NE(discovery_key_signed_bytes(drive, other), base);
+    drive[0] = std::byte{1};
+    EXPECT_NE(discovery_key_signed_bytes(drive, k), base);
+}
+
 TEST(Codec, PrintableNameKeepsTextAndReplacesControls) {
     EXPECT_EQ(printable_name("Riyad's MacBook"), "Riyad's MacBook");
     EXPECT_EQ(printable_name("caf\xC3\xA9"), "caf\xC3\xA9");  // UTF-8 kept

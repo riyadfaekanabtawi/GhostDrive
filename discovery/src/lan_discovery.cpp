@@ -152,18 +152,21 @@ void LanDiscovery::wait_readable() {
                            });
 }
 
+void LanDiscovery::refresh() {
+    auto id = current_id_();
+    if (id == advertised_id_ || register_ == nullptr) return;
+    auto txt = txt_record(id);
+    if (DNSServiceUpdateRecord(register_, nullptr, 0, static_cast<uint16_t>(txt.size()), txt.data(),
+                               0) == kDNSServiceErr_NoError) {
+        advertised_id_ = id;
+    }
+}
+
 void LanDiscovery::refresh_id() {
     refresh_timer_.expires_after(kRefreshEvery);
     refresh_timer_.async_wait([this, alive = alive_](const std::error_code& ec) {
         if (!*alive || ec) return;
-        auto id = current_id_();
-        if (id != advertised_id_) {
-            auto txt = txt_record(id);
-            if (DNSServiceUpdateRecord(register_, nullptr, 0, static_cast<uint16_t>(txt.size()),
-                                       txt.data(), 0) == kDNSServiceErr_NoError) {
-                advertised_id_ = id;
-            }
-        }
+        refresh();
         expire_ops();
         refresh_id();
     });

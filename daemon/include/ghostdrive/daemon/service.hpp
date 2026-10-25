@@ -72,6 +72,9 @@ struct ServiceStatus {
     std::string rendezvous_group;  // hex, for the server's --allow-group
     std::optional<asio::ip::udp::endpoint> observed;  // public address the server sees
     std::string removed_by;  // set when a member has removed this device from the drive
+    // Set when a new discovery key could not be made or saved (removed devices may still find
+    // this one).
+    std::string discovery_error;
     std::vector<PeerStatus> peers;
 };
 
@@ -128,10 +131,18 @@ private:
     // Countersigns members that are due, then, if anything changed, saves, re-pins, and
     // closes the connections of devices that are no longer members.
     core::Status refresh_membership(bool changed);
+    asio::awaitable<void> push_discovery_keys(std::shared_ptr<transport::Connection> conn);
+    asio::awaitable<void> receive_discovery_keys(std::shared_ptr<transport::Connection> conn,
+                                                 std::shared_ptr<transport::Stream> stream,
+                                                 transport::wire::Frame first);
+    // Re-registers with the rendezvous server and re-advertises on the LAN under the new key.
+    void on_discovery_key_changed();
     // Tells a device just removed why it is being disconnected, then closes the connection.
     asio::awaitable<void> farewell(std::shared_ptr<transport::Connection> conn);
     void on_lan_sighting(const discovery::LanSighting& sighting);
     asio::awaitable<void> rendezvous_loop();
+    // A Register for the current discovery key, noting it in registered_key_.
+    core::Result<core::Bytes> rendezvous_register();
     asio::awaitable<void> request_peers(std::shared_ptr<transport::Connection> conn,
                                         std::shared_ptr<transport::Stream> control);
     void on_peer_at(const core::PublicKey& peer, const asio::ip::udp::endpoint& address);
@@ -158,6 +169,14 @@ private:
     // and dial faster than this.
     std::map<core::PublicKey, std::chrono::steady_clock::time_point> last_peer_at_;
     std::optional<asio::ip::udp::endpoint> observed_;
+    std::pair<std::uint64_t, core::PublicKey> registered_key_{};
+    // The highest discovery key generation each member has sent us.
+    std::map<core::PublicKey, std::uint64_t> seen_generation_;
+    // Dials prompted by LAN sightings under older keys, which a removed device can forge.
+    std::map<core::PublicKey, std::chrono::steady_clock::time_point> last_old_key_dial_;
+    std::chrono::steady_clock::time_point old_key_window_{};
+    int old_key_dials_ = 0;
+    std::string discovery_error_;
     std::map<core::PublicKey, std::shared_ptr<transport::Connection>> live_;
     // Dials in flight, per member and address: a stale address timing out must not hold up one
     // just found on the LAN.

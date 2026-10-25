@@ -41,6 +41,12 @@ inline constexpr std::size_t kMaxEntriesPerAuthor =
 inline constexpr std::size_t kMaxEverRemoved = kMaxMembershipEntries + kMaxKnownKeys;
 inline constexpr std::size_t kMaxMemberNameBytes = 64;
 inline constexpr std::size_t kMaxMembershipBatch = 256;
+// Discovery keys (discovery_keys.hpp): one per author that is a member, plus this device's.
+inline constexpr std::size_t kMaxDiscoveryKeys = kMaxDevices + 1;
+inline constexpr std::uint64_t kMaxDiscoveryGeneration = std::uint64_t{1} << 62;
+// How far above the highest generation held a received key may be. Honest devices go up by one
+// per removal; the cap keeps a device from using up the generations before its removal.
+inline constexpr std::uint64_t kMaxDiscoveryGenerationStep = std::uint64_t{1} << 20;
 
 using Token = std::array<std::byte, kTokenSize>;
 using DriveId = std::array<std::byte, kDriveIdSize>;
@@ -91,12 +97,25 @@ struct MembershipEntry {
     bool operator==(const MembershipEntry&) const = default;
 };
 
+// A key that LAN IDs and the rendezvous group are derived from, made by `author` when a
+// device was removed (discovery_keys.hpp). Generation 0 is the drive secret itself and is
+// never sent.
+struct DiscoveryKey {
+    std::uint64_t generation = 0;
+    core::PublicKey author{};
+    core::DriveSecret key{};
+    core::Signature signature{};
+
+    bool operator==(const DiscoveryKey&) const = default;
+};
+
 struct DriveInfo {
     DriveId drive_id{};
     core::DriveSecret secret{};
     std::vector<Member> members;
     std::string rendezvous;  // "host:port FINGERPRINT", empty when the drive has none
     std::vector<MembershipEntry> membership;
+    std::vector<DiscoveryKey> discovery_keys;
 };
 
 // A device name made safe to show in a terminal: invalid UTF-8, control characters (C0 and
@@ -125,5 +144,12 @@ core::Bytes membership_signed_bytes(const DriveId& drive, const MembershipEntry&
 core::Bytes encode_membership(std::span<const MembershipEntry> entries);
 core::Bytes encode_membership_payload(std::span<const MembershipEntry> entries);
 core::Result<std::vector<MembershipEntry>> decode_membership(std::span<const std::byte> payload);
+
+// The bytes a discovery key's signature covers, drive ID included.
+core::Bytes discovery_key_signed_bytes(const DriveId& drive, const DiscoveryKey& key);
+// These carry secrets: callers zero what they get back.
+core::Bytes encode_discovery_keys(std::span<const DiscoveryKey> keys);
+core::Bytes encode_discovery_keys_payload(std::span<const DiscoveryKey> keys);
+core::Result<std::vector<DiscoveryKey>> decode_discovery_keys(std::span<const std::byte> payload);
 
 }  // namespace ghostdrive::daemon

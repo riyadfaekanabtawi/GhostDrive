@@ -370,6 +370,15 @@ TEST_F(TwoDevices, ARemovedDeviceIsCutOffEverywhere) {
     EXPECT_FALSE(b_->connected_to(c));
     EXPECT_TRUE(a_->connected_to(b));
 
+    // A and B move to a discovery key C never gets, so it can no longer find them on the LAN
+    // or meet them at a rendezvous server.
+    ASSERT_TRUE(drain([&] {
+        return drive_a_->discovery_keys().current() == drive_b_->discovery_keys().current();
+    }));
+    auto current = drive_a_->discovery_keys().current();
+    EXPECT_NE(current, drive_a_->secret());
+    for (const auto& k : drive_c_->discovery_keys().all()) EXPECT_NE(*k.key, current);
+
     // Its key stays out even with a fresh invite.
     auto code = a_->create_invite(60s);
     ASSERT_TRUE(code);

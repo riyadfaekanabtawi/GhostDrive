@@ -123,9 +123,10 @@ core::Result<std::unique_ptr<Drive>> assemble(const DrivePaths& paths, core::Dev
     auto store = core::ChunkStore::open(paths.chunks, core::ChunkHasher(secret));
     if (!store) return store.error();
     Membership membership(id, key.public_key());
+    DiscoveryKeys discovery_keys(id, key.public_key(), secret);
     return std::make_unique<Drive>(paths, std::move(key), id, secret, std::move(name),
                                    std::move(index).value(), std::move(store).value(),
-                                   std::move(membership));
+                                   std::move(membership), std::move(discovery_keys));
 }
 
 // Unix socket paths are limited to about 104 bytes (sun_path). A data directory deep enough to
@@ -170,7 +171,8 @@ DrivePaths::DrivePaths(std::filesystem::path r)
       peers(root / "peers"),
       control(control_socket_for(root)),
       rendezvous(root / "rendezvous"),
-      membership(root / "membership") {}
+      membership(root / "membership"),
+      discovery(root / "discovery") {}
 
 std::filesystem::path default_data_dir() {
     const char* home = std::getenv("HOME");
@@ -192,7 +194,7 @@ std::filesystem::path default_mountpoint() {
 
 Drive::Drive(DrivePaths paths, core::DeviceKey key, DriveId drive_id, core::DriveSecret secret,
              std::string device_name, core::MetadataIndex index, core::ChunkStore store,
-             Membership membership)
+             Membership membership, DiscoveryKeys discovery_keys)
     : paths_(std::move(paths)),
       key_(std::move(key)),
       drive_id_(drive_id),
@@ -200,7 +202,8 @@ Drive::Drive(DrivePaths paths, core::DeviceKey key, DriveId drive_id, core::Driv
       device_name_(std::move(device_name)),
       index_(std::move(index)),
       store_(std::move(store)),
-      membership_(std::move(membership)) {}
+      membership_(std::move(membership)),
+      discovery_keys_(std::move(discovery_keys)) {}
 
 Drive::~Drive() {
     core::secure_zero(secret_);
@@ -243,6 +246,7 @@ core::Result<std::unique_ptr<Drive>> Drive::create(const std::filesystem::path& 
     auto drive = assemble(paths, std::move(key).value(), id, secret.value(), device_name);
     if (!drive) return drive.error();
     if (auto st = drive.value()->save_membership(); !st) return st.error();
+    if (auto st = drive.value()->save_discovery_keys(); !st) return st.error();
     return drive;
 }
 
@@ -276,6 +280,13 @@ core::Result<std::unique_ptr<Drive>> Drive::join(const std::filesystem::path& ro
     d.membership().merge(info.membership);
     if (auto st = d.save_membership(); !st) return st.error();
     if (auto applied = d.apply_membership(); !applied) return applied.error();
+    // The inviter's keys already account for the devices removed so far.
+    auto view = d.membership().view();
+    std::set<core::PublicKey> members;
+    for (const auto& [k, name] : view.members) members.insert(k);
+    d.discovery_keys().merge(info.discovery_keys, members);
+    d.discovery_keys().set_removed(view.removed);
+    if (auto st = d.save_discovery_keys(); !st) return st.error();
     for (const auto& member : info.members) {
         auto pinned = d.index().is_pinned(member.key);
         if (!pinned || !pinned.value()) continue;
@@ -335,11 +346,29 @@ core::Result<std::unique_ptr<Drive>> Drive::open(const std::filesystem::path& ro
     } else {
         return stored.error();
     }
+    // A drive from before discovery keys has none; the daemon makes one if devices were removed.
+    auto keys = read_private_file(paths.discovery);
+    if (keys) {
+        auto parsed =
+            DiscoveryKeys::parse(keys.value(), id, opened.key().public_key(), opened.secret());
+        core::secure_zero(keys.value());
+        if (!parsed) return parsed.error();
+        opened.discovery_keys_ = std::move(parsed).value();
+    } else if (keys.error().code != Errc::not_found) {
+        return keys.error();
+    }
     return drive;
 }
 
 Status Drive::save_membership() {
     return write_private_file(paths_.membership, membership_.serialize());
+}
+
+Status Drive::save_discovery_keys() {
+    auto data = discovery_keys_.serialize();
+    auto st = write_private_file(paths_.discovery, data);
+    core::secure_zero(data);
+    return st;
 }
 
 core::Result<std::vector<core::PublicKey>> Drive::apply_membership() {

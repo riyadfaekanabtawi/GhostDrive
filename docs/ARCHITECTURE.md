@@ -271,9 +271,24 @@ document assumes the corrected version.
   - Daemons act on a `PeerAt` for one peer at most every 2 s and run at most 32 dials at once,
     so even a malicious server cannot turn them into amplifiers. Probes carry no key. Active
     migration is disabled on every connection.
-  - Still open: the group ID is a bearer credential, so a device removed from the drive can
-    keep registering and learn members' public addresses until the drive secret is rotated
-    (revocation, section 7). Relay headers carry public keys in clear, so an on-path observer
+  - The group ID is a bearer credential, so since section 3.7 it is derived from the drive's
+    current discovery key, which a removed device does not get. `Register` also carries an
+    admission ID, the group of the drive secret, which never changes: `--allow-group` is
+    checked against it (a 32-byte `Register` from an older client is its own admission ID).
+    A removed device can still be admitted by such a server, but only to a group no member
+    is in. The admission ID is the same value as the group before section 3.7, so existing
+    allow lists keep working; it is also a stable drive identifier that a removed device can
+    compute, so a server operator working with one could still link the drive's groups.
+  - `Register` also lists up to 4 hidden groups, where the client may `Connect` to others but
+    is never found itself, and relay forwarding is allowed between clients that share a group
+    or where one is hidden in the other's. Only the visible group counts toward the 256 per
+    group, since anyone who knows an earlier key could fill its group. A removed device can
+    still have the server forward datagrams to a member hidden in its group; the member drops
+    them (relayed packets are accepted only from members), so this costs bandwidth within the
+    sender's relay budget and reveals nothing. A later `Register` on the same control stream moves
+    the client to new groups and keeps its relay token, so relayed connections survive a
+    change of discovery key.
+  - Still open: relay headers carry public keys in clear, so an on-path observer
     can follow a device across networks; carrying relay traffic as QUIC DATAGRAM frames on the
     authenticated connections (RFC 9221) would close both this and the token's visibility.
   - Hosting needs UDP: a VPS or any host that forwards a UDP port. Platforms that only proxy
@@ -354,7 +369,7 @@ As built after step (c), before discovery (ahead of the planned order so the dri
     for a known device, and the first entry for a statement wins; verified entries are not
     verified again. Entries that cannot be placed are dropped (the next connection resends
     everything).
-  - Still open: the drive secret is not rotated after a removal (section 7). Any member can
+  - Still open: any member can
     remove any other, and a malicious member can use up device slots (freed when it is
     removed); both deny service but never keep a removed device in. A malicious member that
     removes others more than `countersign_after` before its own removal reaches a device wins
@@ -369,7 +384,7 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   then new records as they are committed (polled every 250 ms). Each record says whether the
   sender holds every chunk of that version, which feeds `holders()` on the receiver.
 - **Data directory** (0700): `device.key` and `drive` (ID, secret, name) are 0600 and refused
-  when readable by others; `index.db`, `chunks/`, `staging/`, `peers` (last known address per
+  when readable by others, as are `membership` and `discovery` (section 3.7); `index.db`, `chunks/`, `staging/`, `peers` (last known address per
   member), and the control socket.
 - **Control socket**: one text command per connection (`status`, `invite [ttl]`, `stop`,
   `ping`); reachable only by the owning user because of the directory and socket modes.
@@ -387,6 +402,59 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   own name for the mountpoint; FUSE-T's unmount alone leaves the mount behind when the given
   path differs in letter case, and polls for seconds when it does the unmount itself.
 
+
+### 3.7 Discovery keys (built after membership)
+- The drive secret keys the chunk hash, the LAN ID and the rendezvous group, and every device
+  ever paired knows it. Changing the chunk key would mean rehashing every file, and buys
+  nothing: chunk IDs only travel inside member connections. The LAN ID and the group are what
+  let a removed device keep finding members, so they come from a separate discovery key.
+- A discovery key is `{generation u64, author, key 32 bytes, Ed25519 signature by the author
+  over "ghostdrive-discovery-key-v1" || drive_id || generation || author || key}`. Generation
+  0 is the drive secret itself and is never sent. The current key is the one with the highest
+  `(generation, author)` among the keys held from this device and from members; a device holds
+  at most one key per author (the highest generation), so at most 65.
+- Whenever the set of removed devices a device sees changes, it makes a new key one
+  generation above every key it holds (from devices that are still members), saves it
+  (`discovery`, 0600) and sends it on. Members exchange all the keys they hold on one stream
+  per direction per connection (frame type 14, an empty list first, then the whole list
+  whenever it changes), and pairing hands the new device the inviter's keys. Keys are only
+  sent to members, checked right before each send, and only taken from members, with the
+  author a member and the signature valid.
+- Why a removed device ends up without the current key: as soon as a device sees the removal,
+  keys by the removed device stop counting there (they are dropped), and it makes a key of its
+  own above the rest. The removed device can still get a newer key from a member that has not
+  heard of the removal, but that member makes yet another key when it does. The last keys
+  made are by devices that already knew, and they never send them to it. Concurrent keys of
+  one generation are settled by author, the same way everywhere.
+- A received key may be at most 2^20 generations above the highest held before the frame, one
+  key per author per frame. Without that cap a
+  device could, before its removal, push the generations to the limit (2^62) so that nobody
+  could make a key above one it knows.
+- When the current key changes, the daemon re-registers on its existing rendezvous connection,
+  in the new group, and updates its LAN advertisement. The last 3 keys that were current here,
+  and the drive secret, are kept as earlier keys. The daemon is hidden in their groups (see
+  section 3.5), so it finds a member that missed the change while a removed device that knows
+  those keys cannot find it there.
+- LAN sightings are matched against the current key first, then every other key held. A match
+  on an older key may be a member that has not caught up, or a removed device posing as one
+  (it knows the drive secret and every member's public key). Such a match only leads to a
+  dial, which pins the member's key; it never replaces the stored address, and it is ignored
+  for a member that has already sent a newer key over a connection. Such dials are limited to
+  one per member per minute and four per 10 s in all, so forged sightings cannot take the
+  dial slots.
+- Drives from before this change start on the drive secret and make a key on first start if
+  they already removed devices. A joining device takes the inviter's keys as already
+  accounting for the removals it knows of.
+- Limits: 65 keys per frame and per file plus 3 earlier keys, 16 KiB frames, generations
+  below 2^62, steps of at most 2^20.
+- A failure to make or save a key never fails the membership change that caused it;
+  `ghostdrive status` shows a warning instead.
+- Still open: a member that missed more than 3 changes of key is found only on the LAN or at
+  an address it has stored. Until every member has heard of a removal, the removed device can
+  still find the members that have not; a member that comes back in an old group can be found
+  there by it until it catches up. A removed device can still make members on its LAN dial it
+  by posing as a member that has not sent a newer key since the daemon started, which tells
+  it that the dialing host belongs to the drive.
 
 ## 4. Data path of one read()
 
@@ -506,10 +574,11 @@ Out of scope for the MVP:
 Revocation:
 1. A member removes a device's key (`ghostdrive remove`). The signed entry replicates and the
    key is unpinned everywhere (built; section 3.6).
-2. The drive secret is rotated and redistributed to the remaining members (not built yet).
-   Until then a removed device cannot connect or read anything new, but it can still match
-   members' LAN announcements and register its group with the rendezvous server.
-3. Chunks keyed by the old secret stay valid until they are rewritten.
+2. Every remaining member makes a new discovery key and they converge on one the removed
+   device never receives, so it can no longer recognise their LAN announcements or meet them
+   in a rendezvous group (built; section 3.7).
+3. The drive secret itself is not replaced: it still keys chunk IDs, which only travel inside
+   member connections, so the removed device learns nothing new from knowing it.
 
 ## 8. Failure modes
 

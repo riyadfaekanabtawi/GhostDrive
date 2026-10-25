@@ -17,7 +17,7 @@ using Udp = asio::ip::udp;
 
 namespace {
 
-constexpr std::uint32_t kMaxControlFrame = 64;
+constexpr std::uint32_t kMaxControlFrame = 256;  // a Register with every hidden group
 // Frames waiting for a client that does not read; beyond this they are dropped, not buffered.
 constexpr std::size_t kMaxOutbox = 64;
 constexpr std::chrono::seconds kRegisterTimeout{10};
@@ -44,7 +44,9 @@ struct Server::Client {
     core::PublicKey key{};
     std::shared_ptr<transport::Connection> conn;
     std::shared_ptr<transport::Stream> control;
-    discovery::GroupId group{};
+    discovery::GroupId group{};           // where others find it
+    std::set<discovery::GroupId> hidden;  // where it may only look for others
+    bool placed = false;                  // counted in group_sizes_
     discovery::RelayToken token{};
     bool registered = false;
 
@@ -148,17 +150,16 @@ asio::awaitable<void> Server::serve(std::shared_ptr<transport::Connection> conn)
             auto decoded = discovery::decode_register(first.value().payload);
             if (decoded) reg = decoded.value();
         }
-        bool allowed = reg && (options_.allowed_groups.empty() ||
-                               options_.allowed_groups.contains(reg->group));
-        if (allowed && group_sizes_[reg->group] < options_.max_group_size &&
-            core::random_bytes(client->token)) {
-            // A device that reconnects replaces its old registration.
+        // A device that reconnects replaces its old registration, which must not count against
+        // the room it needs.
+        if (reg) {
             if (auto it = clients_.find(client->key); it != clients_.end()) drop(it->second);
-            client->group = reg->group;
+        }
+        if (reg && admits(*reg) && core::random_bytes(client->token)) {
+            place(client, *reg);
             client->registered = true;
             clients_[client->key] = client;
             by_token_[client->token] = client;
-            ++group_sizes_[client->group];
             stats_.clients = clients_.size();
             deadline.cancel();
             send(client, discovery::encode(discovery::Registered{conn->current_remote_endpoint(),
@@ -167,6 +168,18 @@ asio::awaitable<void> Server::serve(std::shared_ptr<transport::Connection> conn)
             for (;;) {
                 auto frame = co_await wire::read_frame(*client->control, kMaxControlFrame);
                 if (!*alive) co_return;
+                if (frame && frame.value().type == wire::FrameType::rendezvous_register) {
+                    // Moving to other groups (the drive's discovery key changed); the relay
+                    // token, and so any relayed connection, stays.
+                    auto again = discovery::decode_register(frame.value().payload);
+                    if (!again) break;
+                    unplace(client);
+                    if (!admits(again.value())) break;  // its old groups were released above
+                    place(client, again.value());
+                    send(client, discovery::encode(discovery::Registered{
+                                     conn->current_remote_endpoint(), client->token}));
+                    continue;
+                }
                 if (!frame || frame.value().type != wire::FrameType::rendezvous_connect) break;
                 auto request = discovery::decode_connect(frame.value().payload);
                 if (!request) break;
@@ -177,9 +190,11 @@ asio::awaitable<void> Server::serve(std::shared_ptr<transport::Connection> conn)
                 }
                 if (++client->connects > kMaxConnectsPerWindow) continue;
 
+                // Found only in the group it registered in, by a client there or looking there.
                 auto it = clients_.find(request.value().peer);
-                if (it == clients_.end() || it->second->group != client->group ||
-                    it->second == client) {
+                if (it == clients_.end() || it->second == client ||
+                    (it->second->group != client->group &&
+                     !client->hidden.contains(it->second->group))) {
                     send(client,
                          discovery::encode(discovery::PeerAt{request.value().peer, std::nullopt}));
                     continue;
@@ -207,7 +222,7 @@ void Server::drop(const std::shared_ptr<Client>& client) {
         by_token_.erase(it);
     }
     if (client->registered) {
-        if (--group_sizes_[client->group] == 0) group_sizes_.erase(client->group);
+        unplace(client);
         client->registered = false;
     }
     if (auto it = clients_.find(client->key); it != clients_.end() && it->second == client) {
@@ -215,6 +230,33 @@ void Server::drop(const std::shared_ptr<Client>& client) {
     }
     stats_.clients = clients_.size();
     client->conn->close();
+}
+
+bool Server::admits(const discovery::Register& reg) {
+    if (!options_.allowed_groups.empty() && !options_.allowed_groups.contains(reg.admission)) {
+        return false;
+    }
+    // Only the group a client can be found in counts: anyone who knows an earlier group could
+    // otherwise fill it and lock every member out.
+    auto it = group_sizes_.find(reg.group);
+    return it == group_sizes_.end() || it->second < options_.max_group_size;
+}
+
+void Server::place(const std::shared_ptr<Client>& client, const discovery::Register& reg) {
+    client->group = reg.group;
+    client->hidden = std::set<discovery::GroupId>(reg.hidden.begin(), reg.hidden.end());
+    client->hidden.erase(reg.group);
+    ++group_sizes_[client->group];
+    client->placed = true;
+}
+
+void Server::unplace(const std::shared_ptr<Client>& client) {
+    if (!client->placed) return;
+    client->placed = false;
+    if (auto it = group_sizes_.find(client->group); it != group_sizes_.end() && --it->second == 0) {
+        group_sizes_.erase(it);
+    }
+    client->hidden.clear();
 }
 
 void Server::send(const std::shared_ptr<Client>& client, core::Bytes frame) {
@@ -257,9 +299,14 @@ void Server::on_datagram(std::span<const std::byte> datagram, const Udp::endpoin
     }
     core::PublicKey dest_key{};
     std::copy(relayed->key.begin(), relayed->key.end(), dest_key.begin());
+    // Between clients that could have found each other: a shared group, or one looking in the
+    // other's group.
     auto dest = clients_.find(dest_key);
-    if (dest == clients_.end() || dest->second->group != src->second->group ||
-        dest->second == src->second) {
+    auto shares = [](const Client& a, const Client& b) {
+        return a.group == b.group || a.hidden.contains(b.group) || b.hidden.contains(a.group);
+    };
+    if (dest == clients_.end() || dest->second == src->second ||
+        !shares(*src->second, *dest->second)) {
         ++stats_.dropped_datagrams;
         return;
     }

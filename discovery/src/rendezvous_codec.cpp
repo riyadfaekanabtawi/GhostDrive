@@ -2,6 +2,7 @@
 
 #include <openssl/evp.h>
 
+#include <algorithm>
 #include <string_view>
 
 #include "ghostdrive/transport/frame.hpp"
@@ -72,11 +73,11 @@ Error malformed(const char* what) { return Error{Errc::protocol, std::string("ma
 
 }  // namespace
 
-core::Result<GroupId> rendezvous_group(const core::DriveSecret& secret) {
+core::Result<GroupId> rendezvous_group(const core::DriveSecret& key) {
     GroupId out{};
     std::size_t len = 0;
     // A silent failure would leave every drive in the all-zero group together.
-    if (EVP_Q_mac(nullptr, "HMAC", nullptr, "SHA256", nullptr, secret.data(), secret.size(),
+    if (EVP_Q_mac(nullptr, "HMAC", nullptr, "SHA256", nullptr, key.data(), key.size(),
                   reinterpret_cast<const unsigned char*>(kGroupLabel.data()), kGroupLabel.size(),
                   reinterpret_cast<unsigned char*>(out.data()), out.size(), &len) == nullptr ||
         len != out.size()) {
@@ -86,7 +87,13 @@ core::Result<GroupId> rendezvous_group(const core::DriveSecret& secret) {
 }
 
 core::Bytes encode(const Register& m) {
-    return frame(wire::FrameType::rendezvous_register, core::Bytes(m.group.begin(), m.group.end()));
+    core::Bytes p(m.group.begin(), m.group.end());
+    p.insert(p.end(), m.admission.begin(), m.admission.end());
+    auto hidden = std::min(m.hidden.size(), kMaxHiddenGroups);
+    p.push_back(static_cast<std::byte>(hidden));
+    for (std::size_t i = 0; i < hidden; ++i)
+        p.insert(p.end(), m.hidden[i].begin(), m.hidden[i].end());
+    return frame(wire::FrameType::rendezvous_register, p);
 }
 
 core::Bytes encode(const Registered& m) {
@@ -107,9 +114,25 @@ core::Bytes encode(const PeerAt& m) {
 }
 
 core::Result<Register> decode_register(std::span<const std::byte> payload) {
-    if (payload.size() != kGroupIdSize) return malformed("Register");
     Register m;
-    std::copy(payload.begin(), payload.end(), m.group.begin());
+    if (payload.size() == kGroupIdSize) {  // an older client: its group admits it
+        std::copy_n(payload.begin(), kGroupIdSize, m.group.begin());
+        m.admission = m.group;
+        return m;
+    }
+    if (payload.size() < 2 * kGroupIdSize + 1) return malformed("Register");
+    std::copy_n(payload.begin(), kGroupIdSize, m.group.begin());
+    std::copy_n(payload.begin() + kGroupIdSize, kGroupIdSize, m.admission.begin());
+    auto count = std::to_integer<std::size_t>(payload[2 * kGroupIdSize]);
+    auto rest = payload.subspan(2 * kGroupIdSize + 1);
+    if (count > kMaxHiddenGroups || rest.size() != count * kGroupIdSize)
+        return malformed("Register");
+    for (std::size_t i = 0; i < count; ++i) {
+        GroupId g{};
+        std::copy_n(rest.begin() + static_cast<std::ptrdiff_t>(i * kGroupIdSize), kGroupIdSize,
+                    g.begin());
+        m.hidden.push_back(g);
+    }
     return m;
 }
 

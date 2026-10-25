@@ -39,6 +39,7 @@ constexpr std::size_t kBatchRecords = 256;
 constexpr std::uint32_t kMaxFirstFrame = 4096;
 constexpr std::uint32_t kMaxDriveInfo = 8 * 1024 * 1024;  // the largest membership log fits
 constexpr std::uint32_t kMaxMembershipFrame = 256 * 1024;
+constexpr std::uint32_t kMaxDiscoveryKeysFrame = 16 * 1024;
 constexpr std::chrono::seconds kPairingTimeout{15};
 constexpr std::size_t kMaxPairingConnections = 8;
 constexpr int kMaxConnectionsPerMember = 2;
@@ -86,6 +87,12 @@ std::vector<asio::ip::address> local_ipv4_addresses() {
             out.push_back(v4);
     }
     ::freeifaddrs(list);
+    return out;
+}
+
+std::set<core::PublicKey> member_keys(const MembershipView& view) {
+    std::set<core::PublicKey> out;
+    for (const auto& [key, name] : view.members) out.insert(key);
     return out;
 }
 
@@ -141,7 +148,8 @@ Status Service::start() {
         auto lan = discovery::LanDiscovery::start(
             io_, port(),
             [this] {
-                return discovery::lan_id(drive_.secret(), drive_.key().public_key(),
+                return discovery::lan_id(drive_.discovery_keys().current(),
+                                         drive_.key().public_key(),
                                          discovery::lan_epoch(std::chrono::system_clock::now()));
             },
             [this](const discovery::LanSighting& s) { on_lan_sighting(s); });
@@ -158,9 +166,42 @@ void Service::on_lan_sighting(const discovery::LanSighting& sighting) {
     if (!devices) return;
     std::vector<core::PublicKey> members;
     for (const auto& d : devices.value()) members.push_back(d.key);
-    auto key = discovery::match_lan_id(sighting.id, drive_.secret(), members,
-                                       std::chrono::system_clock::now());
+    std::optional<core::PublicKey> key;
+    std::uint64_t generation = 0;
+    bool current = false;
+    auto now = std::chrono::system_clock::now();
+    auto held = drive_.discovery_keys().all();
+    for (std::size_t i = 0; i < held.size() && !key; ++i) {
+        key = discovery::match_lan_id(sighting.id, *held[i].key, members, now);
+        generation = held[i].generation;
+        current = i == 0;
+    }
     if (!key) return;  // another drive, or a stale or forged advertisement
+    if (!current) {
+        // An older key: a member that has not caught up, or a removed device posing as one (it
+        // knows every key from before its removal). Only dial, which pins the member's key, and
+        // keep the stored address: a forgery must not replace it. A member seen holding a newer
+        // key no longer advertises this one.
+        if (auto it = seen_generation_.find(*key);
+            it != seen_generation_.end() && it->second > generation) {
+            return;
+        }
+        // Forged sightings must not take the dial slots real ones need: once a minute per
+        // member, and a few per window in all.
+        auto at = std::chrono::steady_clock::now();
+        if (at - old_key_window_ > std::chrono::seconds(10)) {
+            old_key_window_ = at;
+            old_key_dials_ = 0;
+        }
+        auto& last = last_old_key_dial_[*key];
+        if (live_.contains(*key) || at - last < std::chrono::minutes(1) || old_key_dials_ >= 4) {
+            return;
+        }
+        last = at;
+        ++old_key_dials_;
+        start_dial(*key, sighting.endpoint);
+        return;
+    }
     auto text = format_address(sighting.endpoint);
     auto known = drive_.peer_addresses();
     if (auto it = known.find(*key); it == known.end() || it->second != text) {
@@ -217,12 +258,11 @@ asio::awaitable<void> Service::rendezvous_loop() {
             continue;
         }
 
-        auto group = discovery::rendezvous_group(drive_.secret());
         auto control = co_await conn->open_stream();
         bool registered = false;
-        if (control && group) {
-            auto request = discovery::encode(discovery::Register{group.value()});
-            if (co_await control.value()->write(request)) {
+        auto request = rendezvous_register();
+        if (control && request) {
+            if (co_await control.value()->write(request.value())) {
                 auto reply = co_await wire::read_frame(*control.value(), 64);
                 if (reply && reply.value().type == wire::FrameType::rendezvous_registered) {
                     if (auto r = discovery::decode_registered(reply.value().payload)) {
@@ -244,6 +284,13 @@ asio::awaitable<void> Service::rendezvous_loop() {
             for (;;) {
                 auto frame = co_await wire::read_frame(*control.value(), 64);
                 if (!*alive) co_return;
+                if (frame && frame.value().type == wire::FrameType::rendezvous_registered) {
+                    // The answer to registering again under a new discovery key.
+                    if (auto r = discovery::decode_registered(frame.value().payload)) {
+                        observed_ = r.value().observed;
+                    }
+                    continue;
+                }
                 if (!frame || frame.value().type != wire::FrameType::rendezvous_peer_at) break;
                 auto at = discovery::decode_peer_at(frame.value().payload);
                 if (!at) break;
@@ -258,10 +305,43 @@ asio::awaitable<void> Service::rendezvous_loop() {
     }
 }
 
+core::Result<core::Bytes> Service::rendezvous_register() {
+    // The group follows the discovery key, so a removed device cannot meet members there; the
+    // server admits the drive by the group of the drive secret, which never changes. Members
+    // that missed a change of key are still in the groups of earlier keys, so this device looks
+    // for them there too, without being found there itself.
+    auto& keys = drive_.discovery_keys();
+    auto group = discovery::rendezvous_group(keys.current());
+    if (!group) return group.error();
+    auto admission = discovery::rendezvous_group(drive_.secret());
+    if (!admission) return admission.error();
+    discovery::Register reg{group.value(), admission.value(), {}};
+    for (const auto* earlier : keys.earlier()) {
+        if (reg.hidden.size() == discovery::kMaxHiddenGroups) break;
+        if (auto g = discovery::rendezvous_group(*earlier)) reg.hidden.push_back(g.value());
+    }
+    registered_key_ = keys.current_id();
+    return discovery::encode(reg);
+}
+
 asio::awaitable<void> Service::request_peers(std::shared_ptr<transport::Connection> conn,
                                              std::shared_ptr<transport::Stream> control) {
     auto alive = alive_;
+    // The only writer on the control stream once registered (one write at a time).
+    auto next_round = std::chrono::steady_clock::now();
     while (*alive && !stopped_ && conn->is_open()) {
+        // A new discovery key moves the registration without dropping the connection, so the
+        // relay, and members reached only through it, stay up while the key spreads.
+        if (drive_.discovery_keys().current_id() != registered_key_) {
+            auto request = rendezvous_register();
+            if (!request || !co_await control->write(request.value())) co_return;
+            if (!*alive) co_return;
+        }
+        if (std::chrono::steady_clock::now() < next_round) {
+            co_await sleep_for(std::min(options_.sync_poll, options_.rendezvous_interval));
+            continue;
+        }
+        next_round = std::chrono::steady_clock::now() + options_.rendezvous_interval;
         if (auto devices = drive_.index().devices()) {
             for (const auto& d : devices.value()) {
                 // Members not reachable directly: offline here, or only through the relay.
@@ -272,7 +352,6 @@ asio::awaitable<void> Service::request_peers(std::shared_ptr<transport::Connecti
                 if (!*alive) co_return;
             }
         }
-        co_await sleep_for(options_.rendezvous_interval);
     }
 }
 
@@ -316,9 +395,10 @@ asio::awaitable<void> Service::relay_fallback(core::PublicKey peer) {
 void Service::stop() {
     stopped_ = true;
     lan_.reset();
-    if (rendezvous_conn_) rendezvous_conn_->close();
+    // Members first, while the relay can still carry their close.
     for (auto& [key, conn] : live_) conn->close();
     live_.clear();
+    if (rendezvous_conn_) rendezvous_conn_->close();
     if (endpoint_) endpoint_->close();
 }
 
@@ -407,6 +487,7 @@ ServiceStatus Service::status() const {
     out.port = port();
     if (auto config = drive_.rendezvous()) out.rendezvous = config->host + ":" + std::to_string(config->port);
     out.observed = observed_;
+    out.discovery_error = discovery_error_;
     auto view = drive_.membership().view();
     if (view.removed_by) {
         auto it = view.members.find(*view.removed_by);
@@ -499,6 +580,7 @@ asio::awaitable<void> Service::run_member(std::shared_ptr<transport::Connection>
     }
     asio::co_spawn(io_, push_index(conn), asio::detached);
     asio::co_spawn(io_, push_membership(conn), asio::detached);
+    asio::co_spawn(io_, push_discovery_keys(conn), asio::detached);
     for (;;) {
         auto stream = co_await conn->accept_stream();
         if (!*alive) co_return;
@@ -532,6 +614,9 @@ asio::awaitable<void> Service::handle_stream(std::shared_ptr<transport::Connecti
         }
         case wire::FrameType::membership:
             co_await receive_membership(conn, stream, std::move(first).value());
+            break;
+        case wire::FrameType::discovery_keys:
+            co_await receive_discovery_keys(conn, stream, std::move(first).value());
             break;
         default: {
             auto reply = wire::encode_error(wire::ErrorCode::bad_request);
@@ -728,6 +813,7 @@ asio::awaitable<void> Service::run_pairing(std::shared_ptr<transport::Connection
     info.members.push_back(Member{drive_.key().public_key(), drive_.device_name(), ""});
     if (auto config = drive_.rendezvous()) info.rendezvous = config->to_string();
     info.membership = drive_.membership().entries();
+    info.discovery_keys = drive_.discovery_keys().keys();
     auto addresses = drive_.peer_addresses();
     if (auto devices = drive_.index().devices()) {
         for (const auto& d : devices.value()) {
@@ -740,6 +826,7 @@ asio::awaitable<void> Service::run_pairing(std::shared_ptr<transport::Connection
     (void)co_await stream.value()->write(reply, true);
     core::secure_zero(reply);
     core::secure_zero(info.secret);
+    for (auto& k : info.discovery_keys) core::secure_zero(k.key);
     deadline.cancel();
     // The new member reconnects as a member; this connection served only the pairing.
     conn->close();
@@ -780,7 +867,91 @@ Status Service::refresh_membership(bool changed) {
             }
         }
     }
+    // After unpinning, so a new discovery key is never sent to a device just removed.
+    auto& keys = drive_.discovery_keys();
+    auto before = keys.current_id();
+    view = membership.view();
+    auto rotated = keys.update(drive_.key(), member_keys(view), view.removed);
+    // A failure here leaves the keys as they were; the membership change itself stands, and
+    // `ghostdrive status` reports it.
+    core::Status saved;
+    if (rotated && rotated.value()) saved = drive_.save_discovery_keys();
+    if (!rotated) {
+        discovery_error_ = rotated.error().message;
+    } else if (!saved) {
+        discovery_error_ = saved.error().message;
+    } else {
+        discovery_error_.clear();
+    }
+    if (keys.current_id() != before) on_discovery_key_changed();
     return {};
+}
+
+void Service::on_discovery_key_changed() {
+    // request_peers registers again with the rendezvous server.
+#ifdef GHOSTDRIVE_HAVE_DNSSD
+    if (lan_) lan_->refresh();
+#endif
+}
+
+asio::awaitable<void> Service::push_discovery_keys(std::shared_ptr<transport::Connection> conn) {
+    auto alive = alive_;
+    auto stream = co_await conn->open_stream();
+    if (!*alive || !stream) co_return;
+    // Empty first, like the membership stream, to fit the first-frame limit.
+    if (!co_await stream.value()->write(encode_discovery_keys({}))) co_return;
+    std::uint64_t sent = 0;
+    while (*alive && conn->is_open()) {
+        auto& keys = drive_.discovery_keys();
+        // Checked right before every send: a device removed meanwhile gets no newer key.
+        if (!is_member(conn->peer_key())) co_return;
+        if (keys.version() == sent) {
+            co_await sleep_for(options_.sync_poll);
+            continue;
+        }
+        sent = keys.version();
+        auto held = keys.keys();
+        auto frame = encode_discovery_keys(held);
+        for (auto& k : held) core::secure_zero(k.key);
+        auto st = co_await stream.value()->write(frame);
+        core::secure_zero(frame);
+        if (!*alive || !st) co_return;
+    }
+}
+
+asio::awaitable<void> Service::receive_discovery_keys(std::shared_ptr<transport::Connection> conn,
+                                                      std::shared_ptr<transport::Stream> stream,
+                                                      wire::Frame first) {
+    auto alive = alive_;
+    auto frame = core::Result<wire::Frame>(std::move(first));
+    for (;;) {
+        if (frame.value().type != wire::FrameType::discovery_keys) {
+            conn->close();
+            co_return;
+        }
+        auto keys = decode_discovery_keys(frame.value().payload);
+        core::secure_zero(frame.value().payload);
+        if (!keys) {
+            conn->close();
+            co_return;
+        }
+        bool member = is_member(conn->peer_key());
+        if (member) {
+            // What the sender holds: its LAN advertisements under older keys are forgeries.
+            auto& seen = seen_generation_[conn->peer_key()];
+            for (const auto& k : keys.value()) seen = std::max(seen, k.generation);
+            auto& held = drive_.discovery_keys();
+            auto before = held.current_id();
+            if (held.merge(keys.value(), member_keys(drive_.membership().view()))) {
+                (void)drive_.save_discovery_keys();
+                if (held.current_id() != before) on_discovery_key_changed();
+            }
+        }
+        for (auto& k : keys.value()) core::secure_zero(k.key);
+        if (!member) co_return;
+        frame = co_await wire::read_frame(*stream, kMaxDiscoveryKeysFrame);
+        if (!*alive || !frame) co_return;
+    }
 }
 
 asio::awaitable<void> Service::farewell(std::shared_ptr<transport::Connection> conn) {
