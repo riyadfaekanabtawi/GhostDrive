@@ -18,7 +18,7 @@
 class Ghostdrive < Formula
   desc "Virtual drive stored on your own devices, peer to peer and end-to-end encrypted"
   homepage "https://github.com/riyadfaekanabtawi/GhostDrive"
-  url "https://github.com/riyadfaekanabtawi/GhostDrive.git", tag: "v0.1.0"
+  url "https://github.com/riyadfaekanabtawi/GhostDrive.git", tag: "v0.1.1"
   license "Apache-2.0"
   head "https://github.com/riyadfaekanabtawi/GhostDrive.git", branch: "main"
 
