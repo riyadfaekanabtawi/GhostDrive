@@ -196,6 +196,16 @@ TEST(Drive, AnInvitersRetiredListDoesNotHoldBackAMember) {
     auto& b = *joined.value();
     EXPECT_TRUE(b.index().is_retired_signer(core::short_id(x)));
     EXPECT_FALSE(b.index().is_confirmed_retired(core::short_id(x)));
+    core::FileRecord r;
+    r.path = "from-x.txt";
+    r.modified_by = core::short_id(x);
+    r.version.bump(r.modified_by);
+    r.hlc = b.clock().now();
+    r.signature = x_key.sign(core::record_signed_bytes(b.drive_id(), r)).value();
+    // X's records that arrive first are held or remembered as skipped, not dropped for good.
+    auto early = b.index().apply_remote(r, b.clock());
+    ASSERT_FALSE(early);
+    EXPECT_EQ(early.error().code, core::Errc::not_found);
 
     // X's membership reaches B; its records are then accepted.
     ASSERT_TRUE(a.membership().add(a.key(), x, "x", false));
@@ -203,12 +213,6 @@ TEST(Drive, AnInvitersRetiredListDoesNotHoldBackAMember) {
     ASSERT_TRUE(b.apply_membership());
     ASSERT_TRUE(b.index().is_pinned(x).value());
     EXPECT_FALSE(b.index().is_retired_signer(core::short_id(x)));
-    core::FileRecord r;
-    r.path = "from-x.txt";
-    r.modified_by = core::short_id(x);
-    r.version.bump(r.modified_by);
-    r.hlc = b.clock().now();
-    r.signature = x_key.sign(core::record_signed_bytes(b.drive_id(), r)).value();
     auto applied = b.index().apply_remote(r, b.clock());
     ASSERT_TRUE(applied) << applied.error().message;
 

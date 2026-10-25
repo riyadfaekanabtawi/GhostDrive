@@ -424,9 +424,11 @@ As built after step (c), before discovery (ahead of the planned order so the dri
     `pending_hold` (10 minutes) per peer at most, counted from the first such record of each
     episode; an episode ends when a batch holds nothing back. After the hold the stream stops
     holding back, earlier batches included, and the records are skipped, but the (peer, device)
-    pairs are stored (at most 1024, 64 per peer). When that device is later pinned or retired,
-    only those peers' progress is reset and their connections closed, so they send their index
-    again. A record with sequence 0 is never held. When the membership view pins or retires a
+    pairs are stored (at most 1024, 64 per peer, the oldest evicted first). When that device
+    is later pinned or retired, only those peers' progress is reset and their connections
+    closed, so they send their index again. A device retired only on the inviter's word counts
+    as not established yet, so its own records are held or skipped this way too. A record
+    with sequence 0 is never held. When the membership view pins or retires a
     device, only the connections that delivered records naming it are closed (each remembers
     at most 64 devices). A batch still being applied then notices the change (an epoch taken
     before, checked against the devices it names after) and closes its connection itself.

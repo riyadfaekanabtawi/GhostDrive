@@ -432,6 +432,34 @@ TEST_F(MetadataIndexTest, AnUnknownSignerIsRejectedUntilPinned) {
     EXPECT_EQ(a.apply_remote(from_b, clock_a_).value().kind, Kind::applied);
 }
 
+TEST_F(MetadataIndexTest, SkippedRecordsEvictTheOldestWhenFull) {
+    MetadataIndex a = open("a.db", key_a_);
+    std::vector<PublicKey> peers;
+    for (int i = 0; i < 17; ++i) {
+        peers.push_back(key_with(static_cast<std::uint8_t>(0x10 + i)));
+        ASSERT_TRUE(a.add_device(peers.back(), "peer"));
+    }
+    // One peer over its own cap drops its oldest row only.
+    for (std::uint64_t author = 1; author <= kMaxSkippedPerPeer + 1; ++author) {
+        ASSERT_TRUE(a.note_skipped(peers[0], author));
+    }
+    EXPECT_TRUE(a.take_skipped(1).value().empty());
+    EXPECT_EQ(a.take_skipped(2).value(), std::vector<PublicKey>{peers[0]});
+    EXPECT_EQ(a.take_skipped(kMaxSkippedPerPeer + 1).value(), std::vector<PublicKey>{peers[0]});
+
+    // Filling the shared cap drops the oldest row of any peer.
+    std::uint64_t author = 1000;
+    for (const auto& peer : peers) {
+        for (std::size_t i = 0; i < kMaxSkippedPerPeer; ++i) {
+            ASSERT_TRUE(a.note_skipped(peer, ++author));
+        }
+    }
+    const std::uint64_t first_full = 1000 + kMaxSkippedPerPeer * 16 + 1;  // peers[16]'s first
+    EXPECT_TRUE(a.take_skipped(1001).value().empty());  // the oldest went
+    EXPECT_EQ(a.take_skipped(first_full).value(), std::vector<PublicKey>{peers[16]});
+    EXPECT_EQ(a.take_skipped(author).value(), std::vector<PublicKey>{peers[16]});
+}
+
 TEST_F(MetadataIndexTest, AShortIdStaysBoundToItsFirstKey) {
     MetadataIndex a = open("a.db", key_a_);
     ASSERT_TRUE(a.add_device(key_b_.public_key(), "b"));
