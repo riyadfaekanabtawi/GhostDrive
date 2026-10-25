@@ -17,8 +17,8 @@ Goals:
 Non-goals for the MVP:
 - Multi-writer merging. Concurrent edits produce conflict copies.
 - Storing data on other people's devices (friends). The design keeps room for it (section 9).
-- Windows (phase 2) and mobile (phase 3), beyond keeping the C ABI boundary clean. Phase 1 of
-  the Windows port (section 3.8) builds everything but the mount and passes the tests.
+- Windows (phase 2) and mobile (phase 3), beyond keeping the C ABI boundary clean. The Windows
+  port (section 3.8) builds everything and passes the tests, and mounts through WinFsp.
 
 ## 2. Corrections to the original requirements
 
@@ -570,7 +570,7 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   by posing as a member that has not sent a newer key since the daemon started, which tells
   it that the dialing host belongs to the drive.
 
-### 3.8 Windows (phase 1: builds and passes the tests, no mount)
+### 3.8 Windows (phase 1: builds and passes the tests; phase 2: WinFsp mount)
 - **Toolchain.** clang-cl with Ninja and the `x64-windows` vcpkg triplet (preset `windows`, CI
   job `windows`). It is the same Clang front end as on macOS and Linux, so the C++20 coroutine
   behaviour and the warnings match, and it links against the MSVC-built vcpkg packages and the
@@ -618,19 +618,78 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   through `asio::signal_set`; console close, Ctrl-Break, logoff and shutdown go through
   `SetConsoleCtrlHandler`, which requests the stop and waits for it (Windows allows about five
   seconds). The default data directory is `%LOCALAPPDATA%\GhostDrive`.
-- **Not on Windows yet.** No mount (`ghostdrived` needs `--no-mount`); the vfs core
-  (Filesystem, Tree, Fetcher, write handles) builds and its unit tests run. No LAN discovery:
-  the `lan_discovery_none` backend is built, and devices are reached by stored addresses and
-  the rendezvous server. No `ghostdrive autostart`, which says so. The mount and e2e tests are
-  not built there.
-- **Phase 2 (WinFsp).** A WinFsp front end in vfs/ (`FSP_FILE_SYSTEM_INTERFACE`) over the same
-  `vfs::Filesystem`: `Read`/`Write` with offsets map directly, with `FspFileSystemSendResponse`
-  for replies completed later on the io executor; open, create, cleanup and close mapped to the
-  write-handle lifecycle (commit on cleanup); Windows names (case-insensitive lookups, reserved
-  names and characters); security descriptors for the volume instead of mode bits; a drive
-  letter or directory mountpoint; and WinFsp installed on CI so the mount tests run. LAN
-  discovery (DNS-SD through `windns.h` `DnsServiceBrowse`/`DnsServiceRegister`, Windows 10
-  1903+, unverified) and autostart (a per-user scheduled task or Run key) are separate follow-ups.
+- **Mount (phase 2, WinFsp).** `vfs::WinFspMount` (vfs/src/winfsp_mount.cpp) implements
+  WinFsp's native `FSP_FILE_SYSTEM_INTERFACE` over the same `vfs::Filesystem` as the libfuse3
+  front end, checked against the WinFsp 2.1 headers. CMake builds it when it finds the WinFsp
+  SDK (`inc/winfsp/winfsp.h`, `lib/winfsp-x64.lib`, the installer's Developer feature);
+  `winfsp-x64.dll` is delay-loaded and found through `FspLoad`, so `ghostdrived --no-mount`
+  still runs where WinFsp is not installed. `ghostdrived` mounts by default at
+  `%USERPROFILE%\GhostDrive`, or at `--mount X:` or `--mount <dir>`.
+  - *Asynchronous replies.* `Read` and `Write` return `STATUS_PENDING` and answer with
+    `FspFileSystemSendResponse` (the request's `Hint`, its kind, `IoStatus`, and for writes the
+    new `FileInfo`) when the Filesystem's callback runs on the io executor, so no dispatcher
+    thread waits for the network; read bytes are copied once into the request's buffer (C8).
+    WinFsp allows `STATUS_PENDING` only for Read, Write and ReadDirectory, so the rest
+    (Overwrite, Flush, Cleanup, SetFileSize, SetBasicInfo) wait for their callback on the
+    dispatcher thread; none of them fetch from peers. Read-ahead, the chunk cache and hash
+    verification are the Filesystem's, unchanged. Writes are copied 4 MiB at a time, so a large
+    non-cached write does not need a buffer of its size; append-to-end takes the size when the
+    request arrives, so two handles appending at once are not atomic.
+  - *Pending request buffers.* A pending request's buffer is the reader's memory mapped into
+    the daemon (WinFsp 2.1 `src/sys/read.c`, `FspFsvolReadPrepare`), unmapped by the request's
+    fini (`FspFsvolReadNonCachedRequestFini`) when the request is completed or cancelled. The
+    driver is built with `FSP_IOQ_PROCESS_NO_CANCEL` (`src/sys/driver.h`; `src/sys/ioq.c`,
+    `FspIoqStartProcessingIrp`): once a request reaches the file system it has no cancel
+    routine and no timeout, so a reader's `CancelIoEx`, its exit or `IrpTimeout` cannot end it.
+    Only stopping the I/O queue with cancellation does (`FspIoqStop`, from `FSP_FSCTL_STOP` in
+    `FspFileSystemStopDispatcher`, or the volume handle closing). So a late reply copies into the
+    buffer only under a shared lock and while the mount is open; unmount closes it under the
+    exclusive lock before stopping the dispatcher, then waits for outstanding replies, then
+    commits and releases files still open (WinFsp sends them no Close), then deletes the volume.
+  - *Cleanup and Close.* `Cleanup`, the last `CloseHandle` of a file object, is close(2): it
+    commits the handle's writes (Filesystem `flush`), or carries out a delete. `Close` releases
+    the Filesystem handle. A handle opened with `FILE_WRITE_DATA` or `FILE_APPEND_DATA` gets a
+    write handle, as `O_WRONLY`/`O_RDWR` does under FUSE. The Windows cache manager is off:
+    the FSD enables it only when `FileInfoTimeout` is `INFINITE` and the open's
+    `Rsp.Create.Opened.DisableCache` is clear (`inc/winfsp/fsctl.h`; `src/sys/create.c`,
+    `FspFsvolCreateComplete`), and the timeout is 1 s and every open sets `DisableCache`. So
+    every read and write reaches the Filesystem and nothing is written back after Cleanup.
+    Attributes and listings may be cached for 1 s. Write-handle reads have the same request
+    deadline as other reads.
+  - *Delete and rename.* `CanDelete` refuses non-empty directories; the delete happens in
+    `Cleanup` with `FspCleanupDelete`, which also covers `FILE_FLAG_DELETE_ON_CLOSE`.
+    Unlinking orphans open writers, as on POSIX. `Rename` maps to Filesystem `rename` with
+    `no_replace` unless `ReplaceIfExists`; a target differing only in case is the same name, so
+    a case-only rename works and a different file at such a name counts as existing. Replacing a
+    directory is refused, as NTFS does.
+  - *Names.* The volume is case-insensitive and case-preserving, and WinFsp keeps one kernel
+    file node per name compared without case. So of a directory's entries whose names differ
+    only in case (possible from POSIX devices), only the first in the Tree's order (UTF-8 byte
+    order, `Report.txt` before `report.txt`) is listed, and every spelling, including the exact
+    name of a hidden one, resolves to it; the others stay on the drive but are unreachable from
+    Windows. Names are compared by their file-system uppercase (`LCMapStringEx` with
+    `LCMAP_UPPERCASE` and no linguistic casing). New names with
+    control characters, `<>:"/\|?*`, a trailing dot or space, or a device name (`CON`, `NUL`,
+    `COM1`, ...) are refused with `STATUS_OBJECT_NAME_INVALID`; existing names like that, from
+    other platforms, are left out of listings. Names are converted strictly between UTF-16 and
+    UTF-8.
+  - *Security.* One self-relative descriptor, `O:<user>G:<user>D:P(A;;FA;;;<user>)` for the
+    user running the daemon, is returned for every file and directory and set on the
+    mountpoint; WinFsp checks access against it, so other users (and services) cannot open
+    anything. `SetSecurity` is not implemented.
+  - *Mountpoint.* A drive letter, or a directory that does not exist: anything already at the
+    path (a directory, even an empty one, a junction, a file) is the user's and mounting
+    refuses it. WinFsp creates the directory and removes it on unmount; missing parents are
+    created owner-only (`core::make_private_dir`), existing ones are not checked. A mount that
+    would contain the data directory is refused.
+  - *Not handled.* Named streams, extended attributes, reparse points and hard links are not
+    supported; file attributes other than read-only are not stored. Case-insensitive lookups
+    scan the directory.
+- **Not on Windows yet.** No LAN discovery: the `lan_discovery_none` backend is built, and
+  devices are reached by stored addresses and the rendezvous server. No `ghostdrive autostart`,
+  which says so. LAN discovery (DNS-SD through `windns.h` `DnsServiceBrowse`/`DnsServiceRegister`,
+  Windows 10 1903+, unverified) and autostart (a per-user scheduled task or Run key) are
+  separate follow-ups.
 
 ## 4. Data path of one read()
 
@@ -702,7 +761,7 @@ Every copy of payload bytes on this path:
 | C5 | A: kernel -> pooled buffer (`recvmsg`) | Kernel socket boundary. |
 | C6 | A: ciphertext -> plaintext (decrypt) | ngtcp2 decrypts into its own buffer (`conn->crypto.decrypt_buf`, checked in ngtcp2 1.25.0). In-place decrypt is not exposed. |
 | C7 | A: ngtcp2 stream data -> chunk buffer | Callback data is only valid during the callback, so it is reassembled into the chunk buffer. |
-| C8 | A: chunk buffer -> kernel (FUSE reply) | `write`/`writev` to /dev/fuse. `fuse_reply_data` with splice can move pages on Linux (later). |
+| C8 | A: chunk buffer -> kernel (FUSE reply) | `write`/`writev` to /dev/fuse. `fuse_reply_data` with splice can move pages on Linux (later). On Windows, `memcpy` into the WinFsp read request's buffer, which WinFsp maps from the reader. |
 | C9 | A, macOS FUSE-T only: FUSE-T -> NFS reply -> kernel NFS client | Inside FUSE-T; outside our control. |
 | C10 | A: kernel -> app buffer | Normal `read()` semantics. |
 

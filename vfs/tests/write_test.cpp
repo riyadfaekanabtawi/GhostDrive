@@ -390,5 +390,53 @@ TEST_F(WriteTest, RemoteEditWhileOpenBecomesAConflictCopy) {
     EXPECT_EQ(record_of(conflicts[0]).size, 100u);
 }
 
+// A write handle reading a block only a peer holds answers by the request deadline, like any
+// other read, even while the fetch waits for the peer.
+TEST_F(WriteTest, WriteHandleReadsHaveADeadline) {
+    auto other_store =
+        core::ChunkStore::open(dir_.path() / "other-store", core::ChunkHasher(secret_)).value();
+    const auto source = dir_.path() / "source";
+    auto data = random_bytes(2 * kBlock, 30);
+    std::ofstream(source, std::ios::binary)
+        .write(reinterpret_cast<const char*>(data.data()),
+               static_cast<std::streamsize>(data.size()));
+    auto imported = other_store.import_file(source).value();
+    auto other = core::DeviceKey::generate().value();
+    ASSERT_TRUE(index_.add_device(other.public_key(), "other"));
+    core::FileRecord record;
+    record.path = "remote.bin";
+    record.size = imported.size;
+    record.mode = 0644;
+    record.block_size = imported.block_size;
+    record.chunks = imported.chunks;
+    ASSERT_TRUE(index_.commit_local(record, clock_));
+    for (const auto& id : record.chunks) {
+        ASSERT_TRUE(index_.set_holds(other.public_key(), id, true));
+    }
+    ASSERT_TRUE(tree_.refresh(index_));
+    auto ino = tree_.resolve("remote.bin");
+    ASSERT_TRUE(ino);
+
+    FilesystemOptions options;
+    options.request_timeout = 200ms;
+    Filesystem fs(
+        io_.get_executor(), tree_, fetcher_, options,
+        WriteSupport{store_, index_, clock_, disk_.get_executor(), dir_.path() / "staging"});
+    auto h = fs.open(*ino, true);
+    ASSERT_TRUE(h) << h.error().message;
+    std::optional<core::Result<ReadReply>> result;
+    const auto started = std::chrono::steady_clock::now();
+    fs.read(h.value(), 0, 100, [&](core::Result<ReadReply> r) { result = std::move(r); });
+    drain([&] { return result.has_value(); });
+    ASSERT_TRUE(result);
+    ASSERT_FALSE(*result);
+    EXPECT_EQ(result->error().code, core::Errc::timeout);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, 3s);  // the holder wait is 5 s
+    fs.release(h.value());
+    // Let the abandoned fetch give up before the filesystem goes away.
+    drain([&] { return !fetcher_.in_flight(record.chunks[0]); });
+    drain([] { return false; }, 100ms);
+}
+
 }  // namespace
 }  // namespace ghostdrive::vfs

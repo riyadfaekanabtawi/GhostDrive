@@ -23,6 +23,8 @@
 #include "status_text.hpp"
 #ifdef GHOSTDRIVE_HAVE_FUSE
 #include "ghostdrive/vfs/fuse_mount.hpp"
+#elif defined(GHOSTDRIVE_HAVE_WINFSP)
+#include "ghostdrive/vfs/winfsp_mount.hpp"
 #endif
 #ifdef _WIN32
 #include <windows.h>
@@ -37,7 +39,8 @@ constexpr const char* kUsage =
     "       ghostdrived --version\n"
     "\n"
     "Runs this device of the drive in DIR (default: the per-user data directory) and mounts\n"
-    "it at PATH (default: ~/GhostDrive). Stop with Ctrl-C or `ghostdrive stop`.\n";
+    "it at PATH (default: ~/GhostDrive; on Windows also a drive letter such as X:). Stop with\n"
+    "Ctrl-C or `ghostdrive stop`.\n";
 
 struct Args {
     std::filesystem::path data = daemon::default_data_dir();
@@ -110,10 +113,10 @@ int main(int argc, char** argv) {
         std::cerr << kUsage;
         return 2;
     }
-#ifndef GHOSTDRIVE_HAVE_FUSE
+#if !defined(GHOSTDRIVE_HAVE_FUSE) && !defined(GHOSTDRIVE_HAVE_WINFSP)
     if (args.mount) {
 #ifdef _WIN32
-        std::cerr << "ghostdrived cannot mount the drive on Windows yet; run with --no-mount\n";
+        std::cerr << "ghostdrived was built without WinFsp support; run with --no-mount\n";
 #else
         std::cerr << "ghostdrived was built without FUSE support; run with --no-mount\n";
 #endif
@@ -210,6 +213,21 @@ int main(int argc, char** argv) {
             mount = std::move(mounted).value();
         }
     }
+#elif defined(GHOSTDRIVE_HAVE_WINFSP)
+    // A drive letter ("X:") or a directory, which WinFsp creates itself.
+    std::unique_ptr<vfs::WinFspMount> mount;
+    if (args.mount) {
+        vfs::WinFspMountOptions mount_options;
+        mount_options.volume_name = "GhostDrive";
+        mount_options.data_dir = args.data;
+        auto mounted = vfs::WinFspMount::mount(service.filesystem(), args.mountpoint, mount_options);
+        if (!mounted) {
+            std::cerr << "ghostdrived: " << mounted.error().message << "\n";
+            request_stop();
+        } else {
+            mount = std::move(mounted).value();
+        }
+    }
 #endif
 
     std::cout << "GhostDrive is running.\n"
@@ -222,7 +240,7 @@ int main(int argc, char** argv) {
     stop_requested.get_future().wait();
     std::cout << "Stopping...\n" << std::flush;
 
-#ifdef GHOSTDRIVE_HAVE_FUSE
+#if defined(GHOSTDRIVE_HAVE_FUSE) || defined(GHOSTDRIVE_HAVE_WINFSP)
     // Unmount while the executor still runs, so in-flight reads and commits can finish.
     mount.reset();
 #endif

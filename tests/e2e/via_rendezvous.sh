@@ -49,7 +49,8 @@ PORT_B=$(free_port) || fail "no free UDP port"
 "$GD" join "$CODE" --data "$B" --name laptop --port "$PORT_B" || fail "join"
 "$GD" rendezvous --data "$B" | grep -q ":$RDV_PORT" || fail "the invite did not carry the rendezvous setting"
 # Kill the address learned from the invite: only the rendezvous can connect the devices now.
-sed -i '' -E "s/ [0-9.]+:$PORT_A\$/ 127.0.0.1:9/" "$B/peers"
+# -i.bak works with both BSD and GNU sed.
+sed -i.bak -E "s/ [0-9.]+:$PORT_A\$/ 127.0.0.1:9/" "$B/peers" && rm -f "$B/peers.bak"
 grep -q " 127.0.0.1:9$" "$B/peers" || fail "could not replace A's address in B's peers"
 "$GDD" --data "$B" --mount "$MB" --port "$PORT_B" --no-lan >"$WORK/b.log" 2>&1 &
 PIDS+=($!)
