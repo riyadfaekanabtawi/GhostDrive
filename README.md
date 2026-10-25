@@ -284,7 +284,8 @@ terminal, copy the programs to a directory on PATH: `cp bin/* ~/.local/bin/`.
 #### Linux
 
 Releases after 0.1.1 include the GTK desktop app, `bin/ghostdrive-app`, with its menu entry
-and icon. It needs these runtime packages (Ubuntu 24.04, Debian 13, Fedora 40 or later):
+and icon. The programs need glibc 2.38 or later, and these runtime packages (Ubuntu 24.04,
+Debian 13 and Fedora 40 or later have new enough versions):
 
 | Needed for | Library | Debian and Ubuntu | Fedora |
 |---|---|---|---|

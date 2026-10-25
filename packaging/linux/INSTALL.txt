@@ -20,7 +20,8 @@ Runtime dependencies (install them with your distribution's package manager firs
                                    (libfuse3-4 on Debian 13)
   avahi-client, for LAN discovery  libavahi-client3           avahi-libs
 
-  Ubuntu 24.04, Debian 13 and Fedora 40 or later have new enough GTK and libadwaita.
+  The programs need glibc 2.38 or later. Ubuntu 24.04, Debian 13 and Fedora 40 or later
+  have new enough glibc, GTK and libadwaita.
   Only ghostdrive-app needs GTK and libadwaita; the other programs run without them.
 
 Install
