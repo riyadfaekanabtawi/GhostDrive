@@ -371,7 +371,11 @@ document assumes the corrected version.
     current key (every member has sent this device a key at or above the current one since
     the daemon started), the earlier IDs can be dropped; from then on the removed device,
     which only has those, is refused. A member that has not caught up is refused too after
-    the drop, and has to catch up on the LAN or at a stored address. Until the old IDs are
+    the drop, and has to catch up on the LAN or at a stored address. The check sees which key a
+    member holds, not which admission IDs its daemon sends: a member still running a daemon from
+    before rotating admission IDs (0.1.x) gets the new key but registers with generation 0's ID
+    only, so drop the earlier IDs only once every member runs 0.2 or later, or it is refused
+    too. Until the old IDs are
     dropped, a removed device can still be admitted, but only to groups no member is visible
     in, and generation 0's ID stays a drive identifier it can compute.
   - `Register` also lists up to 4 hidden groups, where the client may `Connect` to others but

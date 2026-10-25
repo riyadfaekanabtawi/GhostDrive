@@ -39,7 +39,8 @@ inline std::string format_status(const ServiceStatus& status, const std::string&
         if (!status.earlier_admissions.empty()) {
             out << (status.members_caught_up
                         ? "           all members have the current key; earlier --allow-group "
-                          "values can be dropped\n"
+                          "values can be dropped once every member runs GhostDrive 0.2 or "
+                          "later\n"
                         : "           not every member has the current key yet; keep the earlier "
                           "--allow-group values\n");
         }
