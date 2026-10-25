@@ -575,6 +575,9 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   job `windows`). It is the same Clang front end as on macOS and Linux, so the C++20 coroutine
   behaviour and the warnings match, and it links against the MSVC-built vcpkg packages and the
   MSVC standard library. Windows 10 is the minimum (`_WIN32_WINNT=0x0A00`), for AF_UNIX.
+  Releases use the `windows-release` preset instead: the `x64-windows-static-release` triplet
+  and the static C/C++ runtime (`CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`), so the programs in
+  the zip from `scripts/package.ps1` import only Windows DLLs, plus the delay-loaded WinFsp DLL.
 - **Files.** `core::File` (core/include/ghostdrive/core/file.hpp) wraps a descriptor on POSIX
   and a HANDLE on Windows: positional `ReadFile`/`WriteFile` with an OVERLAPPED offset,
   `FlushFileBuffers` for fsync, `SetFileInformationByHandle(FileEndOfFileInfo)` for truncate,

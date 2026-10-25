@@ -1,7 +1,7 @@
 name: Release
 
-# Pushing a tag such as v0.1.0 builds the release tarballs on macOS and Linux and publishes them,
-# with their .sha256 files, as a GitHub release for that tag.
+# Pushing a tag such as v0.1.0 builds the release tarballs on macOS and Linux and the zip on
+# Windows, and publishes them, with their .sha256 files, as a GitHub release for that tag.
 on:
   push:
     tags: ["v*"]
@@ -57,21 +57,102 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: tarball-${{ matrix.name }}
+          name: package-${{ matrix.name }}
           path: |
             build/release/ghostdrive-*.tar.gz
             build/release/ghostdrive-*.tar.gz.sha256
           if-no-files-found: error
 
+  package-windows:
+    name: package-windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      # The same pinned WinFsp MSI as in CI, with the Developer feature (headers and import
+      # library), so the released ghostdrived has the WinFsp front end.
+      - name: Install WinFsp
+        run: |
+          $msi = "$env:RUNNER_TEMP\winfsp-2.1.25156.msi"
+          Invoke-WebRequest -Uri https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi -OutFile $msi
+          $hash = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($hash -ne "073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a") { throw "WinFsp MSI checksum mismatch: $hash" }
+          $install = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart ADDLOCAL=ALL" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "msiexec failed with $($install.ExitCode)" }
+
+      - name: Bootstrap vcpkg
+        run: |
+          .\external\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Package
+        run: scripts/package.ps1
+
+      - name: Check the version matches the tag
+        run: |
+          $version = (Select-String -Path build/windows-release/CMakeCache.txt -Pattern '^CMAKE_PROJECT_VERSION:STATIC=(.+)$').Matches.Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) { throw "tag $env:GITHUB_REF_NAME does not match project version $version" }
+
+      # The programs must start from a folder of their own with nothing but Windows: every DLL
+      # they import (not counting the delay-loaded WinFsp DLL) has to be a system DLL, and none
+      # may be the Visual C++ runtime.
+      - name: Check the zip runs from a clean folder
+        run: |
+          $zip = Get-Item build/windows-release/ghostdrive-*-windows-x86_64.zip
+          $line = (Get-Content "$($zip.FullName).sha256" -Raw).Trim()
+          if ($line -ne "$((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant())  $($zip.Name)") { throw "bad .sha256: $line" }
+          $clean = Join-Path $env:RUNNER_TEMP clean
+          Expand-Archive -Path $zip -DestinationPath $clean
+          Get-ChildItem -Recurse -File $clean | ForEach-Object { $_.FullName.Substring($clean.Length + 1) }
+          $dir = Join-Path $clean $zip.BaseName
+          $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          foreach ($exe in 'ghostdrive.exe', 'ghostdrived.exe', 'ghostdrive-rendezvous.exe') {
+            $text = & $dumpbin /nologo /dependents (Join-Path $dir $exe) | Out-String
+            Write-Output $text
+            $imports = ($text -split 'Image has the following delay load dependencies:')[0]
+            $dlls = [regex]::Matches($imports, '(?m)^\s+(\S+\.dll)\s*$') | ForEach-Object { $_.Groups[1].Value }
+            foreach ($dll in $dlls) {
+              if ($dll -match '^(vcruntime|msvcp|api-ms-win-crt|ucrtbase)' -or -not (Test-Path (Join-Path $env:SystemRoot "System32\$dll"))) {
+                throw "$exe needs $dll, which is not part of Windows"
+              }
+            }
+          }
+          Push-Location $env:RUNNER_TEMP
+          try {
+            & (Join-Path $dir ghostdrive.exe) --version
+            if ($LASTEXITCODE) { throw "ghostdrive --version failed: $LASTEXITCODE" }
+            & (Join-Path $dir ghostdrived.exe) --version
+            if ($LASTEXITCODE) { throw "ghostdrived --version failed: $LASTEXITCODE" }
+            # It has no --version; an unknown option prints the usage and exits with 2.
+            & (Join-Path $dir ghostdrive-rendezvous.exe) --help
+            if ($LASTEXITCODE -ne 2) { throw "ghostdrive-rendezvous exited with $LASTEXITCODE" }
+            $global:LASTEXITCODE = 0
+          } finally {
+            Pop-Location
+          }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-windows
+          path: |
+            build/windows-release/ghostdrive-*.zip
+            build/windows-release/ghostdrive-*.zip.sha256
+          if-no-files-found: error
+
   release:
-    needs: package
+    needs: [package, package-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
-          pattern: tarball-*
+          pattern: package-*
           path: dist
           merge-multiple: true
 

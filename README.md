@@ -168,8 +168,9 @@ GhostDrive installs three programs: `ghostdrive` (the CLI), `ghostdrived` (the d
 directory; `ghostdrive autostart on` runs the `ghostdrived` next to it. `ghostdrive --version`
 prints the installed version.
 
-Mounting needs FUSE-T on macOS (`brew install --cask fuse-t`) and libfuse3 on Linux (the
-`libfuse3-3` or `fuse3` package). Install it before GhostDrive.
+Mounting needs FUSE-T on macOS (`brew install --cask fuse-t`), libfuse3 on Linux (the
+`libfuse3-3` or `fuse3` package) and [WinFsp](https://winfsp.dev) 2.x on Windows. Install it
+before GhostDrive.
 
 ### From a release tarball
 
@@ -189,6 +190,25 @@ The macOS tarball also holds `GhostDrive Menu.app` with its own copy of `ghostdr
 confirmation the first time it opens (Control-click, Open), and a browser download is
 quarantined (`xattr -dr com.apple.quarantine "GhostDrive Menu.app"`). The Linux binaries also
 need avahi-client (`libavahi-client3`) for LAN discovery.
+
+### On Windows
+
+Releases after 0.1.1 also have `ghostdrive-<version>-windows-x86_64.zip`, for Windows 10
+or later on x64, with a `.sha256` file next to it. It holds one folder with `ghostdrive.exe`,
+`ghostdrived.exe`, `ghostdrive-rendezvous.exe`, `LICENSE` and `README.md`. The programs are
+linked statically, the Visual C++ runtime included, so no Visual C++ Redistributable or other
+DLLs are needed. Mounting needs [WinFsp](https://winfsp.dev) 2.x (the default installer
+options are enough); `ghostdrived --no-mount` and `ghostdrive-rendezvous` run without it.
+
+```
+(Get-FileHash ghostdrive-0.1.2-windows-x86_64.zip -Algorithm SHA256).Hash   # compare with .sha256
+Expand-Archive ghostdrive-0.1.2-windows-x86_64.zip -DestinationPath $env:LOCALAPPDATA\Programs
+$env:Path += ";$env:LOCALAPPDATA\Programs\ghostdrive-0.1.2-windows-x86_64"   # or add it in Settings
+```
+
+Keep the three programs together in that folder. A browser download is marked as coming from
+the internet, and the programs are not signed, so SmartScreen may ask before the first run
+(More info, Run anyway); `Unblock-File` on the zip before extracting avoids that.
 
 ### From Homebrew
 
@@ -215,6 +235,8 @@ cmake --install build/release --prefix ~/.local     # bin/, plus share/doc/ghost
 
 `scripts/package.sh` does the release build and writes the tarball described above into
 `build/release/`, including the menu-bar app on macOS; it writes nothing outside `build/release`.
+On Windows, `pwsh scripts/package.ps1` does the same with the `windows-release` preset (static
+`x64-windows-static-release` triplet) and writes the zip into `build\windows-release\`.
 
 ## Building
 
