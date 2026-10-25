@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Everything the app decides without a window: the ghostdrive command lines, parsing their
+       output, and cleaning text for display. Plain net10.0, so the tests run on any OS.
+       IsTrimmable and IsAotCompatible turn on the trim analyzers here, since the app is
+       published trimmed. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>GhostDriveApp.Core</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <IsTrimmable>true</IsTrimmable>
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="GhostDriveApp.Core.Tests" />
+  </ItemGroup>
+
+</Project>

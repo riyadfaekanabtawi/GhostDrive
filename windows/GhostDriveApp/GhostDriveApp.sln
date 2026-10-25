@@ -1,0 +1,37 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "GhostDriveApp.Core", "GhostDriveApp.Core\GhostDriveApp.Core.csproj", "{1433E70B-AA4D-4406-B78A-25F3C4A9C2B6}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "GhostDriveApp.Core.Tests", "GhostDriveApp.Core.Tests\GhostDriveApp.Core.Tests.csproj", "{3FC289E7-29A6-4F80-8C41-509500975A1D}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "GhostDriveApp", "GhostDriveApp\GhostDriveApp.csproj", "{724B5BDA-421B-4691-B306-C3DE6557EA6D}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{1433E70B-AA4D-4406-B78A-25F3C4A9C2B6}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{1433E70B-AA4D-4406-B78A-25F3C4A9C2B6}.Debug|x64.Build.0 = Debug|Any CPU
+		{1433E70B-AA4D-4406-B78A-25F3C4A9C2B6}.Release|x64.ActiveCfg = Release|Any CPU
+		{1433E70B-AA4D-4406-B78A-25F3C4A9C2B6}.Release|x64.Build.0 = Release|Any CPU
+		{3FC289E7-29A6-4F80-8C41-509500975A1D}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{3FC289E7-29A6-4F80-8C41-509500975A1D}.Debug|x64.Build.0 = Debug|Any CPU
+		{3FC289E7-29A6-4F80-8C41-509500975A1D}.Release|x64.ActiveCfg = Release|Any CPU
+		{3FC289E7-29A6-4F80-8C41-509500975A1D}.Release|x64.Build.0 = Release|Any CPU
+		{724B5BDA-421B-4691-B306-C3DE6557EA6D}.Debug|x64.ActiveCfg = Debug|x64
+		{724B5BDA-421B-4691-B306-C3DE6557EA6D}.Debug|x64.Build.0 = Debug|x64
+		{724B5BDA-421B-4691-B306-C3DE6557EA6D}.Release|x64.ActiveCfg = Release|x64
+		{724B5BDA-421B-4691-B306-C3DE6557EA6D}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {C75C7CA9-9F63-4CD1-AAAC-164B38570DF4}
+	EndGlobalSection
+EndGlobal
