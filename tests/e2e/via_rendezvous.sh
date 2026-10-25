@@ -85,7 +85,8 @@ wait_for 15 sh -c "! test -e '$MA/reply.txt'" || fail "delete never reached A"
 
 # The operator story for --allow-group: a third device joins and is removed, the members move
 # to a new discovery key, and once they all hold it the operator lists only the new admission
-# ID. The members get in again; the removed device, which has only the old ID, does not.
+# ID (and any earlier one but generation 0's). The members get in again; the removed device,
+# which has only generation 0's ID, does not.
 CODE=$("$GD" invite --data "$A" | grep -o 'gd1-[A-Z0-9-]*') || fail "second invite"
 PORT_C=$(free_port) || fail "no free UDP port"
 "$GD" join "$CODE" --data "$C" --name spare --port "$PORT_C" >/dev/null || fail "join C"
@@ -95,18 +96,29 @@ PIDS+=($PID_C)
 wait_for 20 sh -c "'$GD' status --data '$C' | grep -q 'Rendezvous: 127.0.0.1:$RDV_PORT (connected'" ||
     fail "C never registered with the server"
 "$GD" status --data "$A" | grep -q "^Admission: .* (generation 0)" || fail "A did not start at generation 0"
+GEN0=$("$GD" status --data "$A" | awk '/^Admission:/{print $2}')
 
+# Both members may make a key for the removal, so wait until A says everyone holds its current
+# one and B shows the same.
+converged() {
+    local a
+    a=$("$GD" status --data "$A") || return 1
+    echo "$a" | grep -q "all members have the current key" || return 1
+    echo "$a" | grep -q "^Admission: .* (generation [1-9]" || return 1
+    NEW=$(echo "$a" | awk '/^Admission:/{print $2}')
+    # Every ID but generation 0's: a later key would still list the ones before it.
+    ALLOW=$(echo "$a" | awk '/^Admission:|^  earlier/{print $2}' | tr -d '\r' | grep -v "$GEN0")
+    "$GD" status --data "$B" | grep -q "^Admission: $NEW "
+}
 "$GD" remove spare --data "$A" >/dev/null || fail "remove C"
-wait_for 30 sh -c "'$GD' status --data '$A' | grep -q 'all members have the current key'" ||
-    fail "A never saw every member holding the new key"
-"$GD" status --data "$A" | grep -q "^Admission: .* (generation [1-9]" || fail "A's admission ID did not rotate"
-NEW=$("$GD" status --data "$A" | awk '/^Admission:/{print $2}')
-wait_for 10 sh -c "'$GD' status --data '$B' | grep -q '^Admission: $NEW '" || fail "B shows another admission ID"
+wait_for 30 converged || fail "A and B never agreed on a new key that every member holds"
+ALLOW_ARGS=()
+for id in $ALLOW; do ALLOW_ARGS+=(--allow-group "$id"); done
 
 kill "$RDV" 2>/dev/null
 for _ in $(seq 50); do kill -0 "$RDV" 2>/dev/null || break; sleep 0.1; done
 "$BIN/rendezvous/ghostdrive-rendezvous" --key "$WORK/server.key" --port "$RDV_PORT" \
-    --allow-group "$NEW" >"$WORK/server2.log" 2>&1 &
+    "${ALLOW_ARGS[@]}" >"$WORK/server2.log" 2>&1 &
 RDV=$!
 wait_for 10 grep -q Fingerprint "$WORK/server2.log" || fail "the rendezvous server did not restart"
 # A daemon notices a vanished server only by idle timeout; restarting the daemons is quicker.
