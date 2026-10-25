@@ -147,17 +147,17 @@ protected:
 };
 
 TEST_F(WinFsp, ListsStatsAndReadsFiles) {
-    auto small = random_bytes(5000, 1);
-    auto large = random_bytes(3 * core::kMinBlockSize + 12345, 2);
-    add("notes.txt", small);
-    add("media/clip.bin", large);
+    auto text = random_bytes(5000, 1);
+    auto clip = random_bytes(3 * core::kMinBlockSize + 12345, 2);
+    add("notes.txt", text);
+    add("media/clip.bin", clip);
     ASSERT_NO_FATAL_FAILURE(start());
 
     EXPECT_EQ(names_in(mountpoint_), (std::set<std::wstring>{L"media", L"notes.txt"}));
     EXPECT_TRUE(std::filesystem::is_directory(mountpoint_ / "media"));
-    EXPECT_EQ(std::filesystem::file_size(mountpoint_ / "media" / "clip.bin"), large.size());
-    EXPECT_TRUE(read_whole(mountpoint_ / "notes.txt") == small);
-    EXPECT_TRUE(read_whole(mountpoint_ / "media" / "clip.bin") == large);
+    EXPECT_EQ(std::filesystem::file_size(mountpoint_ / "media" / "clip.bin"), clip.size());
+    EXPECT_TRUE(read_whole(mountpoint_ / "notes.txt") == text);
+    EXPECT_TRUE(read_whole(mountpoint_ / "media" / "clip.bin") == clip);
 }
 
 TEST_F(WinFsp, RandomAccessReadsReturnTheRightBytes) {

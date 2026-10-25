@@ -22,7 +22,7 @@ encrypted packets and never stores file data.
 Status: early, but usable (macOS with FUSE-T, Linux with libfuse3). Devices find each other on
 the local network automatically (mDNS), and across the internet through a rendezvous server you
 host, with hole punching and a relay fallback. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-On Windows it builds and passes its tests, but cannot mount the drive yet (see Limitations).
+On Windows it mounts through [WinFsp](https://winfsp.dev), at a drive letter or a folder.
 
 ## How you use it
 
@@ -148,9 +148,12 @@ is also usable from scripts.
 - A remote file is only readable while a device holding it is online.
 - Streaming speed is bounded by the upload bandwidth of the device serving the data.
 - MVP platforms are Linux and macOS. Windows is phase 2; iOS and Android are phase 3. On
-  Windows the tools, the daemon (`ghostdrived --no-mount`) and the rendezvous server build and
-  pass their tests, but there is no mount yet (WinFsp is planned), no LAN discovery (devices are
-  reached by stored addresses and the rendezvous server), and no `ghostdrive autostart`.
+  Windows the drive mounts through WinFsp (`ghostdrived` mounts at `%USERPROFILE%\GhostDrive`,
+  or `--mount X:` for a drive letter), but there is no LAN discovery yet (devices are reached by
+  stored addresses and the rendezvous server) and no `ghostdrive autostart`. The Windows volume
+  is case-insensitive: files from other devices whose names Windows cannot use (such as `a:b`
+  or `CON`) are not shown there, and two names that differ only in case both show but open the
+  same one.
 - A device that stays offline while more than three devices are removed may not find the
   others through the rendezvous server when it comes back; it reconnects once it sees one of
   them on the local network or reaches an address it has stored.
@@ -245,6 +248,11 @@ cmake --preset windows
 cmake --build --preset windows
 ctest --preset windows
 ```
+
+The Windows mount needs [WinFsp](https://winfsp.dev) 2.x with its Developer feature (headers
+and import library) at build time, found in `%ProgramFiles(x86)%\WinFsp` or `WINFSP_ROOT`, and
+WinFsp installed at run time. Without the SDK the mount is skipped and `ghostdrived` needs
+`--no-mount`. The e2e tests run in Git Bash.
 
 LAN discovery on Linux needs the avahi-client development files (`libavahi-client-dev`) at build
 time and a running avahi-daemon. Without them the daemon still runs and reaches devices by stored

@@ -5,7 +5,15 @@
 // wait for the Filesystem on the dispatcher thread.
 
 // winfsp.h includes windows.h with WIN32_NO_STATUS and then ntstatus.h; it must come first.
+// It also uses PNTSTATUS, which windows.h does not declare under WIN32_LEAN_AND_MEAN (set for
+// the whole project), so those headers are included here first, the same way, and the type
+// declared after them.
 // clang-format off
+#define WIN32_NO_STATUS
+#include <windows.h>
+#undef WIN32_NO_STATUS
+#include <winternl.h>
+typedef NTSTATUS* PNTSTATUS;
 #include <winfsp/winfsp.h>
 #include <sddl.h>
 // clang-format on
@@ -206,7 +214,9 @@ struct Node {
     bool directory = false;
     bool write = false;
     std::optional<std::uint64_t> handle;  // files only
-    Attr last;  // answers GetFileInfo once the entry is gone (deleted while open)
+    // Answers GetFileInfo once the entry is gone (deleted while open).
+    std::mutex last_mutex;
+    Attr last;
 
     // Directory listing, taken when an enumeration starts so markers stay meaningful.
     std::mutex listing_mutex;
@@ -410,7 +420,9 @@ NTSTATUS op_open(FSP_FILE_SYSTEM* fsp, PWSTR name, UINT32, UINT32 granted, PVOID
 
 // The current attributes of an open node, or the last known ones if it was deleted.
 Attr current(Impl& self, Node& node) {
-    if (auto attr = self.fs.getattr(node.ino)) node.last = *attr;
+    auto attr = self.fs.getattr(node.ino);
+    std::lock_guard lock(node.last_mutex);
+    if (attr) node.last = *attr;
     return node.last;
 }
 
@@ -419,7 +431,6 @@ NTSTATUS set_attr(Impl& self, Node& node, SetAttr changes, FSP_FSCTL_FILE_INFO* 
         auto result = wait_for<core::Result<Attr>>(
             [&](auto done) { self.fs.setattr(node.ino, changes, node.handle, std::move(done)); });
         if (!result) return to_ntstatus(result.error());
-        node.last = result.value();
     }
     fill(self, current(self, node), info);
     return STATUS_SUCCESS;
@@ -523,12 +534,13 @@ NTSTATUS op_write(FSP_FILE_SYSTEM* fsp, PVOID context, PVOID buffer, UINT64 offs
         auto& self = impl_of(fsp);
         auto& node = node_of(context);
         if (!node.handle || !node.write) return STATUS_INVALID_DEVICE_REQUEST;
-        const std::uint64_t size = current(self, node).size;
+        const Attr before = current(self, node);
+        const std::uint64_t size = before.size;
         if (constrained) {
             // Paging I/O must not extend the file.
             if (offset >= size) {
                 *transferred = 0;
-                fill(self, node.last, info);
+                fill(self, before, info);
                 return STATUS_SUCCESS;
             }
             length = static_cast<ULONG>(std::min<UINT64>(length, size - offset));
@@ -541,21 +553,26 @@ NTSTATUS op_write(FSP_FILE_SYSTEM* fsp, PVOID context, PVOID buffer, UINT64 offs
         core::Bytes data(bytes.begin(), bytes.end());
         const UINT64 hint = FspFileSystemGetOperationContext()->Request->Hint;
         self.begin_pending();
-        self.fs.write(*node.handle, offset, std::move(data),
-                      [&self, ino = node.ino, last = node.last, length, hint](core::Status st) {
-                          FSP_FSCTL_TRANSACT_RSP response{};
-                          response.Size = sizeof(response);
-                          response.Kind = FspFsctlTransactWriteKind;
-                          response.Hint = hint;
-                          response.IoStatus.Status = static_cast<UINT32>(to_ntstatus(st));
-                          if (st) {
-                              response.IoStatus.Information = length;
-                              fill(self, self.fs.getattr(ino).value_or(last),
-                                   &response.Rsp.Write.FileInfo);
-                          }
-                          FspFileSystemSendResponse(self.fsp, &response);
-                          self.end_pending();
-                      });
+        self.fs.write(
+            *node.handle, offset, std::move(data),
+            [&self, ino = node.ino, before, end = offset + length, length, hint](core::Status st) {
+                FSP_FSCTL_TRANSACT_RSP response{};
+                response.Size = sizeof(response);
+                response.Kind = FspFsctlTransactWriteKind;
+                response.Hint = hint;
+                response.IoStatus.Status = static_cast<UINT32>(to_ntstatus(st));
+                if (st) {
+                    response.IoStatus.Information = length;
+                    auto attr = self.fs.getattr(ino);
+                    if (!attr) {
+                        attr = before;
+                        attr->size = std::max<std::uint64_t>(attr->size, end);
+                    }
+                    fill(self, *attr, &response.Rsp.Write.FileInfo);
+                }
+                FspFileSystemSendResponse(self.fsp, &response);
+                self.end_pending();
+            });
         return STATUS_PENDING;
     });
 }
