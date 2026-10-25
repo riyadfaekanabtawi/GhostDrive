@@ -1,9 +1,9 @@
 #!/bin/sh
-# Builds "GhostDrive Menu.app" under .build/ in this directory and writes nothing elsewhere,
-# then prints the app's path.
+# Builds GhostDrive.app (the main window and the menu-bar extra) under .build/ in this directory
+# and writes nothing elsewhere, then prints the app's path.
 # Usage: ./make-app.sh [debug|release]
-# The app finds `ghostdrive` on PATH or next to the app. To bundle the tools instead, set
-# GHOSTDRIVE_BUILD_DIR to a CMake build directory (for example ../../build/release); its
+# The app finds `ghostdrive` inside the bundle, next to the app or on PATH. To bundle the tools,
+# set GHOSTDRIVE_BUILD_DIR to a CMake build directory (for example ../../build/release); its
 # cli/ghostdrive and daemon/ghostdrived are copied into the app.
 # GHOSTDRIVE_SWIFT_SCRATCH, an absolute path, moves .build and SwiftPM's caches and
 # configuration there instead (scripts/package.sh points it into the CMake build tree).
@@ -29,27 +29,30 @@ fi
 swift build -c "$config" "$@"
 bin="$(swift build -c "$config" "$@" --show-bin-path)"
 
-app="$scratch/GhostDrive Menu.app"
+app="$scratch/GhostDrive.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$bin/GhostDriveMenu" "$app/Contents/MacOS/GhostDriveMenu"
+cp "$bin/GhostDriveApp" "$app/Contents/MacOS/GhostDriveApp"
 
 if [ -n "${GHOSTDRIVE_BUILD_DIR:-}" ]; then
     cp "$GHOSTDRIVE_BUILD_DIR/cli/ghostdrive" "$GHOSTDRIVE_BUILD_DIR/daemon/ghostdrived" \
         "$app/Contents/MacOS/"
 fi
 
+# The identifier stays the one of the earlier menu-bar app, so its settings carry over.
 cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>GhostDriveMenu</string>
+    <string>GhostDriveApp</string>
     <key>CFBundleIdentifier</key>
     <string>org.ghostdrive.menu</string>
     <key>CFBundleName</key>
-    <string>GhostDrive Menu</string>
+    <string>GhostDrive</string>
+    <key>CFBundleDisplayName</key>
+    <string>GhostDrive</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -58,7 +61,9 @@ cat > "$app/Contents/Info.plist" <<EOF
     <string>$version</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
-    <key>LSUIElement</key>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+    <key>NSHighResolutionCapable</key>
     <true/>
 </dict>
 </plist>

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the release preset and packs the installed programs into
 #   build/release/ghostdrive-<version>-<os>-<arch>.tar.gz (plus a .sha256 file).
-# On macOS the tarball also holds "GhostDrive Menu.app", with ghostdrive and ghostdrived inside.
+# On macOS the tarball also holds GhostDrive.app, with ghostdrive and ghostdrived inside.
 # Everything, including vcpkg's build trees and SwiftPM's caches, is written under build/release.
 #
 # Usage: scripts/package.sh [extra cmake configure arguments]
@@ -18,9 +18,9 @@ mkdir -p "$build"
 export VCPKG_DOWNLOADS
 mkdir -p "$VCPKG_DOWNLOADS"
 
-# On macOS, everything (dependencies, programs, menu-bar app) targets this version, so the
+# On macOS, everything (dependencies, programs, desktop app) targets this version, so the
 # release runs on it and later rather than only on the build machine's macOS. 13 is the floor of
-# the menu-bar app (MenuBarExtra).
+# the desktop app (MenuBarExtra and the Window scene).
 osx_target=""
 if [ "$(uname -s)" = Darwin ]; then
     : "${MACOSX_DEPLOYMENT_TARGET:=13.0}"
@@ -57,7 +57,7 @@ cmake --install "$build" --prefix "$stage/$name" --strip
 
 if [ "$os" = macos ]; then
     app="$(GHOSTDRIVE_BUILD_DIR="$build" GHOSTDRIVE_SWIFT_SCRATCH="$build/swift" \
-        GHOSTDRIVE_VERSION="$version" "$root/macos/GhostDriveMenu/make-app.sh" release | tail -n 1)"
+        GHOSTDRIVE_VERSION="$version" "$root/macos/GhostDrive/make-app.sh" release | tail -n 1)"
     cp -R "$app" "$stage/$name/"
     # Bundle the stripped programs rather than the build tree's, and sign the result again.
     bundled="$stage/$name/$(basename "$app")"
