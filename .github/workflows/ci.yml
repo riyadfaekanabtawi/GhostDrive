@@ -154,7 +154,7 @@ jobs:
         run: cmake --build --preset windows -- -k 0
 
       - name: Test
-        run: ctest --preset windows -LE "mount|e2e"
+        run: ctest --preset windows -LE "mount|e2e" --timeout 60
 
   # The macOS menu-bar app is a separate Swift package; its tests need no daemon.
   menu-app:
