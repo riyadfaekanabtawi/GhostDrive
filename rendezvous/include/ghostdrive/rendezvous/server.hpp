@@ -75,8 +75,10 @@ public:
 private:
     struct Client;
 
-    asio::awaitable<void> accept_loop();
-    asio::awaitable<void> serve(std::shared_ptr<transport::Connection> conn);
+    asio::awaitable<void> accept_loop(std::shared_ptr<bool> alive,
+                                      std::shared_ptr<transport::Endpoint> endpoint);
+    asio::awaitable<void> serve(std::shared_ptr<bool> alive,
+                                std::shared_ptr<transport::Connection> conn);
     void send(const std::shared_ptr<Client>& client, core::Bytes frame);
     // A relay frame (DATAGRAM frame, transport::kMaxRelayFrame) received on `sender`'s
     // connection.
