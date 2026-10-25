@@ -68,8 +68,14 @@ UPDATE files SET effective_version = version;
 CREATE TABLE signers (
     short_id INTEGER PRIMARY KEY,
     key BLOB NOT NULL UNIQUE,
-    retired_seq INTEGER
+    retired_seq INTEGER,
+    provisional INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE skipped (
+    peer BLOB NOT NULL REFERENCES devices(key) ON DELETE CASCADE,
+    author INTEGER NOT NULL,
+    PRIMARY KEY (peer, author)
+) WITHOUT ROWID;
 INSERT INTO signers(short_id, key) SELECT short_id, key FROM devices;
 )sql";
 
@@ -240,6 +246,8 @@ struct MetadataIndex::Impl {
     struct Signer {
         PublicKey key{};
         bool retired = false;
+        // Retired only on another device's word (the inviter's), until confirmed here.
+        bool provisional = false;
         bool pinned = false;  // in the devices table, or this device
     };
 
@@ -462,7 +470,7 @@ Status MetadataIndex::Impl::verify(FileRecord& record) const {
 }
 
 Status MetadataIndex::Impl::load_signers() {
-    auto stmt = prepare(db.get(), "SELECT short_id, key, retired_seq FROM signers");
+    auto stmt = prepare(db.get(), "SELECT short_id, key, retired_seq, provisional FROM signers");
     if (!stmt) return stmt.error();
     std::map<std::uint64_t, Signer> loaded;
     for (;;) {
@@ -475,6 +483,7 @@ Status MetadataIndex::Impl::load_signers() {
         Signer signer;
         std::copy(blob.begin(), blob.end(), signer.key.begin());
         signer.retired = !s.col_null(2);
+        signer.provisional = s.col_i64(3) != 0;
         loaded[s.col_u64(0)] = signer;
     }
     auto pinned = prepare(db.get(), "SELECT short_id FROM devices");
@@ -817,20 +826,29 @@ Status MetadataIndex::add_device(const PublicKey& key, std::string_view name) {
     // Either the key or its 64-bit short ID is already present.
     if (!st && sqlite3_errcode(db) == SQLITE_CONSTRAINT) return clash;
     if (!st) return st;
-    if (known == impl_->signers.end()) {
-        auto signer = prepare(db, "INSERT INTO signers(short_id, key) VALUES(?, ?)");
+    const bool provisional = known != impl_->signers.end() && known->second.provisional;
+    if (known == impl_->signers.end() || provisional) {
+        // A retirement only the inviter claimed does not outlast the device becoming a member.
+        auto signer = prepare(db, known == impl_->signers.end()
+                                      ? "INSERT INTO signers(short_id, key) VALUES(?, ?)"
+                                      : "UPDATE signers SET retired_seq = NULL, provisional = 0 "
+                                        "WHERE short_id = ? AND key = ?");
         if (!signer) return signer.error();
         if (auto sst = signer.value().bind_u64(1, id).bind_blob(2, key).run(); !sst) return sst;
     }
     if (auto cst = tx.commit(); !cst) return cst;
-    // A retired key stays retired even if pinned again: removal is permanent.
+    // A key retired here stays retired even if pinned again: removal is permanent.
     auto& entry = impl_->signers[id];
     entry.key = key;
     entry.pinned = true;
+    if (provisional) {
+        entry.retired = false;
+        entry.provisional = false;
+    }
     return {};
 }
 
-Result<std::size_t> MetadataIndex::retire_signer(const PublicKey& key) {
+Result<std::size_t> MetadataIndex::retire_signer(const PublicKey& key, bool provisional) {
     std::lock_guard lock(impl_->mutex);
     sqlite3* db = impl_->db.get();
     const std::uint64_t id = short_id(key);
@@ -841,18 +859,38 @@ Result<std::size_t> MetadataIndex::retire_signer(const PublicKey& key) {
     // Records under this short ID were signed by another key; they are not this key's to give up.
     if (known != impl_->signers.end() && known->second.key != key) return std::size_t{0};
     // Retiring and adopting happen in one transaction, so a retired key is done.
-    if (known != impl_->signers.end() && known->second.retired) return std::size_t{0};
+    if (known != impl_->signers.end() && known->second.retired &&
+        (provisional || !known->second.provisional)) {
+        return std::size_t{0};
+    }
+    // Another device's word does not retire a device pinned here.
+    if (provisional && known != impl_->signers.end() && known->second.pinned) return std::size_t{0};
 
     Transaction tx(db);
     if (auto st = tx.begin(); !st) return st.error();
     auto sequence = read_meta(db, "sequence");
     if (!sequence) return sequence.error();
     auto signer = prepare(db,
-                          "INSERT INTO signers(short_id, key, retired_seq) VALUES(?, ?, ?) "
-                          "ON CONFLICT(short_id) DO UPDATE SET retired_seq = excluded.retired_seq");
+                          "INSERT INTO signers(short_id, key, retired_seq, provisional) "
+                          "VALUES(?, ?, ?, ?) ON CONFLICT(short_id) DO UPDATE SET "
+                          "retired_seq = excluded.retired_seq, provisional = excluded.provisional");
     if (!signer) return signer.error();
-    auto st = signer.value().bind_u64(1, id).bind_blob(2, key).bind_u64(3, sequence.value()).run();
+    auto st = signer.value()
+                  .bind_u64(1, id)
+                  .bind_blob(2, key)
+                  .bind_u64(3, sequence.value())
+                  .bind_i64(4, provisional ? 1 : 0)
+                  .run();
     if (!st) return st.error();
+    if (provisional) {
+        // Lets adopted records be checked; nothing is rewritten on another device's word.
+        if (auto cst = tx.commit(); !cst) return cst.error();
+        auto& entry = impl_->signers[id];
+        entry.key = key;
+        entry.retired = true;
+        entry.provisional = true;
+        return std::size_t{0};
+    }
 
     // Adoption: records by a removed device are accepted only with a member's countersignature,
     // so this device countersigns each verified record the key signed, and each it had
@@ -876,7 +914,56 @@ Result<std::size_t> MetadataIndex::retire_signer(const PublicKey& key) {
     auto& entry = impl_->signers[id];
     entry.key = key;
     entry.retired = true;
+    entry.provisional = false;
     return paths.value().size();
+}
+
+bool MetadataIndex::is_confirmed_retired(std::uint64_t id) const {
+    std::lock_guard lock(impl_->mutex);
+    auto it = impl_->signers.find(id);
+    return it != impl_->signers.end() && it->second.retired && !it->second.provisional;
+}
+
+Status MetadataIndex::note_skipped(const PublicKey& peer, std::uint64_t author) {
+    std::lock_guard lock(impl_->mutex);
+    sqlite3* db = impl_->db.get();
+    auto count = prepare(db,
+                         "SELECT (SELECT COUNT(*) FROM skipped), "
+                         "(SELECT COUNT(*) FROM skipped WHERE peer = ?)");
+    if (!count) return count.error();
+    count.value().bind_blob(1, peer);
+    auto row = count.value().step();
+    if (!row) return row.error();
+    if (count.value().col_i64(0) >= static_cast<std::int64_t>(kMaxSkipped) ||
+        count.value().col_i64(1) >= static_cast<std::int64_t>(kMaxSkippedPerPeer)) {
+        return {};  // full: those records are only fetched again with the whole index
+    }
+    auto ins = prepare(db, "INSERT OR IGNORE INTO skipped(peer, author) VALUES(?, ?)");
+    if (!ins) return ins.error();
+    return ins.value().bind_blob(1, peer).bind_u64(2, author).run();
+}
+
+Result<std::vector<PublicKey>> MetadataIndex::take_skipped(std::uint64_t author) {
+    std::lock_guard lock(impl_->mutex);
+    sqlite3* db = impl_->db.get();
+    auto stmt = prepare(db, "SELECT peer FROM skipped WHERE author = ?");
+    if (!stmt) return stmt.error();
+    stmt.value().bind_u64(1, author);
+    std::vector<PublicKey> peers;
+    for (;;) {
+        auto row = stmt.value().step();
+        if (!row) return row.error();
+        if (!row.value()) break;
+        const auto blob = stmt.value().col_blob(0);
+        if (blob.size() != kPublicKeySize) return Error{Errc::corrupt, "skipped peer key"};
+        PublicKey key{};
+        std::copy(blob.begin(), blob.end(), key.begin());
+        peers.push_back(key);
+    }
+    auto del = prepare(db, "DELETE FROM skipped WHERE author = ?");
+    if (!del) return del.error();
+    if (auto st = del.value().bind_u64(1, author).run(); !st) return st.error();
+    return peers;
 }
 
 bool MetadataIndex::is_active_signer(std::uint64_t id) const {

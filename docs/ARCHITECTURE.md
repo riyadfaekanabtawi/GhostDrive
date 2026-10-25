@@ -421,13 +421,15 @@ As built after step (c), before discovery (ahead of the planned order so the dri
     or adopter is not established here yet: the membership stream can lag the index stream).
     Progress on that stream then stops just before the lowest such record, so the next
     connection sends it again; nothing is reset for other peers. This holds for
-    `pending_hold` (10 minutes) per peer at most, counted from the first such record and
-    cleared by a batch without any; after that they are skipped like invalid ones, so keys that
-    are never established cannot make every connection resend. A record with sequence 0 is
-    never held. When the membership view pins or retires a device, only the connections that
-    delivered records naming it are closed. A batch still being applied then notices the
-    change (an epoch taken before, checked against the devices it names after) and closes its
-    connection itself.
+    `pending_hold` (10 minutes) per peer at most, counted from the first such record of each
+    episode; an episode ends when a batch holds nothing back. After the hold the stream stops
+    holding back, earlier batches included, and the records are skipped, but the (peer, device)
+    pairs are stored (at most 1024, 64 per peer). When that device is later pinned or retired,
+    only those peers' progress is reset and their connections closed, so they send their index
+    again. A record with sequence 0 is never held. When the membership view pins or retires a
+    device, only the connections that delivered records naming it are closed (each remembers
+    at most 64 devices). A batch still being applied then notices the change (an epoch taken
+    before, checked against the devices it names after) and closes its connection itself.
   - A device removed for good (not one in doubt, and not one whose removal may still be
     undone) has its key retired as a signer: its stored records stay, new ones signed by it are
     rejected. Retiring runs before unpinning and again whenever the drive is opened, so a crash
@@ -437,9 +439,12 @@ As built after step (c), before discovery (ahead of the planned order so the dri
     version, content, `modified_by` or the author's signature. A newer version by the removed
     device still supersedes an older one whoever adopted each, so adoption neither brings
     deleted files back nor makes conflict copies.
-  - A device that joins later learns the retired keys from `DriveInfo` at pairing (the
-    inviter's retired signers, trusted like the rest of `DriveInfo`; a key it sees as a member
-    is ignored), since membership compaction may have dropped every entry naming them.
+  - A device that joins later learns the retired keys from `DriveInfo` at pairing, since
+    membership compaction may have dropped every entry naming them. These are provisional,
+    on the inviter's word: they let adopted records be checked, but adopt nothing. A key the
+    joiner sees as a member is not retired, and pinning one later clears the mark, so its
+    own records verify normally. A key counts as retired for good only when this device's own
+    membership view has it removed for good, which also adopts its records.
 - **Data directory** (0700): `device.key` and `drive` (ID, secret, name) are 0600 and refused
   when readable by others, as are `membership` and `discovery` (section 3.7); `index.db`, `chunks/`, `staging/`, `peers` (last known address per
   member), and the control socket.
@@ -455,7 +460,10 @@ As built after step (c), before discovery (ahead of the planned order so the dri
     edits (attributable, not prevented);
   - a removed device's records, signed while it was a member, can be countersigned by any
     member; the content is the removed device's own, and the adopter is traceable;
-  - an inviter can hand a new device any keys as retired signers;
+  - an inviter can hand a new device keys as retired signers: until such a device is a member
+    in the joiner's own view, the joiner accepts its records only as adopted;
+  - a member colluding with a removed device (or holding its key) can countersign records
+    newly made with that key; attribution then points at the removed device and the adopter;
   - any version a device once signed can be presented as that version's conflict copy, under
     the author's own signature (not attributable to the relay). A copy is valid only at the
     name derived from its origin, mtime and author, so this resurfaces old content under a

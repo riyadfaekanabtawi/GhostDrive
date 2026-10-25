@@ -194,10 +194,12 @@ protected:
     std::unique_ptr<Service> c_;
     std::unique_ptr<Service> d_;
     std::chrono::milliseconds countersign_after_ = loopback_options().countersign_after;
+    std::chrono::milliseconds pending_hold_ = loopback_options().pending_hold;
 
     ServiceOptions options() const {
         auto o = loopback_options();
         o.countersign_after = countersign_after_;
+        o.pending_hold = pending_hold_;
         return o;
     }
 };
@@ -561,6 +563,81 @@ TEST_F(TwoDevices, RecordsByADeviceNotKnownYetAreFetchedAgain) {
     join_by_invite("e", drive_d_);
     ASSERT_TRUE(drain([&] { return drive_b_->index().is_pinned(e_key.public_key()).value(); }));
     EXPECT_TRUE(drain([&] { return !held->is_open(); }));
+    endpoint->close();
+}
+
+TEST_F(TwoDevices, RecordsSkippedAfterTheHoldAreFetchedWhenTheDeviceArrives) {
+    pending_hold_ = 300ms;
+    start_a();
+    start_b();
+    join_by_invite("c", drive_c_);
+    ASSERT_TRUE(drive_c_);
+    const auto c = drive_c_->key().public_key();
+    ASSERT_TRUE(drain([&] { return drive_b_->index().is_pinned(c).value(); }));
+    auto e_key = Drive::load_or_create_key(dir_.path() / "e").value();
+    const auto& drive = drive_a_->drive_id();
+    auto make = [&](const core::DeviceKey& key, const char* path, std::uint64_t sequence) {
+        core::FileRecord r;
+        r.path = path;
+        r.modified_by = core::short_id(key.public_key());
+        r.version.bump(r.modified_by);
+        r.hlc = drive_c_->clock().now();
+        r.sequence = sequence;
+        r.signature = key.sign(core::record_signed_bytes(drive, r)).value();
+        return r;
+    };
+    std::vector<IndexEntry> first{{make(e_key, "from-e.txt", 1), false}};
+    std::vector<IndexEntry> second{{make(drive_c_->key(), "from-c.txt", 2), false}};
+    auto progress = [&] {
+        auto devices = drive_b_->index().devices();
+        for (const auto& d : devices.value()) {
+            if (d.key == c) return d.peer_max_sequence;
+        }
+        return std::uint64_t{99};
+    };
+
+    auto endpoint = transport::Endpoint::create(io_.get_executor(), drive_c_->key(), {}).value();
+    std::shared_ptr<transport::Stream> stream;
+    std::shared_ptr<transport::Connection> held;
+    bool ready = false;
+    asio::co_spawn(
+        io_,
+        [&]() -> asio::awaitable<void> {
+            auto conn = co_await endpoint->connect(
+                asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), b_->port()),
+                drive_b_->key().public_key());
+            if (!conn) co_return;
+            held = conn.value();
+            auto opened = co_await conn.value()->open_stream();
+            if (!opened || !co_await opened.value()->write(encode_hello(Hello{7, 2})) ||
+                !co_await transport::wire::read_frame(*opened.value(), 64) ||
+                !co_await opened.value()->write(encode_index_batch(first))) {
+                co_return;
+            }
+            stream = opened.value();
+            ready = true;
+        },
+        asio::detached);
+    ASSERT_TRUE(drain([&] { return ready; }));
+    drain([] { return false; }, 500ms);  // E's record is held, then the hold runs out
+    EXPECT_EQ(progress(), 0u);
+    bool sent = false;
+    asio::co_spawn(
+        io_,
+        [&]() -> asio::awaitable<void> {
+            sent = static_cast<bool>(co_await stream->write(encode_index_batch(second)));
+        },
+        asio::detached);
+    ASSERT_TRUE(drain([&] {
+        return sent && b_->filesystem().lookup(vfs::kRootIno, "from-c.txt").has_value();
+    }));
+    // The stream moved past E's record, remembering it was skipped.
+    ASSERT_TRUE(drain([&] { return progress() == 2; }));
+
+    // When E is pinned, B fetches C's index again from the start.
+    join_by_invite("e", drive_d_);
+    ASSERT_TRUE(drain([&] { return drive_b_->index().is_pinned(e_key.public_key()).value(); }));
+    EXPECT_TRUE(drain([&] { return progress() == 0 && !held->is_open(); }));
     endpoint->close();
 }
 

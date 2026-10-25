@@ -41,6 +41,9 @@ struct ApplyOutcome {
 // local sequence number so peers can fetch only what changed since their last exchange.
 // Local changes are signed with the device key; remote ones must carry a valid signature by the
 // device in their modified_by. Thread-safe: calls are serialized internally.
+inline constexpr std::size_t kMaxSkipped = 1024;
+inline constexpr std::size_t kMaxSkippedPerPeer = 64;
+
 class MetadataIndex {
 public:
     // `key` signs local changes and must outlive the index. The local device is its short ID.
@@ -80,7 +83,16 @@ public:
     // a member countersigned them, and adopts the verified records the key signed or
     // countersigned: this device countersigns them as they are. Retiring is permanent, and
     // retiring a key already retired does nothing. Returns how many records were adopted.
-    Result<std::size_t> retire_signer(const PublicKey& key);
+    // A provisional retirement (on the inviter's word, at pairing) lets records adopted from
+    // the key be checked but adopts nothing, is skipped for a key pinned here, and is cleared
+    // when the key is pinned. A retirement confirmed here also confirms a provisional one.
+    Result<std::size_t> retire_signer(const PublicKey& key, bool provisional = false);
+    bool is_confirmed_retired(std::uint64_t short_id) const;
+    // Records from `peer` by `author` skipped while the author was not established here
+    // (bounded; see kMaxSkipped). take_skipped returns and forgets the peers that skipped
+    // records by `author`, so their progress can be reset once it is pinned or retired.
+    Status note_skipped(const PublicKey& peer, std::uint64_t author);
+    Result<std::vector<PublicKey>> take_skipped(std::uint64_t author);
     // The device's key is known and not retired.
     bool is_active_signer(std::uint64_t short_id) const;
     bool is_retired_signer(std::uint64_t short_id) const;
