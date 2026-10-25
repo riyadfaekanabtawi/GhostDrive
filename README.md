@@ -145,6 +145,47 @@ invisible formatting characters replaced by `?`. Without `GHOSTDRIVE_BUILD_DIR`,
 leaves the tools out of the bundle. The app never reads key files. `ghostdrive status --json`
 is also usable from scripts.
 
+### Windows app
+
+`windows/GhostDriveApp` is a desktop app for Windows 10 (1809) or later on x64, in WinUI 3
+(Windows App SDK 2.5.1, C# on .NET 8). It is unpackaged and self-contained: the built folder
+runs as it is, with no MSIX, Windows App SDK runtime or .NET install, and is meant to sit
+next to `ghostdrive.exe`.
+
+- First run: when the data folder has no drive, it offers "Create a new drive"
+  (`ghostdrive init`) and "Join with an invite code" (`ghostdrive join`).
+- Home: this device's name and ID, whether GhostDrive is running, where the drive is mounted
+  (with Open drive) and the rendezvous state.
+- Devices: the other devices, online, relayed or offline, each with Remove
+  (`ghostdrive remove <ID>`, after a confirmation; its output is shown, including devices the
+  removed one added).
+- Add device: a one-time invite code (`ghostdrive invite`), large and copyable (kept out of
+  clipboard history), with the time it stays valid counting down.
+- Settings: Start and Stop GhostDrive, Start at login (`ghostdrive autostart on/off`), the
+  rendezvous server (`ghostdrive rendezvous`), and the data folder, mount location (a drive
+  letter such as `G:` or a folder) and the `ghostdrive.exe` to use, each empty for the default.
+  They are stored in `%LOCALAPPDATA%\GhostDriveApp\settings.json`.
+
+It finds `ghostdrive.exe` next to itself unless Settings names one, runs it without a shell
+or console window, and checks `ghostdrive status --json` every three seconds. Start runs the
+`ghostdrived.exe` next to `ghostdrive.exe` without a console window; Stop runs
+`ghostdrive stop`. Text from the daemon is shown with control, bidirectional and other
+invisible characters replaced by `?`. The app never reads key files or anything else in the
+data folder; it only checks whether the folder's `drive` file exists.
+
+Build it on Windows with the .NET 8 SDK (Visual Studio is not needed):
+
+```
+cd windows\GhostDriveApp
+dotnet test GhostDriveApp.Core.Tests          # also runs on Linux and macOS
+dotnet publish GhostDriveApp -c Release -o out
+```
+
+Then copy `ghostdrive.exe` and `ghostdrived.exe` from the `windows-release` build
+(`build\windows-release\cli` and `build\windows-release\daemon`) into `out`, and run
+`out\GhostDriveApp.exe`. The `windows` (Debug) build's programs need the vcpkg DLLs beside
+them, so for those set `build\windows\cli\ghostdrive.exe` as the tool in Settings instead.
+
 ## Limitations
 
 - Across the internet, devices need a rendezvous server to find each other, and a relay when

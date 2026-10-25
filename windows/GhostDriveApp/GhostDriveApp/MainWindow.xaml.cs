@@ -71,12 +71,10 @@ public sealed partial class MainWindow : Window
     private void UpdateVisibility()
     {
         var firstRun = model is not null && !model.HasDrive && model.CheckedOnce;
-        FirstRunPage.Visibility = Visible(page == "home" && firstRun);
-        HomePage.Visibility = Visible(page == "home" && !firstRun);
-        DevicesPage.Visibility = Visible(page == "devices");
-        AddPage.Visibility = Visible(page == "add");
-        SettingsPage.Visibility = Visible(page == "settings");
+        FirstRunPage.Visibility = Ui.Visible(page == "home" && firstRun);
+        HomePage.Visibility = Ui.Visible(page == "home" && !firstRun);
+        DevicesPage.Visibility = Ui.Visible(page == "devices");
+        AddPage.Visibility = Ui.Visible(page == "add");
+        SettingsPage.Visibility = Ui.Visible(page == "settings");
     }
-
-    private static Visibility Visible(bool on) => on ? Visibility.Visible : Visibility.Collapsed;
 }

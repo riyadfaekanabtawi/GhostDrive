@@ -30,14 +30,20 @@ public static class Locations
                 $"{CliName} was not found next to the app. Keep the app in the GhostDrive folder, or set the tool's location in Settings.");
     }
 
-    // ghostdrived.exe next to the ghostdrive.exe in use, as `ghostdrive autostart on` expects.
+    // ghostdrived.exe next to the ghostdrive.exe in use, or else in a build tree's daemon
+    // folder beside its cli folder: the rule `ghostdrive autostart on` follows (daemon_path).
     public static Located Daemon(string cliPath, Func<string, bool> fileExists)
     {
         var dir = System.IO.Path.GetDirectoryName(cliPath) ?? "";
         var daemon = System.IO.Path.Combine(dir, DaemonName);
-        return fileExists(daemon)
-            ? new Located(daemon, null)
-            : new Located(null, $"{DaemonName} was not found next to {CliName}.");
+        if (fileExists(daemon)) return new Located(daemon, null);
+        var parent = System.IO.Path.GetDirectoryName(dir);
+        if (!string.IsNullOrEmpty(parent))
+        {
+            var built = System.IO.Path.Combine(parent, "daemon", DaemonName);
+            if (fileExists(built)) return new Located(built, null);
+        }
+        return new Located(null, $"{DaemonName} was not found next to {CliName}.");
     }
 
     // The CLI's default (daemon/src/drive.cpp, default_data_dir): %LOCALAPPDATA%\GhostDrive.

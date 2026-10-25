@@ -301,6 +301,8 @@ public class LocationsTests
         var daemon = Path.Combine("dir", "ghostdrived.exe");
         Assert.Equal(daemon, Locations.Daemon(cli, Exists(daemon)).Path);
         Assert.NotNull(Locations.Daemon(cli, Exists()).Problem);
+        var built = Path.Combine("build", "daemon", "ghostdrived.exe");
+        Assert.Equal(built, Locations.Daemon(Path.Combine("build", "cli", "ghostdrive.exe"), Exists(built)).Path);
     }
 
     [Fact]
