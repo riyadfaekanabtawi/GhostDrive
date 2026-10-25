@@ -22,9 +22,10 @@ enum class Chunking : std::uint8_t {
     fixed = 0,
 };
 
-// One entry of the replicated index. `path` is drive-relative with '/' separators. The device in
-// `signer` signs the record (record_signed_bytes); relays pass it on unchanged. The signer is
-// the author in `modified_by`, except for a record of a removed device adopted by a member.
+// One entry of the replicated index. `path` is drive-relative with '/' separators. The author in
+// `modified_by` signs the record (record_signed_bytes); relays pass it on unchanged. A record
+// whose author was removed from the drive also carries the countersignature of the member that
+// adopted it (countersign_bytes).
 struct FileRecord {
     std::string path;
     std::uint64_t size = 0;
@@ -33,7 +34,6 @@ struct FileRecord {
     std::uint64_t hlc = 0;
     VersionVector version;
     std::uint64_t modified_by = 0;
-    std::uint64_t signer = 0;
     std::uint32_t block_size = 0;
     Chunking chunking = Chunking::fixed;
     bool deleted = false;
@@ -44,6 +44,9 @@ struct FileRecord {
     std::string origin_path;
     // Unset only for other devices' records stored before records were signed.
     std::optional<Signature> signature;
+    // The adopting member and its countersignature; 0 and unset on any other record.
+    std::uint64_t countersigner = 0;
+    std::optional<Signature> countersignature;
     // Local only, never sent: every version this device has seen for the path merged, which
     // can be ahead of the signed `version` after a concurrent update.
     VersionVector effective_version;
@@ -62,7 +65,11 @@ Status validate(const FileRecord& record);
 std::string conflict_copy_path(std::string_view path, std::int64_t mtime_ns, std::uint64_t device);
 
 // The bytes the author's signature covers: a context string, the drive ID, the signed path
-// (origin_path if set, else path), and every replicated field except sequence, signer included.
+// (origin_path if set, else path), and every replicated field except sequence.
 Bytes record_signed_bytes(const DriveId& drive, const FileRecord& record);
+// The bytes a countersignature covers: another context string, record_signed_bytes and the
+// author's signature. Covering the author's signature binds the countersignature to the exact
+// record the author signed, so it vouches for nothing else.
+Bytes countersign_bytes(const DriveId& drive, const FileRecord& record);
 
 }  // namespace ghostdrive::core

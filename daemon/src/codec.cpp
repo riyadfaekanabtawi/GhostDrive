@@ -127,8 +127,9 @@ void put_record(Writer& w, const core::FileRecord& r) {
     w.u32(static_cast<std::uint32_t>(r.chunks.size()));
     for (const auto& id : r.chunks) w.bytes(id.to_bytes());
     // Only signed records are sent; an unsigned one goes out with zeros and fails to verify.
-    w.u64(r.signer);
     w.bytes(r.signature.value_or(core::Signature{}));
+    w.u64(r.countersigner);
+    if (r.countersigner != 0) w.bytes(r.countersignature.value_or(core::Signature{}));
     w.str16(r.origin_path);
 }
 
@@ -177,11 +178,18 @@ std::optional<core::FileRecord> get_record(Reader& r) {
         if (!id) return std::nullopt;
         rec.chunks.push_back(id.value());
     }
-    auto signer = r.u64();
     core::Signature signature{};
-    auto origin = signer && r.fixed(signature) ? r.str16(kMaxPathBytes) : std::nullopt;
+    if (!r.fixed(signature)) return std::nullopt;
+    auto countersigner = r.u64();
+    if (!countersigner) return std::nullopt;
+    if (*countersigner != 0) {
+        core::Signature countersignature{};
+        if (!r.fixed(countersignature)) return std::nullopt;
+        rec.countersigner = *countersigner;
+        rec.countersignature = countersignature;
+    }
+    auto origin = r.str16(kMaxPathBytes);
     if (!origin) return std::nullopt;
-    rec.signer = *signer;
     rec.signature = signature;
     rec.origin_path = std::move(*origin);
     return rec;
@@ -398,6 +406,8 @@ core::Bytes encode_drive_info(const DriveInfo& info) {
     w.str16(info.rendezvous);
     put_entries(w, info.membership);
     put_discovery_keys(w, info.discovery_keys);
+    w.u32(static_cast<std::uint32_t>(info.retired_signers.size()));
+    for (const auto& key : info.retired_signers) w.bytes(key);
     return w.frame(wire::FrameType::drive_info);
 }
 
@@ -426,7 +436,14 @@ core::Result<DriveInfo> decode_drive_info(std::span<const std::byte> payload) {
     auto keys = get_discovery_keys(r);
     if (!keys) return malformed("DriveInfo discovery keys");
     info.discovery_keys = std::move(*keys);
-    if (!r.done()) {
+    auto retired = r.u32();
+    bool retired_ok = retired && *retired <= kMaxEverRemoved;
+    for (std::uint32_t i = 0; retired_ok && i < *retired; ++i) {
+        core::PublicKey key{};
+        retired_ok = r.fixed(key);
+        info.retired_signers.push_back(key);
+    }
+    if (!retired_ok || !r.done()) {
         for (auto& k : info.discovery_keys) core::secure_zero(k.key);
         return malformed("DriveInfo");
     }

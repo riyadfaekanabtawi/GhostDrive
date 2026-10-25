@@ -60,8 +60,14 @@ protected:
     // A record as `key` would sign it.
     FileRecord signed_by(const DeviceKey& key, FileRecord record) const {
         record.modified_by = short_id(key.public_key());
-        record.signer = record.modified_by;
         record.signature = key.sign(record_signed_bytes(drive_, record)).value();
+        return record;
+    }
+
+    // A record as `key` would countersign it when adopting it.
+    FileRecord countersigned_by(const DeviceKey& key, FileRecord record) const {
+        record.countersigner = short_id(key.public_key());
+        record.countersignature = key.sign(countersign_bytes(drive_, record)).value();
         return record;
     }
 
@@ -461,7 +467,8 @@ TEST_F(MetadataIndexTest, ARetiredSignerIsRejectedButItsRecordsStay) {
     ASSERT_TRUE(kept);
     EXPECT_EQ(kept->chunks, std::vector<ChunkId>{chunk_with(1)});
     EXPECT_EQ(kept->modified_by, id_b_);
-    EXPECT_EQ(kept->signer, id_a_);
+    EXPECT_EQ(kept->countersigner, id_a_);
+    EXPECT_EQ(kept->signature, b.get("kept").value()->signature);
     EXPECT_EQ(kept->version, b.get("kept").value()->version);
     EXPECT_TRUE(a.get("gone").value()->deleted);
 
@@ -481,25 +488,79 @@ TEST_F(MetadataIndexTest, ARetiredSignerIsRejectedButItsRecordsStay) {
     EXPECT_EQ(a.apply_remote(late, clock_a_).error().code, Errc::invalid_argument);
 }
 
-TEST_F(MetadataIndexTest, OnlyARemovedDevicesRecordsMayBeSignedByAnother) {
+TEST_F(MetadataIndexTest, AnAdoptedRecordMustBeOneTheRemovedDeviceSigned) {
     MetadataIndex a = open_peer("a.db", key_a_);
     MetadataIndex b = open_peer("b.db", key_b_);
     auto genuine = b.commit_local(file("f", 1, 1), clock_b_).value();
-    // C signs B's record as if adopting it while B is still a member.
-    auto relabelled = genuine;
-    relabelled.signer = id_c_;
-    relabelled.signature = key_c_.sign(record_signed_bytes(drive_, relabelled)).value();
-    EXPECT_EQ(a.apply_remote(relabelled, clock_a_).error().code, Errc::invalid_argument);
-    // Once B is removed, an adoption by a pinned member is fine.
+    auto other = b.commit_local(file("g", 1, 2), clock_b_).value();
     ASSERT_TRUE(a.retire_signer(key_b_.public_key()));
-    EXPECT_EQ(a.apply_remote(relabelled, clock_a_).value().kind, Kind::applied);
-    // Not by a device that is not pinned here.
-    auto by_unpinned = genuine;
-    by_unpinned.path = "g";
+
+    // B's own signature alone no longer counts.
+    EXPECT_EQ(a.apply_remote(genuine, clock_a_).error().code, Errc::invalid_argument);
+    // C makes up content in B's name at B's real version and countersigns it.
+    auto made_up = genuine;
+    made_up.chunks = {chunk_with(9)};
+    made_up.signature = key_c_.sign(record_signed_bytes(drive_, made_up)).value();
+    EXPECT_EQ(a.apply_remote(countersigned_by(key_c_, made_up), clock_a_).error().code,
+              Errc::invalid_argument);
+    // A countersignature over other bytes does not count either.
+    auto moved = countersigned_by(key_c_, genuine);
+    moved.countersignature = countersigned_by(key_c_, other).countersignature;
+    EXPECT_EQ(a.apply_remote(moved, clock_a_).error().code, Errc::invalid_argument);
+    // B's record countersigned by a pinned member is accepted, unchanged.
+    EXPECT_EQ(a.apply_remote(countersigned_by(key_c_, genuine), clock_a_).value().kind,
+              Kind::applied);
+    EXPECT_EQ(a.get("f").value()->chunks, std::vector<ChunkId>{chunk_with(1)});
+    // Not when the adopter is not pinned here; that may change, so it can be retried.
     ASSERT_TRUE(a.remove_device(key_c_.public_key()));
-    by_unpinned.signer = id_c_;
-    by_unpinned.signature = key_c_.sign(record_signed_bytes(drive_, by_unpinned)).value();
-    EXPECT_EQ(a.apply_remote(by_unpinned, clock_a_).error().code, Errc::not_found);
+    EXPECT_EQ(a.apply_remote(countersigned_by(key_c_, other), clock_a_).error().code,
+              Errc::not_found);
+}
+
+TEST_F(MetadataIndexTest, ADeviceThatIsNotPinnedCannotSign) {
+    MetadataIndex a = open_peer("a.db", key_a_);
+    MetadataIndex b = open_peer("b.db", key_b_);
+    auto record = b.commit_local(file("f", 1, 1), clock_b_).value();
+    // B is out (say every device that vouched for it is out) but not removed for good.
+    ASSERT_TRUE(a.remove_device(key_b_.public_key()));
+    EXPECT_EQ(a.apply_remote(record, clock_a_).error().code, Errc::not_found);
+    // A countersignature does not stand in for B being pinned.
+    EXPECT_EQ(a.apply_remote(countersigned_by(key_c_, record), clock_a_).error().code,
+              Errc::not_found);
+    EXPECT_FALSE(a.get("f").value().has_value());
+    // Pinned again, it signs again.
+    ASSERT_TRUE(a.add_device(key_b_.public_key(), "b"));
+    EXPECT_EQ(a.apply_remote(record, clock_a_).value().kind, Kind::applied);
+}
+
+TEST_F(MetadataIndexTest, RetiringAnAdopterAdoptsWhatItAdopted) {
+    const DeviceKey key_d = seeded_key(4);
+    MetadataIndex b = open_peer("b.db", key_b_);
+    MetadataIndex c = open_peer("c.db", key_c_);
+    auto record = b.commit_local(file("f", 1, 1), clock_b_).value();
+    ASSERT_TRUE(c.apply_remote(record, clock_a_));
+    // B is removed; C adopts its record and A gets C's adoption.
+    ASSERT_EQ(c.retire_signer(key_b_.public_key()).value(), 1u);
+    MetadataIndex a = open("a.db", key_a_);
+    ASSERT_TRUE(a.add_device(key_c_.public_key(), "c"));
+    ASSERT_TRUE(a.retire_signer(key_b_.public_key()));
+    std::uint64_t c_to_a = 0;
+    for (const auto& o : sync(c, a, c_to_a, clock_a_)) EXPECT_EQ(o.kind, Kind::applied);
+    EXPECT_EQ(a.get("f").value()->countersigner, id_c_);
+
+    // Then C is removed too: A countersigns the record in its place.
+    ASSERT_TRUE(a.remove_device(key_c_.public_key()));
+    EXPECT_EQ(a.retire_signer(key_c_.public_key()).value(), 1u);
+    EXPECT_EQ(a.get("f").value()->countersigner, id_a_);
+
+    // D joins later, knowing both were removed, and still gets B's file from A.
+    MetadataIndex d = open("d.db", key_d);
+    ASSERT_TRUE(d.add_device(key_a_.public_key(), "a"));
+    ASSERT_TRUE(d.retire_signer(key_b_.public_key()));
+    ASSERT_TRUE(d.retire_signer(key_c_.public_key()));
+    std::uint64_t a_to_d = 0;
+    for (const auto& o : sync(a, d, a_to_d, clock_a_)) EXPECT_EQ(o.kind, Kind::applied);
+    EXPECT_EQ(d.get("f").value()->chunks, std::vector<ChunkId>{chunk_with(1)});
 }
 
 TEST_F(MetadataIndexTest, AdoptionDoesNotBringBackADeletedFile) {

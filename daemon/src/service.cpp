@@ -588,7 +588,7 @@ asio::awaitable<void> Service::run_member(std::shared_ptr<transport::Connection>
         asio::co_spawn(io_, handle_stream(conn, std::move(stream).value()), asio::detached);
     }
     member_conns_.erase(conn);
-    unknown_signer_conns_.erase(conn);
+    pending_conns_.erase(conn);
     if (auto it = live_.find(key); it != live_.end() && it->second == conn) live_.erase(it);
     if (--member_connections_[key] == 0) member_connections_.erase(key);
 }
@@ -709,10 +709,18 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
             co_return;
         }
         if (!is_member(peer)) co_return;
-        bool pending = false;
+        // Devices whose records in this batch may become valid once pinned or retired here.
+        std::set<std::uint64_t> pending;
+        bool any_pending = false;
         const auto epoch = signer_epoch_;
+        const auto now = std::chrono::steady_clock::now();
+        // Such records hold this peer's progress back for pending_hold at most, so keys that
+        // are never established here cannot make every connection resend them.
+        auto held = pending_since_.find(peer);
+        const bool may_hold =
+            held == pending_since_.end() || now - held->second < options_.pending_hold;
         auto applied = co_await detail::run_on(
-            disk_, [drive, fs, peer, hello, &pending, &cap,
+            disk_, [drive, fs, peer, hello, may_hold, &pending, &any_pending, &cap,
                     entries = std::move(entries).value()]() -> Status {
                 auto& index = drive->index();
                 std::uint64_t last = 0;
@@ -722,8 +730,12 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
                     // signature first.
                     auto outcome = index.apply_remote(e.record, drive->clock());
                     if (!outcome && outcome.error().code == Errc::not_found) {
-                        pending = true;
-                        if (!cap) cap = e.record.sequence - 1;
+                        any_pending = true;
+                        if (may_hold && e.record.sequence > 0) {
+                            pending.insert(e.record.modified_by);
+                            if (e.record.countersigner != 0) pending.insert(e.record.countersigner);
+                            cap = std::min(cap.value_or(UINT64_MAX), e.record.sequence - 1);
+                        }
                     } else if (!outcome && outcome.error().code != Errc::invalid_argument) {
                         // A database failure: stop here so the next exchange resends this record.
                         failure = outcome.error();
@@ -752,13 +764,20 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
                 return {};
             });
         if (!*alive) co_return;
-        if (pending && conn->is_open()) {
-            // A device pinned or retired while the batch was applied may make those records
-            // valid already; otherwise wait for one.
-            if (signer_epoch_ != epoch) {
+        if (!any_pending) {
+            pending_since_.erase(peer);
+        } else if (!pending.empty()) {
+            pending_since_.emplace(peer, now);
+            // One of those devices pinned or retired while the batch was applied may make the
+            // records valid already; otherwise wait for that.
+            bool changed = std::any_of(pending.begin(), pending.end(), [&](std::uint64_t id) {
+                auto it = changed_at_.find(id);
+                return it != changed_at_.end() && it->second > epoch;
+            });
+            if (changed) {
                 conn->close();
-            } else {
-                unknown_signer_conns_.insert(conn);
+            } else if (conn->is_open()) {
+                pending_conns_[conn].insert(pending.begin(), pending.end());
             }
         }
         if (!applied) {
@@ -833,6 +852,7 @@ asio::awaitable<void> Service::run_pairing(std::shared_ptr<transport::Connection
     if (auto config = drive_.rendezvous()) info.rendezvous = config->to_string();
     info.membership = drive_.membership().entries();
     info.discovery_keys = drive_.discovery_keys().keys();
+    info.retired_signers = drive_.index().retired_signers();
     auto addresses = drive_.peer_addresses();
     if (auto devices = drive_.index().devices()) {
         for (const auto& d : devices.value()) {
@@ -873,10 +893,23 @@ Status Service::refresh_membership(bool changed) {
     auto applied = drive_.apply_membership();
     if (!applied) return applied.error();
     if (!applied.value().pinned.empty() || !applied.value().retired.empty()) {
+        // Close only the connections that sent records naming one of these devices.
         ++signer_epoch_;
-        auto stale = std::move(unknown_signer_conns_);
-        unknown_signer_conns_.clear();
-        for (const auto& conn : stale) conn->close();
+        std::set<std::uint64_t> changed;
+        for (const auto& key : applied.value().pinned) changed.insert(core::short_id(key));
+        for (const auto& key : applied.value().retired) changed.insert(core::short_id(key));
+        for (auto id : changed) changed_at_[id] = signer_epoch_;
+        std::vector<std::shared_ptr<transport::Connection>> stale;
+        for (const auto& [conn, ids] : pending_conns_) {
+            if (std::any_of(ids.begin(), ids.end(),
+                            [&](std::uint64_t id) { return changed.contains(id); })) {
+                stale.push_back(conn);
+            }
+        }
+        for (const auto& conn : stale) {
+            pending_conns_.erase(conn);
+            conn->close();
+        }
     }
     for (const auto& key : applied.value().unpinned) {
         live_.erase(key);

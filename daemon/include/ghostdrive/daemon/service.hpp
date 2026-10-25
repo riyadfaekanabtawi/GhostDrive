@@ -54,6 +54,9 @@ struct ServiceOptions {
     // device that adds a key, or removes another device, gets neither from a device that
     // learns of its removal within this time.
     std::chrono::milliseconds countersign_after{60'000};
+    // How long records that may become valid (their author or adopter is not established here
+    // yet) hold a peer's index progress back. After that they are skipped like invalid ones.
+    std::chrono::milliseconds pending_hold{10 * 60'000};
 };
 
 struct PeerStatus {
@@ -185,11 +188,16 @@ private:
     std::map<core::PublicKey, int> member_connections_;
     // Every open member connection, including the second one when both sides dialed.
     std::set<std::shared_ptr<transport::Connection>> member_conns_;
-    // Connections that sent records whose signer is not known here yet. They are closed when
-    // a device is pinned or retired, so the next one sends those records again.
-    std::set<std::shared_ptr<transport::Connection>> unknown_signer_conns_;
-    // Counts those pins and retirements, so a batch applied meanwhile notices one.
+    // Connections that sent records that may become valid, with the devices they name. A
+    // connection is closed when one of those devices is pinned or retired, so the next one
+    // sends the records again.
+    std::map<std::shared_ptr<transport::Connection>, std::set<std::uint64_t>> pending_conns_;
+    // Counts pins and retirements, and when each device last changed, so a batch applied
+    // meanwhile notices one.
     std::uint64_t signer_epoch_ = 0;
+    std::map<std::uint64_t, std::uint64_t> changed_at_;
+    // Since when each peer's progress has been held back by such records (pending_hold).
+    std::map<core::PublicKey, std::chrono::steady_clock::time_point> pending_since_;
     // When each member was first seen as one, for countersign_after.
     std::map<core::PublicKey, std::chrono::steady_clock::time_point> member_since_;
     // When each device was first seen removed by a member, for the same delay.

@@ -94,7 +94,6 @@ FileRecord signed_sample() {
     r.hlc = 0x0102030405060708ull;
     r.version.bump(9);
     r.modified_by = 9;
-    r.signer = 9;
     r.block_size = kMinBlockSize;
     ChunkId id;
     id.digest.fill(std::byte{0xCC});
@@ -116,7 +115,7 @@ TEST(FileRecord, SignedBytesAreStable) {
         "05000000612e747874"                                                // path
         "0500000000000000a4010000feffffffffffffff0807060504030201"          // size .. hlc
         "0100000009000000000000000100000000000000"                          // version
-        "09000000000000000900000000000000"  // modified_by, signer
+        "0900000000000000"  // modified_by
         "000002000000"                      // block size, chunking, deleted
         "01000000"                      // chunk count
         "01cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";  // tag, digest
@@ -140,7 +139,6 @@ TEST(FileRecord, SignedBytesCoverEveryReplicatedField) {
         {"hlc", [](FileRecord& r) { r.hlc += 1; }},
         {"version", [](FileRecord& r) { r.version.bump(9); }},
         {"modified_by", [](FileRecord& r) { r.modified_by = 10; }},
-        {"signer", [](FileRecord& r) { r.signer = 10; }},
         {"block_size", [](FileRecord& r) { r.block_size *= 2; }},
         {"deleted", [](FileRecord& r) { r.deleted = true; }},
         {"chunk", [](FileRecord& r) { r.chunks[0].digest[0] = std::byte{0}; }},

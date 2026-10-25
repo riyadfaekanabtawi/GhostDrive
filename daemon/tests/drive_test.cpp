@@ -82,6 +82,8 @@ TEST(Drive, JoinPinsTheMembersTheInviterVouchesFor) {
     gone.fill(std::byte{8});
     ASSERT_TRUE(a.discovery_keys().update(a.key(), {phone.value().public_key()}, {gone}));
     info.discovery_keys = a.discovery_keys().keys();
+    // Removed devices whose membership entries may be gone; a member listed is left alone.
+    info.retired_signers = {gone, phone.value().public_key()};
 
     auto joined = Drive::join(dir.path() / "b", "laptop", info, a.key().public_key());
     ASSERT_TRUE(joined) << joined.error().message;
@@ -93,6 +95,8 @@ TEST(Drive, JoinPinsTheMembersTheInviterVouchesFor) {
     EXPECT_EQ(b.peer_addresses().at(phone.value().public_key()), "10.0.0.9:7373");
     EXPECT_FALSE(b.peer_addresses().contains(stranger));
     EXPECT_EQ(b.discovery_keys().current(), a.discovery_keys().current());
+    EXPECT_TRUE(b.index().is_retired_signer(core::short_id(gone)));
+    EXPECT_FALSE(b.index().is_retired_signer(core::short_id(phone.value().public_key())));
 
     // The membership and the discovery keys are stored and survive reopening.
     auto key_b = b.key().public_key();

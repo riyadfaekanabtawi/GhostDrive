@@ -116,6 +116,10 @@ struct DriveInfo {
     std::string rendezvous;  // "host:port FINGERPRINT", empty when the drive has none
     std::vector<MembershipEntry> membership;
     std::vector<DiscoveryKey> discovery_keys;
+    // Keys of devices removed for good, so the new device can check records adopted from them
+    // even when the membership entries naming them were compacted away. The inviter is
+    // trusted for these, as for the rest of DriveInfo.
+    std::vector<core::PublicKey> retired_signers;
 };
 
 // A device name made safe to show in a terminal: invalid UTF-8, control characters (C0 and
