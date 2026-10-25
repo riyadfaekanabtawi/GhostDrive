@@ -524,6 +524,44 @@ TEST_F(RelayRules, TheServerForwardsOnlyWithinTheGroupRules) {
     for (auto* p : {&x, &y, &other, &looking, &unregistered}) p->close();
 }
 
+TEST_F(RelayRules, BudgetsCountWholeFramesPerSenderAndPerReceiver) {
+    // Budgets that do not refill during the test: the sender's covers 7 frames of 132 bytes,
+    // the receiver's 11, so a second sender gets only the receiver's remaining 4 through.
+    // The fixture's server is replaced; its accept loop must have started before it goes.
+    drain([] { return false; }, 50ms);
+    server_->stop();
+    rendezvous::ServerOptions options;
+    options.listen = asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0);
+    options.relay_bytes_per_second = 1;
+    options.relay_burst_bytes = 1000;
+    options.relay_receive_bytes_per_second = 1;
+    options.relay_receive_burst_bytes = 1500;
+    server_ = rendezvous::Server::start(io_.get_executor(), *server_key_, options).value();
+
+    auto mine = secret(1);
+    auto x = open_probe(register_in(mine));
+    auto y = open_probe(register_in(mine));
+    auto z = open_probe(register_in(mine));
+    ASSERT_TRUE(x.registered && y.registered && z.registered);
+    auto flood = [&](Probe& from, std::uint64_t seed) {
+        auto handled = [&] {
+            return server_->stats().relayed_datagrams + server_->stats().dropped_datagrams;
+        };
+        auto before = handled();
+        for (int i = 0; i < 20; ++i) {
+            EXPECT_TRUE(from.conn->send_datagram(relay_frame(y.key, seed + i)));
+        }
+        EXPECT_TRUE(drain([&] { return handled() == before + 20; }, 5s));
+    };
+    flood(x, 100);
+    EXPECT_EQ(server_->stats().relayed_datagrams, 7u) << "the sender's budget";
+    flood(z, 200);
+    EXPECT_EQ(server_->stats().relayed_datagrams, 11u) << "the receiver's budget";
+    EXPECT_EQ(server_->stats().relayed_bytes, 11u * 132);
+    EXPECT_TRUE(drain([&] { return y.received->size() == 11; }, 5s));
+    for (auto* p : {&x, &y, &z}) p->close();
+}
+
 TEST_F(RelayRules, RawUdpInTheOldRelayFormatIsNotRelayed) {
     auto mine = secret(1);
     auto x = open_probe(register_in(mine));

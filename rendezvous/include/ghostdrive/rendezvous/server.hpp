@@ -30,9 +30,13 @@ struct ServerOptions {
     // only their own drives lists them here (`ghostdrive status` shows a drive's ID as its
     // group).
     std::set<discovery::GroupId> allowed_groups;
-    // Relay budget per client, as a token bucket.
+    // Relay budget per client, as a token bucket charged with whole relay frames.
     std::size_t relay_bytes_per_second = 4u * 1024 * 1024;
     std::size_t relay_burst_bytes = 1024 * 1024;
+    // The same per receiving client, so many senders (say, throwaway clients in an earlier
+    // group) cannot flood one member together.
+    std::size_t relay_receive_bytes_per_second = 8u * 1024 * 1024;
+    std::size_t relay_receive_burst_bytes = 2u * 1024 * 1024;
     transport::Impairment impairment{};
 };
 
