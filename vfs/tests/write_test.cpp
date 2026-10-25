@@ -366,7 +366,6 @@ TEST_F(WriteTest, RemoteEditWhileOpenBecomesAConflictCopy) {
     auto remote = record_of("doc.txt");
     remote.version.bump(other_id);
     remote.modified_by = other_id;
-    remote.signer = other_id;
     remote.hlc = clock_.now() + 1000;
     remote.mtime_ns += 1;
     remote.signature = other.sign(core::record_signed_bytes(core::DriveId{}, remote)).value();

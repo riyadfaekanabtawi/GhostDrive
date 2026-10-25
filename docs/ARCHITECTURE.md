@@ -118,19 +118,26 @@ document assumes the corrected version.
 
   The scheme follows Syncthing BEP: each device has a monotonic local sequence plus an `index_id`.
   A peer sends `{index_id, max_sequence}` and receives only newer records.
-- **Signed records.** A record carries a `signer` beside `modified_by`; the signer signs it
-  with its Ed25519 key over a context string, the drive ID, the path (the origin path for a
-  conflict copy), size, mode, mtime, HLC, the canonical version vector, `modified_by`, the
-  signer, block size, chunking, the deleted flag and the chunk list. Sequence and the holds
-  flag are not signed. The signer is the author (`modified_by`), except for an adopted record
-  (section 3.6): one whose author is a retired signer here, signed by a member pinned here.
-  Relays never re-sign, so a member can neither forge a change in another device's name nor
-  alter a record it relays. The index verifies a remote record only when it would change
-  something (new, newer, or concurrent); ignored records cost no check. A record signed by a
-  retired key, or by someone other than its author while the author is not retired, is
-  rejected for good; one whose signer is not known here yet (or an adopted record whose
-  author is not known as removed, or whose signer is not pinned) is rejected as possibly
-  valid later.
+- **Signed records.** The author in `modified_by` signs each record with its Ed25519 key over
+  a context string, the drive ID, the path (the origin path for a conflict copy), size, mode,
+  mtime, HLC, the canonical version vector, `modified_by`, block size, chunking, the deleted
+  flag and the chunk list. Sequence and the holds flag are not signed. Relays never re-sign,
+  so a member can neither forge a change in another device's name nor alter a record it
+  relays. The index verifies a remote record only when it would change something (new, newer,
+  or concurrent); ignored records cost no check. The rules:
+  - the author's signature must verify against its key, which must be known here;
+  - an author that is not retired must be pinned here. One that is unpinned but not removed
+    (in doubt, or out because every device that vouched for it is out) signs nothing here
+    until it is pinned again, and its records are never adopted;
+  - a retired author's record counts only if adopted: it also carries the countersignature of
+    a member pinned here, over another context string, the signed bytes and the author's
+    signature. Covering the author's signature ties the countersignature to the exact record
+    the author signed, so adoption can only pass on records the removed device really signed.
+    The record itself is unchanged, so adoptions of one version by several members compare
+    equal; the first one stored is kept. A retired author's record without a countersignature,
+    or countersigned by a retired key, is rejected;
+  - a record that breaks a rule for good is rejected as invalid; one whose author or adopter
+    is unknown or not pinned here is rejected as possibly valid later.
 - **Schema 2 migration.** Index schema 2 adds signatures. Opening a schema 1 index signs this
   device's own records as they are and gives the index a new `index_id`. Other devices'
   records stay unsigned: still readable here, never sent on or adopted, until a peer sends the
@@ -410,23 +417,29 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   sender holds every chunk of that version, which feeds `holders()` on the receiver.
   - Records carry their signature (section 3.1) in frame type 15; the unsigned type 6 is no
     longer sent or accepted, so an older peer fails cleanly. Unsigned records are not sent.
-  - A rejected record is skipped for good, except one that may become valid later (its signer
-    is not known here yet: the membership stream can lag the index stream). Progress on that
-    stream then stops just before the first such record, so the next connection sends it
-    again; nothing is reset for other peers. When the membership view pins or retires a
-    device, the connections that delivered such records are closed. A batch still being
-    applied when that happens notices it (a counter taken before and checked after) and closes
-    its connection itself.
+  - A rejected record is skipped for good, except one that may become valid later (its author
+    or adopter is not established here yet: the membership stream can lag the index stream).
+    Progress on that stream then stops just before the lowest such record, so the next
+    connection sends it again; nothing is reset for other peers. This holds for
+    `pending_hold` (10 minutes) per peer at most, counted from the first such record and
+    cleared by a batch without any; after that they are skipped like invalid ones, so keys that
+    are never established cannot make every connection resend. A record with sequence 0 is
+    never held. When the membership view pins or retires a device, only the connections that
+    delivered records naming it are closed. A batch still being applied then notices the
+    change (an epoch taken before, checked against the devices it names after) and closes its
+    connection itself.
   - A device removed for good (not one in doubt, and not one whose removal may still be
     undone) has its key retired as a signer: its stored records stay, new ones signed by it are
     rejected. Retiring runs before unpinning and again whenever the drive is opened, so a crash
-    in between never leaves the key accepted. Each remaining member adopts the removed device's
-    verified records, tombstones included, in the same transaction: it signs each as signer
-    and changes nothing else, not the version, content or `modified_by`. Adoptions of the same
-    version by several members compare equal, and a newer version by the removed device still
-    supersedes an older one whoever adopted each, so adoption neither brings deleted files back
-    nor makes conflict copies. A device that joins later accepts these records once it knows
-    the device was removed, from the membership entries it is given.
+    in between never leaves the key accepted. Each remaining member adopts, in the same
+    transaction, the verified records the removed device signed and those it had countersigned
+    (an adopter removed in turn): it countersigns each and changes nothing else, not the
+    version, content, `modified_by` or the author's signature. A newer version by the removed
+    device still supersedes an older one whoever adopted each, so adoption neither brings
+    deleted files back nor makes conflict copies.
+  - A device that joins later learns the retired keys from `DriveInfo` at pairing (the
+    inviter's retired signers, trusted like the rest of `DriveInfo`; a key it sees as a member
+    is ignored), since membership compaction may have dropped every entry naming them.
 - **Data directory** (0700): `device.key` and `drive` (ID, secret, name) are 0600 and refused
   when readable by others, as are `membership` and `discovery` (section 3.7); `index.db`, `chunks/`, `staging/`, `peers` (last known address per
   member), and the control socket.
@@ -440,8 +453,9 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   does not answer a GetChunk within 10 s is passed over. Still open:
   - a member can inflate other devices' counters in a vector it signs, hiding their later
     edits (attributable, not prevented);
-  - a member can present any content in a removed device's name, as an adopted record; it is
-    signed by that member, so it is traceable;
+  - a removed device's records, signed while it was a member, can be countersigned by any
+    member; the content is the removed device's own, and the adopter is traceable;
+  - an inviter can hand a new device any keys as retired signers;
   - any version a device once signed can be presented as that version's conflict copy, under
     the author's own signature (not attributable to the relay). A copy is valid only at the
     name derived from its origin, mtime and author, so this resurfaces old content under a

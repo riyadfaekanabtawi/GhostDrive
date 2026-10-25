@@ -104,7 +104,6 @@ Bytes record_signed_bytes(const DriveId& drive, const FileRecord& record) {
     put(record.hlc, 8);
     out.insert(out.end(), version.begin(), version.end());
     put(record.modified_by, 8);
-    put(record.signer, 8);
     put(record.block_size, 4);
     put(static_cast<std::uint8_t>(record.chunking), 1);
     put(record.deleted ? 1 : 0, 1);
@@ -113,6 +112,17 @@ Bytes record_signed_bytes(const DriveId& drive, const FileRecord& record) {
         const auto bytes = id.to_bytes();  // algorithm tag, then digest
         out.insert(out.end(), bytes.begin(), bytes.end());
     }
+    return out;
+}
+
+Bytes countersign_bytes(const DriveId& drive, const FileRecord& record) {
+    constexpr std::string_view kContext = "ghostdrive-file-record-adoption-v1";
+    const auto context = as_bytes(kContext);
+    Bytes out(context.begin(), context.end());
+    const Bytes signed_bytes = record_signed_bytes(drive, record);
+    out.insert(out.end(), signed_bytes.begin(), signed_bytes.end());
+    const Signature signature = record.signature.value_or(Signature{});
+    out.insert(out.end(), signature.begin(), signature.end());
     return out;
 }
 

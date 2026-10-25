@@ -29,7 +29,8 @@ core::FileRecord sample_record() {
     r.version.bump(7);
     r.version.bump(99);
     r.modified_by = 99;
-    r.signer = 7;
+    r.countersigner = 7;
+    r.countersignature = core::Signature{std::byte{9}};
     r.block_size = 128 * 1024;
     r.sequence = 42;
     for (std::uint8_t i = 0; i < 3; ++i) {
@@ -61,6 +62,8 @@ TEST(Codec, IndexBatchRoundTrip) {
     auto deleted = sample_record();
     deleted.path = "old.txt";
     deleted.origin_path.clear();
+    deleted.countersigner = 0;
+    deleted.countersignature.reset();
     deleted.deleted = true;
     deleted.chunks.clear();
     deleted.size = 0;
@@ -82,7 +85,9 @@ TEST(Codec, IndexBatchRoundTrip) {
     EXPECT_EQ(a.block_size, expected.block_size);
     EXPECT_EQ(a.sequence, expected.sequence);
     EXPECT_EQ(a.chunks, expected.chunks);
-    EXPECT_EQ(a.signer, expected.signer);
+    EXPECT_EQ(a.countersigner, expected.countersigner);
+    EXPECT_EQ(a.countersignature, expected.countersignature);
+    EXPECT_FALSE(decoded.value()[1].record.countersignature);
     EXPECT_EQ(a.signature, expected.signature);
     EXPECT_EQ(a.origin_path, expected.origin_path);
     EXPECT_TRUE(decoded.value()[1].record.origin_path.empty());
@@ -97,8 +102,9 @@ TEST(Codec, TruncatedOrPaddedPayloadsAreRejected) {
     for (std::size_t cut = 0; cut < payload.size(); cut += 7) {
         EXPECT_FALSE(decode_index_batch(payload.first(cut))) << "cut at " << cut;
     }
-    // Cut inside the signature, which ends 2 + origin_path bytes before the end.
-    const std::size_t signature_end = payload.size() - 2 - sample_record().origin_path.size();
+    // Cut inside the signature, which the countersigner, its signature and origin_path follow.
+    const std::size_t signature_end =
+        payload.size() - 8 - core::kSignatureSize - 2 - sample_record().origin_path.size();
     for (std::size_t cut = signature_end - core::kSignatureSize; cut < signature_end; ++cut) {
         EXPECT_FALSE(decode_index_batch(payload.first(cut))) << "cut at " << cut;
     }
@@ -144,6 +150,7 @@ TEST(Codec, JoinAndDriveInfoRoundTrip) {
     EXPECT_EQ(d.value().members[0].key, m.key);
     EXPECT_EQ(d.value().members[0].address, m.address);
     EXPECT_TRUE(d.value().membership.empty());
+    EXPECT_TRUE(d.value().retired_signers.empty());
 
     MembershipEntry e;
     e.kind = MembershipEntry::Kind::add;
@@ -158,10 +165,14 @@ TEST(Codec, JoinAndDriveInfoRoundTrip) {
     r.invited = false;
     r.name.clear();
     info.membership = {e, r};
+    info.retired_signers.resize(2);
+    info.retired_signers[0].fill(std::byte{7});
+    info.retired_signers[1].fill(std::byte{8});
     auto with = encode_drive_info(info);
     auto dm = decode_drive_info(payload_of(with, wire::FrameType::drive_info));
     ASSERT_TRUE(dm);
     EXPECT_EQ(dm.value().membership, info.membership);
+    EXPECT_EQ(dm.value().retired_signers, info.retired_signers);
     auto batch = encode_membership(info.membership);
     auto b = decode_membership(payload_of(batch, wire::FrameType::membership));
     ASSERT_TRUE(b);

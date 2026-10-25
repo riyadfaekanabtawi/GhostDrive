@@ -62,8 +62,9 @@ constexpr const char* kSchemaV2 = R"sql(
 ALTER TABLE files ADD COLUMN signature BLOB;
 ALTER TABLE files ADD COLUMN origin_path TEXT NOT NULL DEFAULT '';
 ALTER TABLE files ADD COLUMN effective_version BLOB;
-ALTER TABLE files ADD COLUMN signer INTEGER NOT NULL DEFAULT 0;
-UPDATE files SET effective_version = version, signer = modified_by;
+ALTER TABLE files ADD COLUMN countersigner INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE files ADD COLUMN countersignature BLOB;
+UPDATE files SET effective_version = version;
 CREATE TABLE signers (
     short_id INTEGER PRIMARY KEY,
     key BLOB NOT NULL UNIQUE,
@@ -254,7 +255,9 @@ struct MetadataIndex::Impl {
     Result<std::vector<std::string>> paths_where(const char* sql, std::uint64_t arg) const;
     Result<FileRecord> write_record(FileRecord record);
     Status sign(FileRecord& record) const;
-    Status verify(const FileRecord& record) const;
+    Status countersign(FileRecord& record) const;
+    // Also drops a countersignature that is not needed, so stored records are canonical.
+    Status verify(FileRecord& record) const;
     Status load_signers();
     Status migrate_to_v2();
     // The caller holds a transaction.
@@ -267,7 +270,7 @@ Result<std::optional<FileRecord>> MetadataIndex::Impl::read_record(std::string_v
     auto stmt = prepare(db.get(),
                         "SELECT size, mode, mtime_ns, hlc, version, modified_by, block_size, "
                         "chunking, deleted, sequence, signature, origin_path, effective_version, "
-                        "signer FROM files WHERE path = ?");
+                        "countersigner, countersignature FROM files WHERE path = ?");
     if (!stmt) return stmt.error();
     Stmt& s = stmt.value();
     s.bind_text(1, path);
@@ -300,7 +303,14 @@ Result<std::optional<FileRecord>> MetadataIndex::Impl::read_record(std::string_v
     auto effective = VersionVector::parse(s.col_blob(12));
     if (!effective) return effective.error();
     record.effective_version = std::move(effective).value();
-    record.signer = s.col_u64(13);
+    record.countersigner = s.col_u64(13);
+    if (!s.col_null(14)) {
+        const auto blob = s.col_blob(14);
+        if (blob.size() != kSignatureSize) return Error{Errc::corrupt, "bad stored signature"};
+        Signature sig{};
+        std::copy(blob.begin(), blob.end(), sig.begin());
+        record.countersignature = sig;
+    }
 
     auto chunks = prepare(db.get(), "SELECT chunk FROM chunks WHERE path = ? ORDER BY idx");
     if (!chunks) return chunks.error();
@@ -329,8 +339,8 @@ Result<FileRecord> MetadataIndex::Impl::write_record(FileRecord record) {
     auto ins = prepare(db.get(),
                        "INSERT INTO files(path, size, mode, mtime_ns, hlc, version, modified_by, "
                        "block_size, chunking, deleted, sequence, signature, origin_path, "
-                       "effective_version, signer) "
-                       "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                       "effective_version, countersigner, countersignature) "
+                       "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     if (!ins) return ins.error();
     const Bytes version = record.version.serialize();
     const Bytes effective = record.effective_version.serialize();
@@ -338,6 +348,11 @@ Result<FileRecord> MetadataIndex::Impl::write_record(FileRecord record) {
         ins.value().bind_blob(12, *record.signature);
     } else {
         ins.value().bind_null(12);
+    }
+    if (record.countersignature) {
+        ins.value().bind_blob(16, *record.countersignature);
+    } else {
+        ins.value().bind_null(16);
     }
     auto st = ins.value()
                   .bind_text(1, record.path)
@@ -353,7 +368,7 @@ Result<FileRecord> MetadataIndex::Impl::write_record(FileRecord record) {
                   .bind_u64(11, record.sequence)
                   .bind_text(13, record.origin_path)
                   .bind_blob(14, effective)
-                  .bind_u64(15, record.signer)
+                  .bind_u64(15, record.countersigner)
                   .run();
     if (!st) return st.error();
 
@@ -387,36 +402,61 @@ Result<std::vector<std::string>> MetadataIndex::Impl::paths_where(const char* sq
 }
 
 Status MetadataIndex::Impl::sign(FileRecord& record) const {
-    record.signer = local_device;
     auto signature = key->sign(record_signed_bytes(drive, record));
     if (!signature) return signature.error();
     record.signature = signature.value();
+    record.countersigner = 0;
+    record.countersignature.reset();
     return {};
 }
 
-Status MetadataIndex::Impl::verify(const FileRecord& record) const {
+Status MetadataIndex::Impl::countersign(FileRecord& record) const {
+    record.countersigner = local_device;
+    auto signature = key->sign(countersign_bytes(drive, record));
+    if (!signature) return signature.error();
+    record.countersignature = signature.value();
+    return {};
+}
+
+Status MetadataIndex::Impl::verify(FileRecord& record) const {
     // not_found: the record may become valid once a device is pinned or retired here.
-    auto it = signers.find(record.signer);
-    if (it == signers.end()) {
-        return Error{Errc::not_found, "record signed by an unknown device: " + record.path};
-    }
-    if (it->second.retired) {
-        return Error{Errc::invalid_argument, "record signed by a removed device: " + record.path};
-    }
-    // Only a removed device's records may be signed by another: a member that adopted them.
-    if (record.signer != record.modified_by) {
-        auto author = signers.find(record.modified_by);
-        if (!it->second.pinned || author == signers.end()) {
-            return Error{Errc::not_found, "adopted record not verifiable yet: " + record.path};
-        }
-        if (!author->second.retired) {
-            return Error{Errc::invalid_argument,
-                         "record signed by a device other than its author: " + record.path};
-        }
+    auto author = signers.find(record.modified_by);
+    if (author == signers.end()) {
+        return Error{Errc::not_found, "record by an unknown device: " + record.path};
     }
     if (!record.signature ||
-        !verify_signature(it->second.key, record_signed_bytes(drive, record), *record.signature)) {
+        !verify_signature(author->second.key, record_signed_bytes(drive, record),
+                          *record.signature)) {
         return Error{Errc::invalid_argument, "record signature does not verify: " + record.path};
+    }
+    if (!author->second.retired) {
+        // Only pinned devices sign. One unpinned but not removed (in doubt, or out because
+        // every device that vouched for it is out) may be pinned again.
+        if (!author->second.pinned) {
+            return Error{Errc::not_found, "record by a device not pinned here: " + record.path};
+        }
+        record.countersigner = 0;
+        record.countersignature.reset();
+        return {};
+    }
+    // A removed device's record counts only as adopted: countersigned by a pinned member.
+    if (record.countersigner == 0) {
+        return Error{Errc::invalid_argument, "record by a removed device: " + record.path};
+    }
+    auto adopter = signers.find(record.countersigner);
+    if (adopter == signers.end()) {
+        return Error{Errc::not_found, "record adopted by an unknown device: " + record.path};
+    }
+    if (adopter->second.retired) {
+        return Error{Errc::invalid_argument, "record adopted by a removed device: " + record.path};
+    }
+    if (!adopter->second.pinned) {
+        return Error{Errc::not_found, "record adopted by a device not pinned: " + record.path};
+    }
+    if (!record.countersignature ||
+        !verify_signature(adopter->second.key, countersign_bytes(drive, record),
+                          *record.countersignature)) {
+        return Error{Errc::invalid_argument, "countersignature does not verify: " + record.path};
     }
     return {};
 }
@@ -814,20 +854,22 @@ Result<std::size_t> MetadataIndex::retire_signer(const PublicKey& key) {
     auto st = signer.value().bind_u64(1, id).bind_blob(2, key).bind_u64(3, sequence.value()).run();
     if (!st) return st.error();
 
-    // Adoption: a device that joins later cannot check the retired key's signatures, so this
-    // device signs each verified record it signed as the record's signer. Content, version and
-    // modified_by stay as they were, so adoptions by several members compare equal and a newer
-    // version by the removed device still supersedes an older one, whoever adopted each.
+    // Adoption: records by a removed device are accepted only with a member's countersignature,
+    // so this device countersigns each verified record the key signed, and each it had
+    // countersigned (an adopter removed in turn). The record itself, its version and the
+    // author's signature stay as they were: adoptions by several members compare equal, and a
+    // newer version by the removed device still supersedes an older one whoever adopted each.
     // Unsigned rows were never verified and are not adopted.
     auto paths = impl_->paths_where(
-        "SELECT path FROM files WHERE modified_by = ?1 AND signer = ?1 AND signature IS NOT NULL",
+        "SELECT path FROM files WHERE signature IS NOT NULL AND "
+        "(modified_by = ?1 OR countersigner = ?1)",
         id);
     if (!paths) return paths.error();
     for (const auto& path : paths.value()) {
         auto record = impl_->read_record(path);
         if (!record) return record.error();
         if (!record.value()) continue;
-        if (auto sst = impl_->sign(*record.value()); !sst) return sst.error();
+        if (auto sst = impl_->countersign(*record.value()); !sst) return sst.error();
         if (auto w = impl_->write_record(std::move(*record.value())); !w) return w.error();
     }
     if (auto cst = tx.commit(); !cst) return cst.error();
@@ -847,6 +889,15 @@ bool MetadataIndex::is_retired_signer(std::uint64_t id) const {
     std::lock_guard lock(impl_->mutex);
     auto it = impl_->signers.find(id);
     return it != impl_->signers.end() && it->second.retired;
+}
+
+std::vector<PublicKey> MetadataIndex::retired_signers() const {
+    std::lock_guard lock(impl_->mutex);
+    std::vector<PublicKey> out;
+    for (const auto& [id, signer] : impl_->signers) {
+        if (signer.retired) out.push_back(signer.key);
+    }
+    return out;
 }
 
 Status MetadataIndex::remove_device(const PublicKey& key) {

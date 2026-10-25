@@ -283,6 +283,12 @@ core::Result<std::unique_ptr<Drive>> Drive::join(const std::filesystem::path& ro
     if (auto applied = d.apply_membership(); !applied) return applied.error();
     // The inviter's keys already account for the devices removed so far.
     auto view = d.membership().view();
+    // Its retired signers too, which the membership entries may no longer name. A device this
+    // device sees as a member is left alone.
+    for (const auto& key : info.retired_signers) {
+        if (view.members.contains(key) || key == d.key().public_key()) continue;
+        if (auto st = d.index().retire_signer(key); !st) return st.error();
+    }
     std::set<core::PublicKey> members;
     for (const auto& [k, name] : view.members) members.insert(k);
     d.discovery_keys().merge(info.discovery_keys, members);

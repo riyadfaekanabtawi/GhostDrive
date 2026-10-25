@@ -430,7 +430,6 @@ TEST_F(TwoDevices, ForgedRecordsFromAMemberAreDropped) {
     const auto a_id = core::short_id(drive_a_->key().public_key());
     const auto& drive = drive_a_->drive_id();
     auto sign_as_c = [&](core::FileRecord r) {
-        r.signer = core::short_id(c);
         r.signature = drive_c_->key().sign(core::record_signed_bytes(drive, r)).value();
         return r;
     };
@@ -513,7 +512,7 @@ TEST_F(TwoDevices, RecordsByADeviceNotKnownYetAreFetchedAgain) {
     auto make = [&](const core::DeviceKey& key, const char* path, std::uint64_t sequence) {
         core::FileRecord r;
         r.path = path;
-        r.modified_by = r.signer = core::short_id(key.public_key());
+        r.modified_by = core::short_id(key.public_key());
         r.version.bump(r.modified_by);
         r.hlc = drive_c_->clock().now();
         r.sequence = sequence;
@@ -592,7 +591,7 @@ TEST_F(TwoDevices, ANewMemberReadsTheFilesOfARemovedDevice) {
     ASSERT_TRUE(drain([&] {
         auto at_a = drive_a_->index().get("from-c.bin").value();
         auto at_b = drive_b_->index().get("from-c.bin").value();
-        return at_a && at_b && at_a->signer != c_id && at_b->signer != c_id;
+        return at_a && at_b && at_a->countersigner != 0 && at_b->countersigner != 0;
     }));
 
     // D joins after the removal and never learns C's key.

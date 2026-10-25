@@ -65,25 +65,26 @@ public:
     // here; the caller fills content fields.
     Result<FileRecord> commit_local(FileRecord record, HybridClock& clock);
     Result<FileRecord> delete_local(std::string_view path, HybridClock& clock);
-    // Rejects with invalid_argument a record that is malformed or whose signature is not valid
-    // here, and with not_found one that may become valid once a device is pinned or retired:
-    // its signer is unknown, or it is an adopted record whose author or signer is not known as
-    // such yet. A record signed by someone other than its author is valid only when the author
-    // is retired and the signer is pinned.
+    // A record is valid when its author signed it and is pinned here, or, for an author that is
+    // retired, when a pinned member countersigned it as well. Rejects with invalid_argument a
+    // record that is malformed or can never be valid here, and with not_found one that may
+    // become valid once a device is pinned or retired: its author or adopter is unknown or not
+    // pinned.
     Result<ApplyOutcome> apply_remote(const FileRecord& record, HybridClock& clock);
 
     // Pinned peers. Only pinned keys may connect; see docs/ARCHITECTURE.md section 7.
     // Pinning also makes the key a signer, for good: a short ID stays bound to its first key.
     Status add_device(const PublicKey& key, std::string_view name);
     Status remove_device(const PublicKey& key);
-    // Stops accepting records signed by `key` (a device removed from the drive for good) and
-    // adopts the verified records it signed: this device signs them as they are, so devices
-    // that never knew the key can still verify them. Retiring is permanent, and retiring a key
-    // already retired does nothing. Returns how many records were adopted.
+    // Stops accepting records signed by `key` (a device removed from the drive for good) unless
+    // a member countersigned them, and adopts the verified records the key signed or
+    // countersigned: this device countersigns them as they are. Retiring is permanent, and
+    // retiring a key already retired does nothing. Returns how many records were adopted.
     Result<std::size_t> retire_signer(const PublicKey& key);
     // The device's key is known and not retired.
     bool is_active_signer(std::uint64_t short_id) const;
     bool is_retired_signer(std::uint64_t short_id) const;
+    std::vector<PublicKey> retired_signers() const;
     Result<bool> is_pinned(const PublicKey& key) const;
     Result<std::vector<DeviceRecord>> devices() const;
     Status set_peer_progress(const PublicKey& key, std::uint64_t peer_index_id,
