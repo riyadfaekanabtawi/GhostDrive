@@ -41,6 +41,8 @@ TEST(ChunkId, BytesRoundTrip) {
     ASSERT_TRUE(back.ok());
     EXPECT_EQ(back.value(), id);
     EXPECT_EQ(id.to_hex().size(), kChunkIdSize * 2);
+    EXPECT_EQ(id.short_hex().size(), 8u);
+    EXPECT_EQ(id.to_hex().substr(2, 8), id.short_hex()) << "the digest after the tag";
 }
 
 TEST(ChunkId, FromBytesRejectsBadInput) {

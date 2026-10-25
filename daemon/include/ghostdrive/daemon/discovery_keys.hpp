@@ -63,9 +63,9 @@ public:
     // Every key held, the current one first and the drive secret last: a device that has not
     // caught up yet still advertises an older one.
     std::vector<Held> all() const;
-    // The keys that were current here before, newest first, then the drive secret; never the
-    // current key.
-    std::vector<const core::DriveSecret*> earlier() const;
+    // The keys that were current here before, newest first, then the drive secret (generation
+    // 0); never the current key.
+    std::vector<Held> earlier() const;
     // The keys to send to a member (not the drive secret). The caller zeroes them.
     std::vector<DiscoveryKey> keys() const;
     // Grows on every change.
@@ -99,5 +99,14 @@ private:
     Digest removed_digest_{};
     std::uint64_t version_ = 0;
 };
+
+using DiscoveryKeyId = std::pair<std::uint64_t, core::PublicKey>;  // generation, author
+
+// Whether every member other than `self` has sent this device a key at or above `current`
+// (compared by generation, then author), as recorded in `seen` (the highest per member). Such a
+// member holds the current key or a newer one, so it registers under the current admission ID.
+bool members_hold(const std::map<core::PublicKey, DiscoveryKeyId>& seen,
+                  const std::set<core::PublicKey>& members, const core::PublicKey& self,
+                  const DiscoveryKeyId& current);
 
 }  // namespace ghostdrive::daemon

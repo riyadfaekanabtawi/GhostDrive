@@ -34,6 +34,9 @@ struct ChunkId {
     std::array<std::byte, kChunkIdSize> to_bytes() const noexcept;
     static Result<ChunkId> from_bytes(std::span<const std::byte> bytes);
     std::string to_hex() const;
+    // The first 4 digest bytes in hex (8 characters), for error messages: enough to tell
+    // chunks apart in a log without writing out whole IDs.
+    std::string short_hex() const;
 };
 
 Result<DriveSecret> generate_drive_secret();

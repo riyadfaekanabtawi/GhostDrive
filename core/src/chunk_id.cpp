@@ -35,6 +35,10 @@ std::string ChunkId::to_hex() const {
     return core::to_hex(to_bytes());
 }
 
+std::string ChunkId::short_hex() const {
+    return core::to_hex(std::span(digest).first(4));
+}
+
 Result<DriveSecret> generate_drive_secret() {
     DriveSecret secret{};
     if (auto st = random_bytes(secret); !st) return st.error();

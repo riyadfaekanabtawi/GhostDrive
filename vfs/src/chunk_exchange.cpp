@@ -88,9 +88,9 @@ asio::awaitable<core::Result<core::Bytes>> request_chunk(transport::Connection& 
             auto code = wire::decode_error(reply.value().payload);
             if (!code) co_return code.error();
             if (code.value() == wire::ErrorCode::not_found) {
-                co_return Error{Errc::not_found, "peer does not hold chunk " + id.to_hex()};
+                co_return Error{Errc::not_found, "peer does not hold chunk " + id.short_hex()};
             }
-            co_return Error{Errc::io, "peer failed to serve chunk " + id.to_hex() + " (code " +
+            co_return Error{Errc::io, "peer failed to serve chunk " + id.short_hex() + " (code " +
                                           std::to_string(static_cast<unsigned>(code.value())) +
                                           ")"};
         }
