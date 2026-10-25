@@ -62,14 +62,14 @@ Result<DeviceKey> DeviceKey::load(const std::filesystem::path& path) {
     auto size = file.value().size();
     if (!size) return size.error();
     if (size.value() != kKeyFileSize) {
-        return Error{Errc::corrupt, "key file " + path.string() + " has the wrong size"};
+        return Error{Errc::corrupt, "key file " + path_utf8(path) + " has the wrong size"};
     }
     std::array<std::byte, kKeyFileSize> buffer{};
     auto n = file.value().read_at(buffer, 0);
     if (!n || n.value() != buffer.size() ||
         std::memcmp(buffer.data(), kKeyFileMagic.data(), kKeyFileMagic.size()) != 0) {
         secure_zero(buffer);
-        return n ? Error{Errc::corrupt, "key file " + path.string() + " is not a GhostDrive key"}
+        return n ? Error{Errc::corrupt, "key file " + path_utf8(path) + " is not a GhostDrive key"}
                  : n.error();
     }
     auto key = from_seed(

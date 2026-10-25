@@ -12,7 +12,7 @@ namespace fs = std::filesystem;
 namespace {
 
 Error fs_error(std::string_view what, const fs::path& path, const std::error_code& ec) {
-    return Error{Errc::io, std::string(what) + " " + path.string() + ": " + ec.message()};
+    return Error{Errc::io, std::string(what) + " " + path_utf8(path) + ": " + ec.message()};
 }
 
 }  // namespace
@@ -156,7 +156,7 @@ Result<ImportedFile> ChunkStore::import_file(const fs::path& file) {
         auto n = source.value().read_at(buffer, offset);
         if (!n) return n.error();
         if (n.value() == 0) {
-            return Error{Errc::io, "file " + file.string() + " shrank while importing"};
+            return Error{Errc::io, "file " + path_utf8(file) + " shrank while importing"};
         }
         auto id = put(std::span(buffer).first(n.value()));
         if (!id) return id.error();

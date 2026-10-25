@@ -26,7 +26,7 @@ inline ::testing::AssertionResult has_private_mode(const std::filesystem::path& 
     (void)mode;
     if (std::filesystem::is_directory(path)) {
         if (core::is_private_dir(path)) return ::testing::AssertionSuccess();
-        return ::testing::AssertionFailure() << path.string() << " is not a private directory";
+        return ::testing::AssertionFailure() << core::path_utf8(path) << " is not a private directory";
     }
     auto file = core::File::open_private(path);
     if (file) return ::testing::AssertionSuccess();

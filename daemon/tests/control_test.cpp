@@ -4,6 +4,7 @@
 
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
+#include <asio/post.hpp>
 #include <thread>
 
 #include "ghostdrive/core/file.hpp"
@@ -74,6 +75,24 @@ TEST_F(Control, NotRunning) {
     auto reply = control_request(socket_, "ping");
     ASSERT_FALSE(reply);
     EXPECT_EQ(reply.error().code, core::Errc::closed);
+}
+
+// A non-ASCII socket name is bound and reached by its UTF-8 name.
+TEST(Socket, NonAscii) {
+    test::TempDir dir;
+    ASSERT_TRUE(core::make_private_dir(dir.path()));
+    const auto socket = dir.path() / std::filesystem::path(u8"\u65e5\u672c.sock");
+    if (core::path_utf8(socket).size() >= 104) GTEST_SKIP() << "socket path too long";
+    asio::io_context io;
+    auto server = ControlServer::start(io.get_executor(), socket,
+                                       [](const std::string& command) { return command + "\n"; });
+    ASSERT_TRUE(server) << server.error().message;
+    std::thread thread([&io] { io.run(); });
+    auto reply = control_request(socket, "ping");
+    asio::post(io, [&server] { server.value().reset(); });
+    thread.join();
+    ASSERT_TRUE(reply) << reply.error().message;
+    EXPECT_EQ(reply.value(), "ping\n");
 }
 
 }  // namespace

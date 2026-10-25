@@ -33,7 +33,7 @@ using core::write_private_file;
 core::Result<core::Bytes> read_private_file(const std::filesystem::path& path) {
     auto data = core::read_private_file(path);
     if (!data && data.error().code == Errc::not_found)
-        return Error{Errc::not_found, "no drive at " + path.parent_path().string()};
+        return Error{Errc::not_found, "no drive at " + core::path_utf8(path.parent_path())};
     return data;
 }
 
@@ -75,13 +75,13 @@ core::Result<std::unique_ptr<Drive>> assemble(const DrivePaths& paths, core::Dev
 std::filesystem::path control_socket_for(const std::filesystem::path& root) {
     constexpr std::size_t kMaxSocketPath = 100;
     auto preferred = root / "control.sock";
-    if (preferred.string().size() < kMaxSocketPath) return preferred;
+    if (core::path_utf8(preferred).size() < kMaxSocketPath) return preferred;
     // Only a per-user private directory will do (macOS TMPDIR, Linux XDG_RUNTIME_DIR, the
     // Windows user temporary directory if private). A shared
     // one such as /tmp would let another user squat the name and answer `invite` with their
     // own drive. With neither, keep the preferred path and let binding report it as too long.
-#ifdef _WIN32
     std::error_code ec;
+#ifdef _WIN32
     const std::filesystem::path base = std::filesystem::temp_directory_path(ec);
     if (ec || !core::is_private_dir(base)) return preferred;
 #else
@@ -93,7 +93,8 @@ std::filesystem::path control_socket_for(const std::filesystem::path& root) {
     if (dir == nullptr || *dir == '\0' || !core::is_private_dir(dir)) return preferred;
     std::filesystem::path base = dir;
 #endif
-    auto hash = std::hash<std::string>{}(std::filesystem::absolute(root).string());
+    const auto absolute = std::filesystem::absolute(root, ec);
+    auto hash = std::hash<std::string>{}(core::path_utf8(ec ? root : absolute));
     char name[64];
     std::snprintf(name, sizeof(name), "ghostdrive-%016zx.sock", hash);
     return base / name;
@@ -116,7 +117,8 @@ DrivePaths::DrivePaths(std::filesystem::path r)
 
 std::filesystem::path default_data_dir() {
 #ifdef _WIN32
-    if (const char* local = std::getenv("LOCALAPPDATA"); local && *local) {
+    // _wgetenv: getenv converts to the ANSI code page, which may not hold the user's name.
+    if (const wchar_t* local = ::_wgetenv(L"LOCALAPPDATA"); local && *local) {
         return std::filesystem::path(local) / "GhostDrive";
     }
 #endif
@@ -134,11 +136,12 @@ std::filesystem::path default_data_dir() {
 
 std::filesystem::path default_mountpoint() {
 #ifdef _WIN32
-    const char* home = std::getenv("USERPROFILE");
+    const wchar_t* home = ::_wgetenv(L"USERPROFILE");
+    return std::filesystem::path(home ? home : L".") / "GhostDrive";
 #else
     const char* home = std::getenv("HOME");
-#endif
     return std::filesystem::path(home ? home : ".") / "GhostDrive";
+#endif
 }
 
 Drive::Drive(DrivePaths paths, std::unique_ptr<core::DeviceKey> key, DriveId drive_id,
@@ -169,7 +172,7 @@ core::Result<core::DeviceKey> Drive::load_or_create_key(const std::filesystem::p
     std::error_code ec;
     std::filesystem::create_directories(paths.root, ec);
     if (!core::make_private_dir(paths.root) || !core::is_private_dir(paths.root)) {
-        return Error{Errc::permission, paths.root.string() + kPrivateDirRule};
+        return Error{Errc::permission, core::path_utf8(paths.root) + kPrivateDirRule};
     }
     auto loaded = core::DeviceKey::load(paths.key);
     if (loaded) return loaded;
@@ -184,7 +187,7 @@ core::Result<std::unique_ptr<Drive>> Drive::create(const std::filesystem::path& 
                                                    const std::string& device_name) {
     DrivePaths paths(root);
     if (exists(root))
-        return Error{Errc::already_exists, "a drive already exists at " + root.string()};
+        return Error{Errc::already_exists, "a drive already exists at " + core::path_utf8(root)};
     auto key = load_or_create_key(root);
     if (!key) return key.error();
     DriveId id{};
@@ -205,7 +208,7 @@ core::Result<std::unique_ptr<Drive>> Drive::join(const std::filesystem::path& ro
                                                  const core::PublicKey& inviter) {
     DrivePaths paths(root);
     if (exists(root))
-        return Error{Errc::already_exists, "a drive already exists at " + root.string()};
+        return Error{Errc::already_exists, "a drive already exists at " + core::path_utf8(root)};
     auto key = load_or_create_key(root);
     if (!key) return key.error();
     if (auto st = save_drive_file(paths, info.drive_id, info.secret, device_name); !st) {
@@ -256,14 +259,14 @@ core::Result<std::unique_ptr<Drive>> Drive::open(const std::filesystem::path& ro
     DrivePaths paths(root);
     // The index, chunks and staging files rely on the directory's mode for their privacy.
     if (std::filesystem::exists(paths.root) && !core::is_private_dir(paths.root)) {
-        return Error{Errc::permission, paths.root.string() + kPrivateDirRule};
+        return Error{Errc::permission, core::path_utf8(paths.root) + kPrivateDirRule};
     }
     auto data = read_private_file(paths.drive);
     if (!data) return data.error();
     const auto& d = data.value();
     constexpr std::size_t kFixed = kDriveMagic.size() + kDriveIdSize + core::kDriveSecretSize + 1;
     if (d.size() < kFixed || std::memcmp(d.data(), kDriveMagic.data(), kDriveMagic.size()) != 0) {
-        return Error{Errc::corrupt, paths.drive.string() + " is not a GhostDrive drive file"};
+        return Error{Errc::corrupt, core::path_utf8(paths.drive) + " is not a GhostDrive drive file"};
     }
     DriveId id{};
     core::DriveSecret secret{};

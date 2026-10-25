@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 
+#include "ghostdrive/core/file.hpp"
 #include "ghostdrive/daemon/control.hpp"
 #include "ghostdrive/daemon/drive.hpp"
 #include "ghostdrive/daemon/service.hpp"
@@ -145,7 +146,7 @@ int main(int argc, char** argv) {
     std::once_flag stop_once;
     auto request_stop = [&] { std::call_once(stop_once, [&] { stop_requested.set_value(); }); };
 
-    std::string mounted_at = args.mount ? args.mountpoint.string() : "";
+    std::string mounted_at = args.mount ? core::path_utf8(args.mountpoint) : "";
     auto control = daemon::ControlServer::start(
         io.get_executor(), drive.value()->paths().control,
         [&](const std::string& command) -> std::string {

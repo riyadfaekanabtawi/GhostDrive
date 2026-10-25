@@ -30,7 +30,7 @@ Result<Bytes> read_private_file(const std::filesystem::path& path) {
     Bytes data(static_cast<std::size_t>(size.value()));
     auto got = file.value().read_at(data, 0);
     if (!got) return got.error();
-    if (got.value() != data.size()) return Error{Errc::io, "short read of " + path.string()};
+    if (got.value() != data.size()) return Error{Errc::io, "short read of " + path_utf8(path)};
     return data;
 }
 

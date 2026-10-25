@@ -85,7 +85,9 @@ Result<File> File::create_private(const std::filesystem::path& path) {
 }
 
 Result<File> File::open_scratch(const std::filesystem::path& path) {
-    auto fd = open_fd(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    // O_TRUNC would keep an existing file's owner and mode, so it is replaced instead.
+    if (::unlink(path.c_str()) != 0 && errno != ENOENT) return errno_error("unlink", path);
+    auto fd = open_fd(path, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (!fd) return fd.error();
     return File(fd.value(), path);
 }
@@ -171,6 +173,14 @@ Status make_private_dir(const std::filesystem::path& dir) {
     if (ec) return Error{Errc::io, "create_directories " + dir.string() + ": " + ec.message()};
     if (::chmod(dir.c_str(), 0700) != 0) return errno_error("chmod", dir);
     return {};
+}
+
+std::string path_utf8(const std::filesystem::path& path) {
+    return path.native();
+}
+
+Result<std::string> exact_utf8(const std::filesystem::path& path) {
+    return path.native();
 }
 
 bool is_private_dir(const std::filesystem::path& dir) {

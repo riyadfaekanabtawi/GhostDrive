@@ -5,6 +5,7 @@ add_executable(ghostdrive_core_tests
     chunk_store_test.cpp
     chunking_test.cpp
     file_record_test.cpp
+    file_test.cpp
     hlc_test.cpp
     identity_test.cpp
     metadata_index_test.cpp

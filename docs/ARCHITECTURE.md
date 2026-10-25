@@ -591,6 +591,24 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   `O_NOFOLLOW`) and refused unless they are regular files owned by the user whose DACL has no
   allow entry for any other SID (deny and inherit-only entries are ignored, a null DACL and
   object or callback allow entries are refused); the data directory is checked the same way.
+  Private directories are opened with `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`
+  and read and set through `GetSecurityInfo`/`SetSecurityInfo` on that handle, so a junction or
+  directory link is refused rather than followed. The vfs staging file is deleted and created
+  anew (`CREATE_NEW`) with the private descriptor, since `CREATE_ALWAYS` would keep an existing
+  file's DACL; POSIX likewise unlinks it and opens it with `O_EXCL`.
+- **Elevated processes.** In an elevated (administrator) process the token's default owner is
+  `BUILTIN\Administrators`, so files that get their security only by inheritance (the index,
+  chunks, the control socket) are owned by that group, not the user. Their DACL still grants
+  only the user, and the files checked for privacy on read (`device.key`, `drive`,
+  `membership`, `discovery`, the data directory) are created with the user as explicit owner.
+  Administrators can take ownership of any file anyway, so this widens nothing, but running
+  `ghostdrived` unelevated is the supported setup.
+- **Paths.** `path::string()` converts to the ANSI code page on Windows and throws for a
+  character outside it (a non-ASCII profile path, for example), so paths become text only through
+  `core::path_utf8` (messages) and `core::exact_utf8` (SQLite file names and the AF_UNIX
+  `sun_path`, which Windows reads as UTF-8; it refuses invalid UTF-16 instead of substituting).
+  `%LOCALAPPDATA%` and `%USERPROFILE%` are read with `_wgetenv`, and the executables carry a
+  manifest that makes UTF-8 the process code page (Windows 10 1903+), so `argv` holds any path.
 - **Control socket.** AF_UNIX, which Windows 10 supports and Asio drives as
   `local::stream_protocol`, so the daemon and CLI share one code path. Windows has no peer
   credentials for AF_UNIX; the server and client take the peer's process ID with
