@@ -581,9 +581,11 @@ NTSTATUS op_read(FSP_FILE_SYSTEM* fsp, PVOID context, PVOID buffer, UINT64 offse
                     response.Size = sizeof(response);
                     response.Kind = FspFsctlTransactReadKind;
                     response.Hint = hint;
-                    reply_later(self, response, [&] {
+                    // A pointer: a variable with a flexible array member cannot be captured.
+                    auto* rsp = &response;
+                    reply_later(self, response, [&result, rsp, buffer, length] {
                         if (!result) {
-                            response.IoStatus.Status =
+                            rsp->IoStatus.Status =
                                 static_cast<UINT32>(result.error().code == Errc::invalid_argument
                                                         ? STATUS_INVALID_HANDLE
                                                         : STATUS_UNEXPECTED_IO_ERROR);
@@ -599,9 +601,9 @@ NTSTATUS op_read(FSP_FILE_SYSTEM* fsp, PVOID context, PVOID buffer, UINT64 offse
                             std::memcpy(out + used, slice.data(), n);
                             used += n;
                         }
-                        response.IoStatus.Status =
+                        rsp->IoStatus.Status =
                             static_cast<UINT32>(used == 0 ? STATUS_END_OF_FILE : STATUS_SUCCESS);
-                        response.IoStatus.Information = static_cast<UINT32>(used);
+                        rsp->IoStatus.Information = static_cast<UINT32>(used);
                     });
                     self.end_pending();
                 });
