@@ -102,7 +102,7 @@ protected:
                 auto it = connections_.find(key);
                 return it == connections_.end() ? nullptr : it->second;
             },
-            per_request_timeout_);
+            per_request_timeout_, holder_wait_);
         FilesystemOptions fs_options;
         fs_options.request_timeout = request_timeout_;
         fs_ = std::make_unique<Filesystem>(io_.get_executor(), tree_, *fetcher_, fs_options);
@@ -245,6 +245,7 @@ protected:
     Tree tree_;
     std::chrono::milliseconds request_timeout_{30'000};
     std::chrono::milliseconds per_request_timeout_{10'000};
+    std::chrono::milliseconds holder_wait_{200};
     std::shared_ptr<transport::Endpoint> client_;
     std::unique_ptr<Fetcher> fetcher_;
     std::unique_ptr<Filesystem> fs_;
@@ -342,6 +343,63 @@ TEST_F(RemoteRead, NoConnectedHolderMeansNotFound) {
     auto got = read_file("f", 4096);
     ASSERT_FALSE(got);
     EXPECT_EQ(got.error().code, core::Errc::not_found) << got.error().message;
+}
+
+TEST_F(RemoteRead, AReadWaitsForAHolderToAppear) {
+    holder_wait_ = 60s;  // far past the test, so only the new holder can end the wait
+    start_client();
+    auto& server = add_server(Behavior::honest);
+    auto data = random_bytes(1000, 9);
+    auto record = publish("f", data, {&server}, {});  // the server has the chunk; nobody knows
+
+    auto ino = tree_.resolve("f");
+    ASSERT_TRUE(ino);
+    auto handle = fs_->open(*ino);
+    ASSERT_TRUE(handle);
+    std::optional<core::Result<ReadReply>> result;
+    fs_->read(handle.value(), 0, 4096, [&](core::Result<ReadReply> r) { result = std::move(r); });
+    drain([&] { return fetcher_->stats().holder_waits == 1; }, 10s);
+    ASSERT_EQ(fetcher_->stats().holder_waits, 1u);
+
+    // A signal with no new holder sends the fetch back to waiting.
+    fetcher_->holders_changed();
+    drain([&] { return fetcher_->stats().holder_waits == 2; }, 10s);
+    ASSERT_EQ(fetcher_->stats().holder_waits, 2u);
+    EXPECT_FALSE(result.has_value());
+
+    // A second read of the same chunk joins the waiting fetch.
+    std::optional<core::Result<ReadReply>> second;
+    fs_->read(handle.value(), 0, 10, [&](core::Result<ReadReply> r) { second = std::move(r); });
+    drain([&] { return fetcher_->stats().coalesced == 1; }, 10s);
+    ASSERT_EQ(fetcher_->stats().coalesced, 1u);
+
+    ASSERT_TRUE(index_.add_device(server.key.public_key(), "server"));
+    ASSERT_TRUE(index_.set_holds(server.key.public_key(), record.chunks[0], true));
+    connect(server);
+    fetcher_->holders_changed();
+    drain([&] { return result.has_value() && second.has_value(); }, 20s);
+    ASSERT_TRUE(result && *result) << (result ? result->error().message : "no reply");
+    ASSERT_TRUE(second && *second) << (second ? second->error().message : "no reply");
+    core::Bytes got;
+    for (auto s : result->value().slices) got.insert(got.end(), s.begin(), s.end());
+    EXPECT_TRUE(got == data);
+    EXPECT_EQ(fetcher_->stats().remote_fetches, 1u);
+    EXPECT_EQ(fetcher_->stats().holder_waits, 2u);
+    fs_->release(handle.value());
+}
+
+TEST_F(RemoteRead, AReadWithNoHolderFailsAfterTheWait) {
+    holder_wait_ = 300ms;
+    start_client();
+    auto& server = add_server(Behavior::honest);
+    publish("f", random_bytes(1000, 10), {&server}, {});
+
+    auto start = std::chrono::steady_clock::now();
+    auto got = read_file("f", 4096);
+    ASSERT_FALSE(got);
+    EXPECT_EQ(got.error().code, core::Errc::not_found) << got.error().message;
+    EXPECT_GE(std::chrono::steady_clock::now() - start, holder_wait_);
+    EXPECT_EQ(fetcher_->stats().holder_waits, 1u);
 }
 
 TEST_F(RemoteRead, StalledPeerHitsTheRequestDeadline) {

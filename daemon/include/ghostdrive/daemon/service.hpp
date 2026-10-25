@@ -58,6 +58,9 @@ struct ServiceOptions {
     // How long records that may become valid (their author or adopter is not established here
     // yet) hold a peer's index progress back. After that they are skipped like invalid ones.
     std::chrono::milliseconds pending_hold{10 * 60'000};
+    // How long a read of a chunk with no connected holder waits for one (a record naming one
+    // arrives, or a holder connects) before it fails.
+    std::chrono::milliseconds holder_wait{5'000};
 };
 
 struct PeerStatus {

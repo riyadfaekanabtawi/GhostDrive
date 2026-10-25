@@ -42,7 +42,8 @@ protected:
           index_(
               core::MetadataIndex::open(dir_.path() / "index.db", core::DriveId{}, key_).value()),
           cache_(64 * 1024 * 1024),
-          fetcher_(io_.get_executor(), disk_.get_executor(), store_, index_, cache_, nullptr) {}
+          fetcher_(io_.get_executor(), disk_.get_executor(), store_, index_, cache_, nullptr,
+                   std::chrono::seconds(10), std::chrono::milliseconds(0)) {}
 
     ~FileViewTest() override { disk_.join(); }
 

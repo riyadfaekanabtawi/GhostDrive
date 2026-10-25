@@ -110,7 +110,8 @@ Service::Service(asio::any_io_executor io, asio::any_io_executor disk, Drive& dr
         [this](const core::PublicKey& key) -> std::shared_ptr<transport::Connection> {
             auto it = live_.find(key);
             return it == live_.end() ? nullptr : it->second;
-        });
+        },
+        std::chrono::seconds(10), options_.holder_wait);
     fs_ = std::make_unique<vfs::Filesystem>(
         io_, tree_, *fetcher_, vfs::FilesystemOptions{},
         vfs::WriteSupport{drive_.store(), drive_.index(), drive_.clock(), disk_,
@@ -578,6 +579,7 @@ asio::awaitable<void> Service::run_member(std::shared_ptr<transport::Connection>
             previous->second->close();
         }
         live_[key] = conn;
+        fetcher_->holders_changed();
     }
     asio::co_spawn(io_, push_index(conn), asio::detached);
     asio::co_spawn(io_, push_membership(conn), asio::detached);
@@ -786,6 +788,7 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
                 return {};
             });
         if (!*alive) co_return;
+        fetcher_->holders_changed();
         if (!any_pending || pending.empty()) {
             // Nothing held back now (none pending, or the hold ran out and they were skipped):
             // the next pending record starts a new hold.

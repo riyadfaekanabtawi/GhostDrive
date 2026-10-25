@@ -591,6 +591,14 @@ The file lives only on device B.
 5. **Peer selection.** The Fetcher reads the location data from the index: device B holds the
    chunk and is online. B is reached directly over the LAN, or over a direct WAN path, or through
    the relay. With no live connection, transport asks discovery to connect (section 3.4).
+   - A file's record can arrive from a member that does not hold its chunks before the record
+     from one that does, and a holder may be about to connect. So when no holder is known, or
+     none is connected, the fetch waits for one, up to `holder_wait` (default 5 s,
+     `ServiceOptions::holder_wait`), before it fails with `not_found`.
+   - The wait is event-driven: the daemon calls `Fetcher::holders_changed()` after it applies
+     each index batch from a peer and when a member connection becomes live. The fetch then
+     reads the holders again. A wait parks a timer on the I/O executor and blocks nothing.
+   - Reads of the same chunk share the one fetch, and so its wait.
 6. **Request.** On a coroutine strand: `auto s = co_await conn.open_stream();`, then
    `co_await s.write(encode(GetChunk{id}))`.
 7. **Remote side (B).** B's daemon accepts the stream, decodes the request, and checks that A is
@@ -704,6 +712,7 @@ Revocation:
 | Failure | Behavior |
 |---|---|
 | Peer goes offline mid-read | The stream errors or times out. The Fetcher retries any other device that holds the chunk. If none exists, the read returns `EIO` after the request deadline. Chunks already verified stay cached, so a retry after reconnect resumes at chunk granularity. |
+| No holder known or connected yet | The fetch waits up to `holder_wait` (5 s) for a record naming a holder or for a holder to connect (section 4, step 5), then the read fails with `EIO`. |
 | Path flaps (Wi-Fi to cellular, NAT rebinding) | QUIC migration or the peer's address-change handling keeps the connection. If the direct path dies, traffic falls back to the warm relay path immediately. Hysteresis prevents flapping back and forth. |
 | Relay down | Direct connections are unaffected. Clients try configured fallback relays with jittered backoff. Peers behind hard NAT on both sides cannot reach each other until a relay returns. |
 | Rendezvous down | Existing sessions and LAN (mDNS) keep working. Cached last-known candidates are tried directly. New WAN connections through hard NATs fail. |
