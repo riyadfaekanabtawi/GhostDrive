@@ -37,6 +37,9 @@ struct ServerOptions {
     // group) cannot flood one member together.
     std::size_t relay_receive_bytes_per_second = 8u * 1024 * 1024;
     std::size_t relay_receive_burst_bytes = 2u * 1024 * 1024;
+    // How long a Connect lets the asked key relay to a client hidden in that key's group.
+    // Members ask again every rendezvous interval (10 s) while they need the relay.
+    std::chrono::milliseconds asked_ttl{30'000};
     transport::Impairment impairment{};
 };
 

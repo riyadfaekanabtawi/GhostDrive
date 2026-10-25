@@ -358,12 +358,23 @@ document assumes the corrected version.
     allow lists keep working; it is also a stable drive identifier that a removed device can
     compute, so a server operator working with one could still link the drive's groups.
   - `Register` also lists up to 4 hidden groups, where the client may `Connect` to others but
-    is never found itself, and relay forwarding is allowed between clients that share a group
-    or where one is hidden in the other's. Only the visible group counts toward the 256 per
-    group, since anyone who knows an earlier key could fill its group. A removed device can
-    still have the server forward datagrams to a member hidden in its group; the member drops
-    them (relayed packets are accepted only from members), so this costs bandwidth within the
-    sender's relay budget and reveals nothing. A later `Register` on the same control stream moves
+    is never found itself. Only the visible group counts toward the 256 per group, since anyone
+    who knows an earlier key could fill its group.
+  - Relay frames are forwarded between clients in the same visible group, or where one is
+    hidden in the other's group and that hidden client has sent `Connect` for the other's key
+    in the last 30 s. The server keeps the 64 most recent such keys per client (the oldest is
+    forgotten first), also those over the `Connect` rate limit, and keeps them when the client
+    registers again. The hidden side's `Connect` opens both directions, so either device may
+    dial. Daemons send `Connect` every `rendezvous_interval` (10 s) for each member they have
+    no direct connection to, relayed ones included, so a live relayed connection keeps its
+    entry. Without the `Connect` condition anyone visible in an earlier group (a removed device
+    knows those keys, and on an open server anyone may register) could send to every member
+    hidden there and use up its receive budget, starving its real relayed connections.
+    Members stay hidden in the groups of their last 3 earlier keys, and in the drive secret's
+    group for good, so that exposure would not end on its own. A removed device can still have the server forward datagrams to a member
+    in its visible group (one that has not caught up); the member drops them (relayed packets
+    are accepted only from members), so this costs bandwidth within the budgets and reveals
+    nothing. A later `Register` on the same control stream moves
     the client to new groups and keeps its connection, so relayed connections survive a
     change of discovery key.
   - Hosting needs UDP: a VPS or any host that forwards a UDP port. Platforms that only proxy

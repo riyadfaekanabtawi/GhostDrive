@@ -24,6 +24,9 @@ constexpr std::chrono::seconds kRegisterTimeout{10};
 // Connect requests per client per window; each one makes the server message two devices.
 constexpr int kMaxConnectsPerWindow = 30;
 constexpr std::chrono::seconds kConnectWindow{10};
+// Keys a client asked for with Connect that may relay to it where it is hidden; the oldest is
+// forgotten first.
+constexpr std::size_t kMaxAskedKeys = 64;
 
 // The key the per-IP cap counts against: the address itself for IPv4, its /64 for IPv6.
 std::string ip_bucket(const asio::ip::address& address) {
@@ -69,6 +72,24 @@ struct Server::Client {
     Bucket received;  // relay frames to this client
     std::chrono::steady_clock::time_point connect_window{};
     int connects = 0;
+    // Peers it sent Connect for, and when. Kept across a new Register, so relayed connections
+    // survive a change of discovery key.
+    std::map<core::PublicKey, std::chrono::steady_clock::time_point> asked;
+
+    void ask(const core::PublicKey& peer, std::chrono::steady_clock::time_point now) {
+        if (!asked.contains(peer) && asked.size() >= kMaxAskedKeys) {
+            asked.erase(std::min_element(asked.begin(), asked.end(), [](const auto& x,
+                                                                        const auto& y) {
+                return x.second < y.second;
+            }));
+        }
+        asked[peer] = now;
+    }
+    bool has_asked(const core::PublicKey& peer, std::chrono::steady_clock::time_point now,
+                   std::chrono::milliseconds ttl) const {
+        auto it = asked.find(peer);
+        return it != asked.end() && now - it->second <= ttl;
+    }
 };
 
 Server::Server(Private, asio::any_io_executor executor, ServerOptions options)
@@ -205,6 +226,9 @@ asio::awaitable<void> Server::serve(std::shared_ptr<bool> alive,
                 auto request = discovery::decode_connect(frame.value().payload);
                 if (!request) break;
                 auto now = std::chrono::steady_clock::now();
+                // Counted even when over the limit below: it only opts this client in to
+                // relay frames from that key.
+                client->ask(request.value().peer, now);
                 if (now - client->connect_window > kConnectWindow) {
                     client->connect_window = now;
                     client->connects = 0;
@@ -310,19 +334,25 @@ void Server::on_relay_frame(Client& sender, core::Bytes frame) {
     }
     core::PublicKey dest_key{};
     std::copy_n(frame.begin(), transport::kRelayKeySize, dest_key.begin());
-    // Between clients that could have found each other: a shared group, or one looking in the
-    // other's group.
+    // Between clients in one group, or where one is hidden in the other's group and asked for
+    // it with Connect recently. Anyone who knows an earlier key (a removed device, or anyone on
+    // an open server) can register visibly in its group, so without the second condition it
+    // could use up the receive budget of every member hidden there. The hidden side's ask
+    // covers both directions of the connection.
+    auto now = std::chrono::steady_clock::now();
     auto dest = clients_.find(dest_key);
-    auto shares = [](const Client& a, const Client& b) {
-        return a.group == b.group || a.hidden.contains(b.group) || b.hidden.contains(a.group);
+    auto may_relay = [&](const Client& a, const Client& b) {
+        if (a.group == b.group) return true;
+        auto ttl = options_.asked_ttl;
+        return (a.hidden.contains(b.group) && a.has_asked(b.key, now, ttl)) ||
+               (b.hidden.contains(a.group) && b.has_asked(a.key, now, ttl));
     };
     if (dest == clients_.end() || dest->second.get() == &sender || !dest->second->placed ||
-        !shares(sender, *dest->second)) {
+        !may_relay(sender, *dest->second)) {
         ++stats_.dropped_datagrams;
         return;
     }
 
-    auto now = std::chrono::steady_clock::now();
     auto& receiver = *dest->second;
     sender.sent.refill(now, options_.relay_bytes_per_second, options_.relay_burst_bytes);
     receiver.received.refill(now, options_.relay_receive_bytes_per_second,
