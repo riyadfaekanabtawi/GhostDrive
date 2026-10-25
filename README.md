@@ -73,6 +73,20 @@ ghostdrive rendezvous your.server.example:7374 <fingerprint>
 Devices that join afterwards inherit the setting. They connect directly when hole punching
 works and otherwise through the server's relay, which forwards only encrypted packets.
 
+### Starting at login
+
+```
+ghostdrive autostart on        # start ghostdrived now and at every login
+ghostdrive autostart status    # is it set up, and is it running?
+ghostdrive autostart off       # stop it and remove the login item
+```
+
+On macOS this installs a LaunchAgent in `~/Library/LaunchAgents` (its log goes to
+`ghostdrived.log` in the data directory); on Linux, a systemd user unit in
+`~/.config/systemd/user`. It runs the `ghostdrived` next to the `ghostdrive` you ran, restarts
+it if it crashes, and leaves it stopped after `ghostdrive stop` until the next login. `on`
+accepts `--mount DIR`, and all three accept `--data DIR`, which gets its own login item.
+
 ## Limitations
 
 - Across the internet, devices need a rendezvous server to find each other, and a relay when

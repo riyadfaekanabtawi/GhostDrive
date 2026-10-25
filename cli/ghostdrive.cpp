@@ -1,20 +1,32 @@
 // ghostdrive: sets up a drive and talks to the running daemon.
 
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
 #include <asio/io_context.hpp>
+#include <cerrno>
 #include <charconv>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "autostart.hpp"
 #include "ghostdrive/daemon/control.hpp"
 #include "ghostdrive/daemon/drive.hpp"
 #include "ghostdrive/daemon/invite.hpp"
 #include "ghostdrive/daemon/service.hpp"
+
+extern char** environ;
 
 namespace {
 
@@ -37,6 +49,11 @@ constexpr const char* kUsage =
     "  stop                             unmount and stop the daemon\n"
     "  id                               print this device's ID\n"
     "\n"
+    "Starting at login:\n"
+    "  autostart on [--mount DIR]       start ghostdrived at login (launchd or systemd --user)\n"
+    "  autostart off                    stop starting it at login, and stop it now\n"
+    "  autostart status                 show whether it is set up and running\n"
+    "\n"
     "Every command accepts --data DIR to use a data directory other than the default.\n";
 
 std::string host_name() {
@@ -51,6 +68,7 @@ struct Args {
     std::string command;
     std::vector<std::string> positional;
     std::filesystem::path data = daemon::default_data_dir();
+    std::filesystem::path mount = daemon::default_mountpoint();
     std::string name = host_name();
     std::uint16_t port = daemon::kDefaultPort;
     long ttl = 600;
@@ -72,6 +90,10 @@ bool parse_args(int argc, char** argv, Args& args) {
             auto v = value();
             if (!v) return false;
             args.data = v;
+        } else if (a == "--mount") {
+            auto v = value();
+            if (!v) return false;
+            args.mount = v;
         } else if (a == "--name") {
             auto v = value();
             if (!v) return false;
@@ -139,15 +161,17 @@ int cmd_rendezvous(const Args& args) {
         std::cout << (config ? config->to_string() : std::string("none")) << "\n";
         return 0;
     }
-    if (args.positional.size() < 2) return fail("rendezvous needs HOST:PORT and the server's fingerprint");
+    if (args.positional.size() < 2)
+        return fail("rendezvous needs HOST:PORT and the server's fingerprint");
     std::string fingerprint;
     for (std::size_t i = 1; i < args.positional.size(); ++i) fingerprint += args.positional[i];
     auto config = daemon::RendezvousConfig::parse(args.positional[0] + " " + fingerprint);
     if (!config) return fail("expected HOST:PORT followed by the fingerprint the server printed");
     if (auto st = drive.value()->set_rendezvous(*config); !st) return fail(st.error().message);
-    std::cout << "Rendezvous server set to " << config->to_string()
-              << ".\nA running daemon picks it up within a few seconds. Devices that join from now on\n"
-                 "get it automatically; run this on devices that joined before.\n";
+    std::cout
+        << "Rendezvous server set to " << config->to_string()
+        << ".\nA running daemon picks it up within a few seconds. Devices that join from now on\n"
+           "get it automatically; run this on devices that joined before.\n";
     return 0;
 }
 
@@ -183,10 +207,10 @@ int cmd_join(const Args& args) {
     std::cout << "Contacting the inviting device...\n" << std::flush;
     io.run();
     if (!result || !*result) {
-        return fail("could not join: " +
-                    (result ? result->error().message : std::string("no answer")) +
-                    "\nThe invite may have expired or been used already; ask for a new one with "
-                    "`ghostdrive invite`, and check that both devices are on the same network.");
+        return fail(
+            "could not join: " + (result ? result->error().message : std::string("no answer")) +
+            "\nThe invite may have expired or been used already; ask for a new one with "
+            "`ghostdrive invite`, and check that both devices are on the same network.");
     }
 
     auto drive =
@@ -204,6 +228,165 @@ int cmd_join(const Args& args) {
     return 0;
 }
 
+// Runs a program found on PATH without a shell and returns its exit status, or -1.
+int run(const std::vector<std::string>& command, bool quiet) {
+    std::vector<char*> argv;
+    for (const auto& a : command) argv.push_back(const_cast<char*>(a.c_str()));
+    argv.push_back(nullptr);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    if (quiet) {
+        posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    }
+    pid_t pid = 0;
+    int rc = ::posix_spawnp(&pid, argv[0], &actions, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0) return -1;
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+std::string join_command(const std::vector<std::string>& command) {
+    std::string out;
+    for (const auto& a : command) out += (out.empty() ? "" : " ") + a;
+    return out;
+}
+
+std::optional<std::filesystem::path> self_path() {
+#ifdef __APPLE__
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string buf(size, '\0');
+    if (_NSGetExecutablePath(buf.data(), &size) != 0) return std::nullopt;
+    buf.resize(std::strlen(buf.c_str()));
+    std::filesystem::path p = buf;
+#else
+    std::filesystem::path p = "/proc/self/exe";
+#endif
+    std::error_code ec;
+    auto resolved = std::filesystem::canonical(p, ec);
+    if (ec) return std::nullopt;
+    return resolved;
+}
+
+std::filesystem::path absolute_path(const std::filesystem::path& p) {
+    std::error_code ec;
+    auto out = std::filesystem::weakly_canonical(std::filesystem::absolute(p, ec), ec);
+    return ec ? std::filesystem::absolute(p).lexically_normal() : out;
+}
+
+int cmd_autostart(const Args& args) {
+    if (args.positional.size() != 1) return fail("autostart needs on, off or status");
+    const std::string& action = args.positional[0];
+    if (action != "on" && action != "off" && action != "status") {
+        return fail("autostart needs on, off or status");
+    }
+    if (::geteuid() == 0) {
+        return fail("autostart sets up a per-user login item; run it as yourself, not as root");
+    }
+    const char* home_env = std::getenv("HOME");
+    if (!home_env || !*home_env) return fail("HOME is not set");
+    const std::filesystem::path home = home_env;
+    const auto data = absolute_path(args.data);
+
+#ifdef __APPLE__
+    const std::string label = autostart::launchd_label(data);
+    const auto file = autostart::launch_agent_path(home, label);
+    const std::string domain = "gui/" + std::to_string(::getuid());
+    const std::string service = domain + "/" + label;
+    auto loaded = [&] { return run({"launchctl", "print", service}, true) == 0; };
+#else
+    const std::string unit = autostart::systemd_unit_name(data);
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    const auto file = autostart::systemd_unit_path(
+        xdg && *xdg ? std::filesystem::path(xdg) : home / ".config", unit);
+    auto loaded = [&] {
+        return run({"systemctl", "--user", "is-active", "--quiet", unit}, true) == 0;
+    };
+#endif
+
+    std::error_code ec;
+    if (action == "status") {
+        bool exists = std::filesystem::exists(file, ec);
+        bool running = loaded();
+        std::cout << "login item: " << (exists ? file.string() : std::string("not set up")) << "\n"
+#ifdef __APPLE__
+                  << "launchd:    " << (running ? "loaded" : "not loaded") << "\n";
+#else
+                  << "systemd:    " << (running ? "active" : "inactive") << "\n";
+#endif
+        return 0;
+    }
+
+    if (action == "off") {
+#ifdef __APPLE__
+        if (loaded()) {
+            std::vector<std::string> bootout{"launchctl", "bootout", service};
+            if (run(bootout, false) != 0) return fail("`" + join_command(bootout) + "` failed");
+        }
+#else
+        if (std::filesystem::exists(file, ec)) {
+            std::vector<std::string> disable{"systemctl", "--user", "disable", "--now", unit};
+            if (run(disable, false) != 0) return fail("`" + join_command(disable) + "` failed");
+        }
+#endif
+        bool removed = std::filesystem::remove(file, ec);
+        if (ec) return fail("remove " + file.string() + ": " + ec.message());
+#ifndef __APPLE__
+        if (removed) run({"systemctl", "--user", "daemon-reload"}, false);
+#endif
+        std::cout << (removed ? "GhostDrive will no longer start at login.\n"
+                              : "GhostDrive was not set to start at login.\n");
+        return 0;
+    }
+
+    if (!daemon::Drive::exists(data)) {
+        return fail("no drive at " + data.string() +
+                    "; run `ghostdrive init` or `ghostdrive join` first");
+    }
+    auto self = self_path();
+    if (!self) return fail("cannot find the path of the running ghostdrive binary");
+    autostart::Spec spec;
+    spec.daemon = self->parent_path() / "ghostdrived";
+    spec.data = data;
+    spec.mount = absolute_path(args.mount);
+    spec.log = data / "ghostdrived.log";
+    if (::access(spec.daemon.c_str(), X_OK) != 0) {
+        return fail("ghostdrived is not next to ghostdrive (" + spec.daemon.string() + ")");
+    }
+#ifdef __APPLE__
+    auto text = autostart::launch_agent_plist(label, spec);
+#else
+    auto text = autostart::systemd_unit(spec);
+#endif
+    if (!text) return fail(text.error().message);
+    if (auto st = autostart::write_file_atomic(file, text.value()); !st) {
+        return fail(st.error().message);
+    }
+#ifdef __APPLE__
+    // Reload so a changed plist takes effect; enable clears an earlier `launchctl disable`.
+    if (loaded()) run({"launchctl", "bootout", service}, false);
+    run({"launchctl", "enable", service}, true);
+    std::vector<std::string> start{"launchctl", "bootstrap", domain, file.string()};
+#else
+    run({"systemctl", "--user", "daemon-reload"}, false);
+    std::vector<std::string> start{"systemctl", "--user", "enable", "--now", unit};
+#endif
+    if (run(start, false) != 0) return fail("`" + join_command(start) + "` failed");
+    std::cout << "GhostDrive will start at login and is starting now.\n"
+              << "  login item: " << file.string() << "\n"
+              << "  mount:      " << spec.mount.string() << "\n"
+#ifdef __APPLE__
+              << "  log:        " << spec.log.string() << "\n"
+#endif
+              << "Turn it off with `ghostdrive autostart off`.\n";
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -217,6 +400,7 @@ int main(int argc, char** argv) {
     if (args.command == "invite") return cmd_invite(args);
     if (args.command == "join") return cmd_join(args);
     if (args.command == "rendezvous") return cmd_rendezvous(args);
+    if (args.command == "autostart") return cmd_autostart(args);
     if (args.command == "status") return cmd_control(args, "status");
     if (args.command == "stop") return cmd_control(args, "stop");
     if (args.command == "remove") {
