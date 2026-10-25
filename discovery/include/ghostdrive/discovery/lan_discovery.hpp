@@ -2,7 +2,9 @@
 
 #include <asio/any_io_executor.hpp>
 #include <asio/ip/udp.hpp>
+#ifdef GHOSTDRIVE_HAVE_DNSSD
 #include <asio/posix/stream_descriptor.hpp>
+#endif
 #include <asio/steady_timer.hpp>
 #include <chrono>
 #include <cstdint>
@@ -107,7 +109,9 @@ private:
     DNSServiceRef main_ = nullptr;
     DNSServiceRef register_ = nullptr;
     DNSServiceRef browse_ = nullptr;
+#ifdef GHOSTDRIVE_HAVE_DNSSD
     asio::posix::stream_descriptor descriptor_;
+#endif
 #endif
     asio::steady_timer refresh_timer_;
     std::list<std::unique_ptr<Op>> ops_;

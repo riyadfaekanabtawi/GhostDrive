@@ -151,7 +151,7 @@ jobs:
           key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
 
       - name: Build
-        run: cmake --build --preset windows
+        run: cmake --build --preset windows -- -k 0
 
       - name: Test
         run: ctest --preset windows -LE "mount|e2e"
