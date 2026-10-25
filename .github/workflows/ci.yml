@@ -97,3 +97,19 @@ jobs:
       # locally with `ctest --preset default -L mount` and `-L e2e`.
       - name: Test
         run: ctest --preset ${{ matrix.preset }} -LE "mount|e2e"
+
+  # The macOS menu-bar app is a separate Swift package; its tests need no daemon.
+  menu-app:
+    name: macos-menu-app
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: macos/GhostDriveMenu
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test

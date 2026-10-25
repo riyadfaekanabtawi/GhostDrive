@@ -1,4 +1,5 @@
 import AppKit
+import GhostDriveMenuKit
 import SwiftUI
 
 @main
@@ -17,6 +18,9 @@ struct GhostDriveMenuApp: App {
             Image(systemName: model.status == nil ? "externaldrive" : "externaldrive.fill")
                 .accessibilityLabel("GhostDrive")
         }
+        Settings {
+            SettingsView()
+        }
     }
 }
 
@@ -29,38 +33,47 @@ struct MenuContent: View {
             Text("GhostDrive: checking...")
         case .noCLI:
             Text("ghostdrive command-line tool not found")
-            Text("Install it on PATH, put it next to this app, or choose it below")
+            Text("Install it on PATH, put it next to this app, or set it in Settings")
+        case .badCLI(let reason):
+            Text("The ghostdrive tool set in Settings cannot be used")
+            Text(reason)
         case .notRunning(let reason):
             Text("GhostDrive is not running")
             if !reason.contains("not running") {
                 Text(reason)
             }
-        case .running(let status):
+        case .running(let status, _):
             RunningSection(status: status)
         }
 
-        if let message = model.message {
+        if !model.message.isEmpty {
             Divider()
-            Text(message)
+            ForEach(Array(model.message.enumerated()), id: \.offset) { _, line in
+                Text(line)
+            }
         }
 
         Divider()
         if let status = model.status {
             Button("Copy Invite Code") { model.copyInvite() }
                 .disabled(model.busy || status.removedBy != nil)
-            Button("Open Drive in Finder") { model.openInFinder() }
-                .disabled(status.mountpoint == nil)
+            Button(model.mountedAt == nil ? "Open Drive in Finder (not mounted)"
+                                          : "Open Drive in Finder") { model.openInFinder() }
+                .disabled(model.mountedAt == nil)
             Button("Stop GhostDrive") { model.stop() }
                 .disabled(model.busy)
-        } else if model.state != .noCLI && model.state != .starting {
+        } else if case .notRunning = model.state {
             Button("Start GhostDrive") { model.start() }
                 .disabled(model.busy)
         }
 
         Divider()
-        Button("Choose ghostdrive Tool...") { model.chooseCLI() }
-        if let custom = model.customCLI {
-            Button("Use Default ghostdrive Tool (now \(custom))") { model.resetCLI() }
+        if #available(macOS 14, *) {
+            SettingsLink { Text("Settings...") }
+                .keyboardShortcut(",")
+        } else {
+            Button("Settings...") { model.openSettings() }
+                .keyboardShortcut(",")
         }
         Button("Quit GhostDrive Menu") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")
@@ -68,7 +81,7 @@ struct MenuContent: View {
 }
 
 struct RunningSection: View {
-    let status: DriveStatus
+    let status: DriveStatus  // already passed through DriveStatus.cleaned()
 
     var body: some View {
         Text("This device: \(status.device)")

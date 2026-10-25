@@ -91,21 +91,41 @@ accepts `--mount DIR`, and all three accept `--data DIR`, which gets its own log
 
 On macOS 13 or later, `macos/GhostDriveMenu` is a small menu-bar app. It shows this device,
 which devices are online or offline, and whether the rendezvous server is connected, and it can
-copy an invite code, open the drive in Finder, start GhostDrive (`ghostdrive autostart on`, only
-when you click it) and stop it.
+copy an invite code, open the drive in Finder, start GhostDrive and stop it.
 
 ```
 cd macos/GhostDriveMenu
 swift build                                     # or: swift run
+swift test                                      # unit tests (no daemon needed)
 GHOSTDRIVE_BUILD_DIR=../../build/release ./make-app.sh   # .build/GhostDrive Menu.app
 ```
 
-The app does everything by running the `ghostdrive` tool (`status --json`, `invite`, `stop`),
-which it looks for inside or next to the app, then on PATH, `/opt/homebrew/bin` and
-`/usr/local/bin`; "Choose ghostdrive Tool..." in the menu picks another one. Without
-`GHOSTDRIVE_BUILD_DIR`, `make-app.sh` leaves the tools out of the bundle. To use a data directory
-other than the default, run `defaults write org.ghostdrive.menu ghostdriveDataDir DIR`. The app
-never reads key files. `ghostdrive status --json` is also usable from scripts.
+The app does everything by running the `ghostdrive` tool (`status --json`, `invite`, `stop`,
+`autostart on`). Settings (in the menu, or Command-comma) holds three values, each empty for
+the default:
+
+- Data folder: passed to every command as `--data`. Default:
+  `~/Library/Application Support/GhostDrive`.
+- ghostdrive tool: the CLI to run; it must exist and be executable. Default: inside or next to
+  the app, then PATH, `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`.
+- Mountpoint: passed to Start as `--mount`. Default: `~/GhostDrive`.
+
+They are stored in UserDefaults (`org.ghostdrive.menu`, keys `ghostdriveDataDir`,
+`ghostdriveCLIPath`, `ghostdriveMountpoint`). The menu actions:
+
+- Copy Invite Code runs `ghostdrive invite`, copies the `gd1-...` code (marked concealed for
+  clipboard managers) and shows how long the CLI says it is valid, for example "Invite copied,
+  valid 10 min".
+- Open Drive in Finder is disabled unless the daemon reports a mountpoint that is really
+  mounted.
+- Start GhostDrive runs `ghostdrive autostart on [--data DIR] [--mount DIR]`, which creates a
+  login item; it only runs when you click it. If a command fails, its error output is shown in
+  the menu.
+
+Device names and other text from the daemon are shown with control, bidirectional and other
+invisible formatting characters replaced by `?`. Without `GHOSTDRIVE_BUILD_DIR`, `make-app.sh`
+leaves the tools out of the bundle. The app never reads key files. `ghostdrive status --json`
+is also usable from scripts.
 
 ## Limitations
 

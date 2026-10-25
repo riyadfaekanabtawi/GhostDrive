@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import GhostDriveMenuKit
 
 // Polls the daemon through the CLI and runs the menu's actions. It only ever sees what
 // `ghostdrive` prints (status and invite codes); keys stay with the daemon.
@@ -7,17 +8,20 @@ import Foundation
 final class DriveModel: ObservableObject {
     enum State: Equatable {
         case starting
-        case running(DriveStatus)
+        case running(DriveStatus, mounted: Bool)
         case notRunning(String)  // the CLI's explanation
         case noCLI
+        case badCLI(String)  // the tool set in Settings cannot be run
     }
 
     @Published private(set) var state: State = .starting
-    @Published private(set) var message: String?  // result of the last action
+    @Published private(set) var message: [String] = []  // result of the last action
     @Published private(set) var busy = false
 
     private var timer: Timer?
     private var polling = false
+    private var defaultsObserver: NSObjectProtocol?
+    private var settings = MenuSettings(defaults: .standard)
     private let queue = DispatchQueue(label: "ghostdrive.menu.cli")
 
     static let pollInterval: TimeInterval = 4
@@ -28,91 +32,115 @@ final class DriveModel: ObservableObject {
             [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
+        // Settings changes take effect at the next poll; poll now so the menu follows at once.
+        defaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: .main) {
+            [weak self] _ in
+            Task { @MainActor in self?.settingsChanged() }
+        }
     }
 
     var status: DriveStatus? {
-        if case .running(let s) = state { return s }
+        if case .running(let s, _) = state { return s }
         return nil
+    }
+
+    // The mountpoint only while it is really mounted.
+    var mountedAt: String? {
+        if case .running(let s, true) = state { return s.mountpoint }
+        return nil
+    }
+
+    private func settingsChanged() {
+        let current = MenuSettings(defaults: .standard)
+        if current == settings { return }
+        settings = current
+        message = []
+        refresh()
     }
 
     func refresh() {
         if polling { return }
         polling = true
-        run(["status", "--json"]) { [weak self] result in
-            guard let self else { return }
-            self.polling = false
-            self.state = Self.state(from: result)
+        let settings = self.settings
+        queue.async {
+            let result = CLI.run(Commands.status(settings), settings: settings)
+            let state = Self.state(from: result)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.polling = false
+                self.state = state
+            }
         }
     }
 
     func copyInvite() {
-        perform(["invite"]) { [weak self] output in
-            guard let code = Self.inviteCode(in: output.stdout) else {
-                return "Could not read an invite code from ghostdrive"
+        perform(Commands.invite(settings)) { [weak self] output in
+            guard let invite = Invite.parse(output.stdout) else {
+                return ["Could not read an invite code from ghostdrive"]
             }
-            self?.copyToPasteboard(code)
-            return "Invite code copied. It works once, for 10 minutes; send it privately."
+            self?.copyToPasteboard(invite.code)
+            return [invite.confirmation]
         }
     }
 
     func openInFinder() {
-        guard let mount = status?.mountpoint else { return }
+        guard let mount = mountedAt else { return }
         NSWorkspace.shared.open(URL(fileURLWithPath: mount))
     }
 
+    // Runs `ghostdrive autostart on` with the data folder and mountpoint from Settings. This
+    // creates a login item, so it only ever runs when the user clicks Start.
     func start() {
-        perform(["autostart", "on"]) { _ in "GhostDrive is starting and will start at login" }
+        perform(Commands.start(settings), failurePrefix: "Start failed", timeout: 60,
+                needsMount: true) { _ in
+            ["GhostDrive is starting and will start at login"]
+        }
     }
 
     func stop() {
-        perform(["stop"]) { _ in "GhostDrive stopped" }
-    }
-
-    func chooseCLI() {
-        let panel = NSOpenPanel()
-        panel.title = "Choose the ghostdrive command-line tool"
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        NSApp.activate(ignoringOtherApps: true)
-        if panel.runModal() == .OK, let url = panel.url {
-            UserDefaults.standard.set(url.path, forKey: CLI.pathKey)
-            refresh()
+        perform(Commands.stop(settings), failurePrefix: "Stop failed") { _ in
+            ["GhostDrive stopped"]
         }
     }
 
-    func resetCLI() {
-        UserDefaults.standard.removeObject(forKey: CLI.pathKey)
-        refresh()
+    // macOS 13 only; later versions open Settings through SettingsLink.
+    func openSettings() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
     }
-
-    var customCLI: String? { UserDefaults.standard.string(forKey: CLI.pathKey) }
 
     // MARK: - Helpers
 
-    private func perform(_ arguments: [String], onSuccess: @escaping (CLI.Output) -> String) {
-        busy = true
-        message = nil
-        run(arguments) { [weak self] result in
-            guard let self else { return }
-            self.busy = false
-            switch result {
-            case .success(let output) where output.status == 0:
-                self.message = onSuccess(output)
-            case .success(let output):
-                self.message = Self.firstLine(output.stderr.isEmpty ? output.stdout : output.stderr)
-            case .failure(let failure):
-                self.message = Self.describe(failure)
-            }
-            self.refresh()
+    private func perform(_ arguments: [String], failurePrefix: String? = nil,
+                         timeout: TimeInterval = 15, needsMount: Bool = false,
+                         onSuccess: @escaping (CLI.Output) -> [String]) {
+        let problems = settings.problems(includingMount: needsMount)
+        if !problems.isEmpty {
+            message = ["Fix the settings first:"]
+                + problems.map { DisplayText.clean($0, maxLength: 120) }
+            return
         }
-    }
-
-    private func run(_ arguments: [String],
-                     completion: @escaping @MainActor (Result<CLI.Output, CLI.Failure>) -> Void) {
+        busy = true
+        message = []
+        let settings = self.settings
         queue.async {
-            let result = CLI.run(arguments)
-            Task { @MainActor in completion(result) }
+            let result = CLI.run(arguments, settings: settings, timeout: timeout)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.busy = false
+                switch result {
+                case .success(let output) where output.status == 0:
+                    self.message = onSuccess(output)
+                case .success(let output):
+                    self.message = DisplayText.failure(failurePrefix, status: output.status,
+                                                       stdout: output.stdout,
+                                                       stderr: output.stderr)
+                case .failure(let failure):
+                    self.message = [Self.describe(failure)]
+                }
+                self.refresh()
+            }
         }
     }
 
@@ -124,41 +152,36 @@ final class DriveModel: ObservableObject {
         board.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
     }
 
-    private static func state(from result: Result<CLI.Output, CLI.Failure>) -> State {
+    // Runs on the CLI queue: the mount check can block on a stuck file system.
+    nonisolated private static func state(from result: Result<CLI.Output, CLI.Failure>) -> State {
         switch result {
         case .failure(.notFound):
             return .noCLI
+        case .failure(.badPath(let path, let problem)):
+            return .badCLI("\(DisplayText.clean(path, maxLength: 120)) \(problem.description)")
         case .failure(let failure):
             return .notRunning(describe(failure))
         case .success(let output) where output.status == 0:
-            guard let status = try? JSONDecoder().decode(DriveStatus.self,
-                                                         from: Data(output.stdout.utf8)) else {
+            guard let decoded = try? JSONDecoder().decode(DriveStatus.self,
+                                                          from: Data(output.stdout.utf8)) else {
                 return .notRunning("Unexpected status output; is ghostdrive up to date?")
             }
-            return .running(status)
+            let status = decoded.cleaned()
+            let mounted = decoded.mountpoint.map { !$0.isEmpty && PathCheck.isMountPoint($0) }
+            return .running(status, mounted: mounted ?? false)
         case .success(let output):
-            return .notRunning(firstLine(output.stderr))
+            return .notRunning(DisplayText.lines(output.stderr, maxLines: 1).first
+                               ?? "ghostdrive failed")
         }
     }
 
-    // `ghostdrive invite` prints "ghostdrive join gd1-..." among other lines.
-    static func inviteCode(in text: String) -> String? {
-        text.split(whereSeparator: { $0.isWhitespace })
-            .first { $0.hasPrefix("gd1-") }
-            .map(String.init)
-    }
-
-    private static func describe(_ failure: CLI.Failure) -> String {
+    nonisolated private static func describe(_ failure: CLI.Failure) -> String {
         switch failure {
         case .notFound: return "ghostdrive command-line tool not found"
-        case .launch(let reason): return "Could not run ghostdrive: \(reason)"
+        case .badPath(let path, let problem):
+            return "\(DisplayText.clean(path, maxLength: 120)) \(problem.description)"
+        case .launch(let reason): return "Could not run ghostdrive: \(DisplayText.clean(reason))"
         case .timedOut: return "ghostdrive did not answer in time"
         }
-    }
-
-    private static func firstLine(_ text: String) -> String {
-        var line = text.split(separator: "\n").first.map(String.init) ?? "ghostdrive failed"
-        if line.hasPrefix("ghostdrive: ") { line.removeFirst("ghostdrive: ".count) }
-        return line
     }
 }

@@ -9,6 +9,12 @@ let package = Package(
     name: "GhostDriveMenu",
     platforms: [.macOS(.v13)],
     targets: [
-        .executableTarget(name: "GhostDriveMenu", path: "Sources/GhostDriveMenu"),
+        // Everything that can be tested without AppKit: settings, the CLI argument lists, and
+        // parsing of what the CLI prints.
+        .target(name: "GhostDriveMenuKit", path: "Sources/GhostDriveMenuKit"),
+        .executableTarget(name: "GhostDriveMenu", dependencies: ["GhostDriveMenuKit"],
+                          path: "Sources/GhostDriveMenu"),
+        .testTarget(name: "GhostDriveMenuKitTests", dependencies: ["GhostDriveMenuKit"],
+                    path: "Tests/GhostDriveMenuKitTests"),
     ]
 )
