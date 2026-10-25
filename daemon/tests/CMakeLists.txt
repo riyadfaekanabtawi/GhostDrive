@@ -4,8 +4,9 @@ add_executable(ghostdrive_daemon_tests
     drive_test.cpp
     invite_test.cpp
     membership_test.cpp
+    status_json_test.cpp
 )
-target_include_directories(ghostdrive_daemon_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/tests)
+target_include_directories(ghostdrive_daemon_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/tests ${PROJECT_SOURCE_DIR}/daemon/src)
 target_link_libraries(ghostdrive_daemon_tests
     PRIVATE
         ghostdrive::daemon

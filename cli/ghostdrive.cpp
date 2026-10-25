@@ -45,7 +45,7 @@ constexpr const char* kUsage =
     "                                   devices on other networks (see ghostdrive-rendezvous)\n"
     "\n"
     "Running (start the daemon with `ghostdrived`):\n"
-    "  status                           show this device and the other devices\n"
+    "  status [--json]                  show this device and the other devices\n"
     "  remove NAME|ID                   take a device out of the drive for good (a lost or\n"
     "                                   stolen one); the other devices learn of it\n"
     "  stop                             unmount and stop the daemon\n"
@@ -74,6 +74,7 @@ struct Args {
     std::string name = host_name();
     std::uint16_t port = daemon::kDefaultPort;
     long ttl = 600;
+    bool json = false;
 };
 
 bool parse_number(const char* text, auto& out) {
@@ -106,6 +107,8 @@ bool parse_args(int argc, char** argv, Args& args) {
         } else if (a == "--ttl") {
             auto v = value();
             if (!v || !parse_number(v, args.ttl)) return false;
+        } else if (a == "--json") {
+            args.json = true;
         } else if (!a.empty() && a[0] == '-') {
             return false;
         } else {
@@ -417,7 +420,7 @@ int main(int argc, char** argv) {
     if (args.command == "join") return cmd_join(args);
     if (args.command == "rendezvous") return cmd_rendezvous(args);
     if (args.command == "autostart") return cmd_autostart(args);
-    if (args.command == "status") return cmd_control(args, "status");
+    if (args.command == "status") return cmd_control(args, args.json ? "status-json" : "status");
     if (args.command == "stop") return cmd_control(args, "stop");
     if (args.command == "remove") {
         if (args.positional.size() != 1) {

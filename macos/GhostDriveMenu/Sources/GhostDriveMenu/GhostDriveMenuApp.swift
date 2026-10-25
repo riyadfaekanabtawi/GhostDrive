@@ -1,0 +1,108 @@
+import AppKit
+import SwiftUI
+
+@main
+struct GhostDriveMenuApp: App {
+    @StateObject private var model = DriveModel()
+
+    init() {
+        // No Dock icon, also when run with `swift run` outside an app bundle (LSUIElement).
+        NSApplication.shared.setActivationPolicy(.accessory)
+    }
+
+    var body: some Scene {
+        MenuBarExtra {
+            MenuContent(model: model)
+        } label: {
+            Image(systemName: model.status == nil ? "externaldrive" : "externaldrive.fill")
+                .accessibilityLabel("GhostDrive")
+        }
+    }
+}
+
+struct MenuContent: View {
+    @ObservedObject var model: DriveModel
+
+    var body: some View {
+        switch model.state {
+        case .starting:
+            Text("GhostDrive: checking...")
+        case .noCLI:
+            Text("ghostdrive command-line tool not found")
+            Text("Install it on PATH, put it next to this app, or choose it below")
+        case .notRunning(let reason):
+            Text("GhostDrive is not running")
+            if !reason.contains("not running") {
+                Text(reason)
+            }
+        case .running(let status):
+            RunningSection(status: status)
+        }
+
+        if let message = model.message {
+            Divider()
+            Text(message)
+        }
+
+        Divider()
+        if let status = model.status {
+            Button("Copy Invite Code") { model.copyInvite() }
+                .disabled(model.busy || status.removedBy != nil)
+            Button("Open Drive in Finder") { model.openInFinder() }
+                .disabled(status.mountpoint == nil)
+            Button("Stop GhostDrive") { model.stop() }
+                .disabled(model.busy)
+        } else if model.state != .noCLI && model.state != .starting {
+            Button("Start GhostDrive") { model.start() }
+                .disabled(model.busy)
+        }
+
+        Divider()
+        Button("Choose ghostdrive Tool...") { model.chooseCLI() }
+        if let custom = model.customCLI {
+            Button("Use Default ghostdrive Tool (now \(custom))") { model.resetCLI() }
+        }
+        Button("Quit GhostDrive Menu") { NSApplication.shared.terminate(nil) }
+            .keyboardShortcut("q")
+    }
+}
+
+struct RunningSection: View {
+    let status: DriveStatus
+
+    var body: some View {
+        Text("This device: \(status.device)")
+        if let removedBy = status.removedBy {
+            Text("Removed from the drive by \(removedBy)")
+        }
+        if let error = status.discoveryError {
+            Text("Warning: could not replace the discovery key (\(error))")
+        }
+        Text(rendezvousText)
+
+        Divider()
+        let online = status.peers.filter(\.online)
+        let offline = status.peers.filter { !$0.online }
+        if status.peers.isEmpty {
+            Text("No other devices yet")
+        }
+        if !online.isEmpty {
+            Text("Online")
+            ForEach(online) { peer in
+                Text("  \(peer.name)\(peer.relayed ? " (relayed)" : "")")
+            }
+        }
+        if !offline.isEmpty {
+            Text("Offline")
+            ForEach(offline) { peer in Text("  \(peer.name)") }
+        }
+    }
+
+    private var rendezvousText: String {
+        guard let rv = status.rendezvous else { return "Rendezvous: not set (local network only)" }
+        if rv.connected {
+            return "Rendezvous: connected to \(rv.address)"
+        }
+        return "Rendezvous: not connected to \(rv.address)"
+    }
+}

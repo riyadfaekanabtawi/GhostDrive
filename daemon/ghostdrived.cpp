@@ -16,6 +16,7 @@
 #include "ghostdrive/daemon/control.hpp"
 #include "ghostdrive/daemon/drive.hpp"
 #include "ghostdrive/daemon/service.hpp"
+#include "status_json.hpp"
 #include "status_text.hpp"
 #ifdef GHOSTDRIVE_HAVE_FUSE
 #include "ghostdrive/vfs/fuse_mount.hpp"
@@ -114,6 +115,9 @@ int main(int argc, char** argv) {
         [&](const std::string& command) -> std::string {
             if (command == "ping") return "pong\n";
             if (command == "status") return daemon::format_status(service.status(), mounted_at);
+            if (command == "status-json") {
+                return daemon::format_status_json(service.status(), mounted_at);
+            }
             if (command == "stop") {
                 request_stop();
                 return "stopping\n";

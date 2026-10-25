@@ -14,7 +14,7 @@ across the internet (rendezvous, hole punching, relay) is not built yet. See
 ## How you use it
 
 The drive appears as a normal volume (Finder sidebar, any app). The terminal is only for setup;
-a menu-bar app with QR pairing is planned.
+the menu-bar app (below) covers daily use, and QR pairing is planned.
 
 On the first device:
 
@@ -86,6 +86,26 @@ On macOS this installs a LaunchAgent in `~/Library/LaunchAgents` (its log goes t
 `~/.config/systemd/user`. It runs the `ghostdrived` next to the `ghostdrive` you ran, restarts
 it if it crashes, and leaves it stopped after `ghostdrive stop` until the next login. `on`
 accepts `--mount DIR`, and all three accept `--data DIR`, which gets its own login item.
+
+### Menu-bar app
+
+On macOS 13 or later, `macos/GhostDriveMenu` is a small menu-bar app. It shows this device,
+which devices are online or offline, and whether the rendezvous server is connected, and it can
+copy an invite code, open the drive in Finder, start GhostDrive (`ghostdrive autostart on`, only
+when you click it) and stop it.
+
+```
+cd macos/GhostDriveMenu
+swift build                                     # or: swift run
+GHOSTDRIVE_BUILD_DIR=../../build/release ./make-app.sh   # .build/GhostDrive Menu.app
+```
+
+The app does everything by running the `ghostdrive` tool (`status --json`, `invite`, `stop`),
+which it looks for inside or next to the app, then on PATH, `/opt/homebrew/bin` and
+`/usr/local/bin`; "Choose ghostdrive Tool..." in the menu picks another one. Without
+`GHOSTDRIVE_BUILD_DIR`, `make-app.sh` leaves the tools out of the bundle. To use a data directory
+other than the default, run `defaults write org.ghostdrive.menu ghostdriveDataDir DIR`. The app
+never reads key files. `ghostdrive status --json` is also usable from scripts.
 
 ## Limitations
 
