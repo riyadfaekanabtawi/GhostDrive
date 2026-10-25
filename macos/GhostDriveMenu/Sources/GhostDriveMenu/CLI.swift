@@ -1,11 +1,9 @@
 import Foundation
+import GhostDriveMenuKit
 
 // Runs the `ghostdrive` command-line tool. The menu talks to the daemon only through it, so the
 // control-socket location and the data directory rules live in one place (the CLI).
 struct CLI {
-    static let pathKey = "ghostdriveCLIPath"  // user setting: full path to the CLI
-    static let dataKey = "ghostdriveDataDir"  // user setting: passed as --data when set
-
     struct Output {
         var status: Int32
         var stdout: String
@@ -14,17 +12,20 @@ struct CLI {
 
     enum Failure: Error {
         case notFound
+        case badPath(String, PathProblem)  // the path set in Settings is not usable
         case launch(String)
         case timedOut
     }
 
     // The configured path, then `ghostdrive` inside or next to the app bundle, then PATH and
     // the usual install locations (apps started from Finder get a minimal PATH).
-    static func locate() -> URL? {
+    static func locate(_ settings: MenuSettings) -> Result<URL, Failure> {
         let fm = FileManager.default
-        if let configured = UserDefaults.standard.string(forKey: pathKey), !configured.isEmpty {
-            let url = URL(fileURLWithPath: (configured as NSString).expandingTildeInPath)
-            return fm.isExecutableFile(atPath: url.path) ? url : nil
+        if let configured = settings.cliURL {
+            if let problem = PathCheck.executable(configured.path) {
+                return .failure(.badPath(configured.path, problem))
+            }
+            return .success(configured)
         }
         var candidates: [URL] = []
         if let exe = Bundle.main.executableURL?.deletingLastPathComponent() {
@@ -38,21 +39,23 @@ struct CLI {
         for dir in dirs where !dir.isEmpty {
             candidates.append(URL(fileURLWithPath: dir).appendingPathComponent("ghostdrive"))
         }
-        return candidates.first { fm.isExecutableFile(atPath: $0.path) }
+        let found = candidates.first { fm.isExecutableFile(atPath: $0.path) }
+        return found.map { .success($0) } ?? .failure(.notFound)
     }
 
-    // Runs `ghostdrive <arguments> [--data DIR]` without a shell. Blocks; call off the main
+    // Runs `ghostdrive <arguments>` (see Commands) without a shell. Blocks; call off the main
     // thread.
-    static func run(_ arguments: [String], timeout: TimeInterval = 15) -> Result<Output, Failure> {
-        guard let tool = locate() else { return .failure(.notFound) }
-        var args = arguments
-        if let data = UserDefaults.standard.string(forKey: dataKey), !data.isEmpty {
-            args += ["--data", (data as NSString).expandingTildeInPath]
+    static func run(_ arguments: [String], settings: MenuSettings,
+                    timeout: TimeInterval = 15) -> Result<Output, Failure> {
+        let tool: URL
+        switch locate(settings) {
+        case .success(let url): tool = url
+        case .failure(let failure): return .failure(failure)
         }
 
         let process = Process()
         process.executableURL = tool
-        process.arguments = args
+        process.arguments = arguments
         let out = Pipe()
         let err = Pipe()
         process.standardOutput = out
