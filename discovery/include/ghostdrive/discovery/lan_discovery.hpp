@@ -12,8 +12,16 @@
 #include <list>
 #include <memory>
 #include <string>
+#ifdef GHOSTDRIVE_LAN_WINDNS
+#include <optional>
+#include <utility>
+#include <vector>
+#endif
 
 #include "ghostdrive/core/result.hpp"
+#ifdef GHOSTDRIVE_LAN_WINDNS
+#include "ghostdrive/discovery/seen_names.hpp"
+#endif
 
 #ifdef GHOSTDRIVE_LAN_AVAHI
 struct AvahiAddress;
@@ -21,7 +29,7 @@ struct AvahiClient;
 struct AvahiEntryGroup;
 struct AvahiServiceBrowser;
 struct AvahiStringList;
-#else
+#elif !defined(GHOSTDRIVE_LAN_WINDNS)
 typedef struct _DNSServiceRef_t* DNSServiceRef;
 #endif
 
@@ -37,9 +45,9 @@ struct LanSighting {
 };
 
 // Advertises this device and browses for others with DNS-SD over mDNS, through the system's
-// responder (mDNSResponder, or avahi-daemon through avahi-client on Linux). An advertisement
-// is only a hint: dialing it still pins the member's key, so a forged one costs one dial.
-// Use from one executor.
+// responder (mDNSResponder, avahi-daemon through avahi-client on Linux, or the DNS Client
+// service through windns.h on Windows). An advertisement is only a hint: dialing it still pins
+// the member's key, so a forged one costs one dial. Use from one executor.
 class LanDiscovery {
 public:
     using IdSource = std::function<std::string()>;
@@ -72,6 +80,13 @@ public:
                    const char* domain, unsigned flags);
     void on_resolve(Op* op, int event, const AvahiAddress* address, std::uint16_t port,
                     AvahiStringList* txt);
+#elif defined(GHOSTDRIVE_LAN_WINDNS)
+    enum class Registration { pending, registered, gone, failed };
+    // Service instance names seen, each with false for a goodbye.
+    void on_browse(std::vector<std::pair<std::string, bool>> names);
+    void on_resolve(std::uint64_t token, bool ok, std::string id, std::uint16_t port,
+                    std::optional<asio::ip::address_v4> address);
+    void on_register(std::uint64_t token, Registration state);
 #else
     void on_browse(std::uint32_t flags, std::uint32_t interface, int error, const char* name,
                    const char* type, const char* domain);
@@ -84,6 +99,9 @@ private:
     core::Status begin();
 #ifdef GHOSTDRIVE_LAN_AVAHI
     void add_service();
+#elif defined(GHOSTDRIVE_LAN_WINDNS)
+    core::Status register_service();
+    void leave();
 #else
     void wait_readable();
 #endif
@@ -105,6 +123,14 @@ private:
     AvahiClient* client_ = nullptr;
     AvahiEntryGroup* group_ = nullptr;
     AvahiServiceBrowser* browser_ = nullptr;
+#elif defined(GHOSTDRIVE_LAN_WINDNS)
+    // Requests handed to dnsapi, by token (lan_discovery_windns.cpp).
+    std::wstring host_;
+    std::vector<std::uint64_t> calls_;
+    std::uint64_t registration_ = 0;
+    Registration registration_state_ = Registration::gone;
+    std::string registered_id_;
+    SeenNames seen_{256, std::chrono::minutes(3)};  // advertisements resolved recently
 #else
     DNSServiceRef main_ = nullptr;
     DNSServiceRef register_ = nullptr;

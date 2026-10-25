@@ -6,11 +6,14 @@ target_link_libraries(ghostdrive_discovery
     PRIVATE OpenSSL::Crypto ghostdrive_warnings)
 
 # LAN discovery goes through the system's mDNS responder: DNS-SD on macOS; on Linux,
-# avahi-daemon through avahi-client, or else an Apple-compatible libdns_sd (mDNSResponder).
+# avahi-daemon through avahi-client, or else an Apple-compatible libdns_sd (mDNSResponder); on
+# Windows, the DNS-SD functions of windns.h (dnsapi, Windows 10 1809 and later).
 # Avahi's DNS-SD compatibility library lacks shared connections and DNSServiceGetAddrInfo, so it
 # is rejected here. Without any of these, devices are reached only by stored addresses.
 if(APPLE)
     set(GHOSTDRIVE_DNSSD_FOUND TRUE)
+elseif(WIN32)
+    set(GHOSTDRIVE_WINDNS_FOUND TRUE)
 else()
     find_package(PkgConfig QUIET)
     if(PKG_CONFIG_FOUND)
@@ -40,7 +43,15 @@ else()
 endif()
 # GHOSTDRIVE_HAVE_LAN_DISCOVERY tells users of LanDiscovery that start() can succeed. The
 # backend macros are public too, since the class layout depends on them.
-if(AVAHI_CLIENT_FOUND)
+if(GHOSTDRIVE_WINDNS_FOUND)
+    target_sources(ghostdrive_discovery PRIVATE src/lan_discovery_windns.cpp)
+    target_compile_definitions(ghostdrive_discovery
+        PUBLIC GHOSTDRIVE_HAVE_LAN_DISCOVERY=1 GHOSTDRIVE_LAN_WINDNS=1)
+    # Not linked with dnsapi.lib: its functions are looked up at run time in dnsapi.dll from
+    # System32, so ghostdrived still starts on a Windows without them and never loads the DLL
+    # through the default search order.
+    message(STATUS "LAN discovery: windns.h DNS-SD")
+elseif(AVAHI_CLIENT_FOUND)
     target_sources(ghostdrive_discovery PRIVATE src/lan_discovery_avahi.cpp)
     target_compile_definitions(ghostdrive_discovery
         PUBLIC GHOSTDRIVE_HAVE_LAN_DISCOVERY=1 GHOSTDRIVE_LAN_AVAHI=1)

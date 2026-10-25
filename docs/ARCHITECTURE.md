@@ -231,10 +231,17 @@ document assumes the corrected version.
   advertises the service and its TXT record is updated in place, and one resolver per sighting
   returns the TXT record and IPv4 address together. Avahi's DNS-SD compatibility library lacks
   shared connections and DNSServiceGetAddrInfo, so it is not used; an mDNSResponder libdns_sd
-  is used when avahi-client is absent. Without avahi-client or libdns_sd at build time, or with
-  no responder running (avahi-daemon stopped), start() fails and the daemon carries on with
-  stored addresses and the rendezvous server. If the responder goes away later, discovery stops
-  until the daemon restarts. The TXT record is
+  is used when avahi-client is absent. On Windows through the DNS-SD functions of `windns.h`
+  (discovery/src/lan_discovery_windns.cpp, Windows 10 1809 and later), answered by the mDNS
+  responder of the DNS Client service: `DnsServiceRegister` advertises, `DnsServiceBrowse`
+  reports the service's PTR records (a TTL of 0 is a goodbye), and `DnsServiceResolve` returns
+  the TXT record and IPv4 address of each instance not seen before. windns.h has no call that
+  updates a registered TXT record, so a new ID deregisters the service and registers it again
+  under the same instance name (section 3.8 has the threading). Without avahi-client or
+  libdns_sd at build time, without the windns.h functions at run time, or with no responder
+  running (avahi-daemon stopped), start() fails and the daemon carries on with stored addresses
+  and the rendezvous server. If the responder goes away later, discovery stops until the daemon
+  restarts. The TXT record is
   `v=1 id=<base32>`, where the ID is `HMAC-SHA256(drive_secret, "ghostdrive-lan-v1" || epoch
   || device key)` truncated to 12 bytes, with one-hour epochs; members check the neighbouring
   epochs too, for clock skew. A sighting updates the stored address and dials right away, in
@@ -735,9 +742,32 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   daemon, and its command line would need the same quoting. The daemon keeps its console
   window, so closing that window stops it as `ghostdrive stop` does. The tests never register
   a task: one hands the generated XML to the Task Scheduler with `TASK_VALIDATE_ONLY`.
-- **Not on Windows yet.** No LAN discovery: the `lan_discovery_none` backend is built, and
-  devices are reached by stored addresses and the rendezvous server. LAN discovery (DNS-SD
-  through `windns.h`) is a separate follow-up.
+- **LAN discovery.** Through `windns.h` (section 3.4). The functions are looked up in dnsapi.dll
+  at run time, from System32 only (`LoadLibraryExW` with `LOAD_LIBRARY_SEARCH_SYSTEM32`;
+  dnsapi.lib is not linked), so `ghostdrived` still starts on a Windows without them, start()
+  fails cleanly, and the DLL is never loaded through the default search order. dnsapi calls back on its own thread pool,
+  and the cancel functions call back on the calling thread before they return (both seen on
+  the CI runner), so no callback touches LanDiscovery: each request is a `Call` in a
+  process-wide registry, and its context is a token, not a pointer. A callback copies what it
+  needs out of the records it was given (it owns them, and frees them with `DnsRecordListFree`
+  or `DnsServiceFreeInstance` at once), looks its token up under the registry lock and, still
+  holding it, posts the result to the executor, where an `alive_` check guards the object.
+  ~LanDiscovery detaches its calls under that lock first, then cancels them without it; a
+  `Call` keeps its request structures, the strings they point to and the `DNS_SERVICE_CANCEL`
+  alive until its final callback (`ERROR_CANCELLED` for a browse, the one result for a
+  resolve, the deregistration for a registration). A registration still pending is cancelled
+  with `DnsServiceRegisterCancel`, because a deregistration sent before it completes fails and
+  leaves the service registered; if it completes as that cancel starts, its `Call` is kept
+  until the deregistration that follows has called back. The registry is never destroyed, so
+  a callback during process exit finds it intact. A resolve for a name nobody answers never
+  calls back, so resolves are cancelled after 10 s. The browse reports every response again
+  (each interface, each announcement), so a name resolved in the last three minutes is not
+  resolved again (`SeenNames`, discovery/include/ghostdrive/discovery/seen_names.hpp). After
+  that it is, so an ID updated in place (other backends rotate it hourly without a goodbye) or
+  a new address is seen; a goodbye or a failed resolve forgets the name at once; and a full
+  table (256 names) drops its oldest entry, so a host advertising many names cannot shut out
+  new ones. On the `windows-latest` runner mDNS answers on the host itself, so the LAN
+  discovery test and the two-daemon LAN test run there.
 
 ## 4. Data path of one read()
 

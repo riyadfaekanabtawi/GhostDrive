@@ -1,4 +1,5 @@
-// Needs the system's mDNS responder (mDNSResponder, or avahi-daemon on Linux); skips without it.
+// Needs the system's mDNS responder (mDNSResponder, avahi-daemon on Linux, the DNS Client
+// service on Windows); skips without it.
 #include "ghostdrive/discovery/lan_discovery.hpp"
 
 #include <gtest/gtest.h>

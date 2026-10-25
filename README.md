@@ -154,8 +154,8 @@ is also usable from scripts.
 - Streaming speed is bounded by the upload bandwidth of the device serving the data.
 - MVP platforms are Linux and macOS. Windows is phase 2; iOS and Android are phase 3. On
   Windows the drive mounts through WinFsp (`ghostdrived` mounts at `%USERPROFILE%\GhostDrive`,
-  or `--mount X:` for a drive letter) and `ghostdrive autostart` works, but there is no LAN
-  discovery yet (devices are reached by stored addresses and the rendezvous server). The Windows
+  or `--mount X:` for a drive letter), finds devices on the local network through Windows' own
+  mDNS (Windows 10 1809 or later), and `ghostdrive autostart` works. The Windows
   volume is case-insensitive: files from other devices whose names Windows cannot use (such as
   `a:b` or `CON`) are not shown there, and of names that differ only in case only one is shown
   (the one whose name sorts first, so `Report.txt` before `report.txt`); the others stay on the
