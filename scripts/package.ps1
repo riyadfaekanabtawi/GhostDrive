@@ -1,15 +1,19 @@
 # Builds the windows-release preset and packs the installed programs into
 #   build\windows-release\ghostdrive-<version>-windows-x86_64.zip (plus a .sha256 file).
 # The zip holds one folder with ghostdrive.exe, ghostdrived.exe, ghostdrive-rendezvous.exe,
-# LICENSE and README.md. The programs link the vcpkg libraries and the C/C++ runtime statically
-# (triplet x64-windows-static-release), so they need no DLLs beyond Windows itself; WinFsp's
-# DLL is delay-loaded and only needed for mounting.
-# Everything, including vcpkg's build trees and downloads, is written under build\windows-release.
+# LICENSE and README.md, and the desktop app (windows\GhostDriveApp) in an app\ subfolder:
+# app\GhostDriveApp.exe finds ghostdrive.exe in the folder above. The programs link the vcpkg
+# libraries and the C/C++ runtime statically (triplet x64-windows-static-release), so they need
+# no DLLs beyond Windows itself; WinFsp's DLL is delay-loaded and only needed for mounting. The
+# app is published trimmed and self-contained, with the .NET and Windows App SDK runtimes.
+# Everything, including vcpkg's build trees and downloads and the app's build output and NuGet
+# packages, is written under build\windows-release.
 #
 # This is a PowerShell script rather than package.sh under Git Bash: Git Bash has no zip tool,
 # the Visual Studio build environment (vcvars64.bat) is set up from cmd or PowerShell, and
 # PowerShell is on every Windows machine. It needs PowerShell 7 (pwsh), Visual Studio 2022 with
-# its C++ and clang-cl components, CMake, Ninja, and the WinFsp SDK for the mount.
+# its C++ and clang-cl components, CMake, Ninja, the WinFsp SDK for the mount, and the .NET SDK
+# pinned in windows\GhostDriveApp\global.json.
 #
 # Usage: pwsh scripts/package.ps1 [extra cmake configure arguments]
 # for example -DVCPKG_INSTALLED_DIR=... to reuse a vcpkg installed tree.
@@ -58,6 +62,22 @@ $name = "ghostdrive-$version-windows-x86_64"
 $stage = Join-Path $build 'package'
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 cmake --install $build --prefix (Join-Path $stage $name)
+
+# The desktop app. -p:Version stamps GhostDriveApp.exe with the project version;
+# --artifacts-path keeps its bin and obj folders out of the source tree.
+if (-not $env:NUGET_PACKAGES) { $env:NUGET_PACKAGES = Join-Path $build 'nuget' }
+$env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
+$env:DOTNET_NOLOGO = '1'
+Push-Location (Join-Path $root 'windows\GhostDriveApp')
+try {
+    dotnet publish GhostDriveApp -c Release "-p:Version=$version" `
+        --artifacts-path (Join-Path $build 'dotnet') -o (Join-Path $stage "$name\app")
+} finally {
+    Pop-Location
+}
+if (-not (Test-Path (Join-Path $stage "$name\app\GhostDriveApp.exe"))) {
+    throw 'package.ps1: dotnet publish wrote no GhostDriveApp.exe'
+}
 
 $zip = Join-Path $build "$name.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }

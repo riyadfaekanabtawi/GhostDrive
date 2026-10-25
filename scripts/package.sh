@@ -1,7 +1,11 @@
 #!/bin/sh
 # Builds the release preset and packs the installed programs into
 #   build/release/ghostdrive-<version>-<os>-<arch>.tar.gz (plus a .sha256 file).
-# On macOS the tarball also holds GhostDrive.app, with ghostdrive and ghostdrived inside.
+# Each tarball holds its platform's desktop app and an INSTALL.txt next to bin/ and share/:
+#   macOS: GhostDrive.app, with ghostdrive and ghostdrived inside;
+#   Linux: bin/ghostdrive-app with its .desktop file and icon under share/, and install.sh,
+#          which installs it all for the current user. Building it needs the gtk4 and
+#          libadwaita-1 development packages.
 # Everything, including vcpkg's build trees and SwiftPM's caches, is written under build/release.
 #
 # Usage: scripts/package.sh [extra cmake configure arguments]
@@ -27,12 +31,15 @@ if [ "$(uname -s)" = Darwin ]; then
     export MACOSX_DEPLOYMENT_TARGET
     osx_target="$MACOSX_DEPLOYMENT_TARGET"
 fi
+linux_app=""
+[ "$(uname -s)" != Linux ] || linux_app="-DGHOSTDRIVE_BUILD_LINUX_APP=ON"
 
 cd "$root"
 cmake --preset release -DGHOSTDRIVE_BUILD_TESTS=OFF \
     "-DVCPKG_INSTALL_OPTIONS=--x-buildtrees-root=$build/vcpkg/buildtrees;--x-packages-root=$build/vcpkg/packages" \
     ${osx_target:+"-DCMAKE_OSX_DEPLOYMENT_TARGET=$osx_target"} \
     ${osx_target:+"-DVCPKG_OVERLAY_TRIPLETS=$root/packaging/vcpkg-triplets"} \
+    ${linux_app:+"$linux_app"} \
     "$@"
 cmake --build --preset release
 
@@ -63,6 +70,13 @@ if [ "$os" = macos ]; then
     bundled="$stage/$name/$(basename "$app")"
     cp "$stage/$name/bin/ghostdrive" "$stage/$name/bin/ghostdrived" "$bundled/Contents/MacOS/"
     codesign --force --sign - "$bundled"
+    cp "$root/packaging/macos/INSTALL.txt" "$stage/$name/"
+elif [ "$os" = linux ]; then
+    [ -x "$stage/$name/bin/ghostdrive-app" ] || {
+        echo "package.sh: ghostdrive-app was not built (GHOSTDRIVE_BUILD_LINUX_APP=OFF?)" >&2
+        exit 1
+    }
+    cp "$root/packaging/linux/INSTALL.txt" "$root/packaging/linux/install.sh" "$stage/$name/"
 fi
 
 tarball="$build/$name.tar.gz"

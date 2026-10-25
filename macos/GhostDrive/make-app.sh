@@ -9,6 +9,8 @@
 # configuration there instead (scripts/package.sh points it into the CMake build tree).
 # GHOSTDRIVE_VERSION sets the bundle version; by default it is the project() version in the
 # top-level CMakeLists.txt.
+# MACOSX_DEPLOYMENT_TARGET, 13.0 or later, sets the oldest macOS the app runs on; by default it
+# is the package's floor, macOS 13. SwiftPM itself ignores the variable.
 set -eu
 
 cd "$(dirname "$0")"
@@ -25,6 +27,16 @@ if [ -n "$scratch" ]; then
 else
     set --
     scratch="$PWD/.build"
+fi
+min_macos="13.0"
+if [ -n "${MACOSX_DEPLOYMENT_TARGET:-}" ]; then
+    case "$MACOSX_DEPLOYMENT_TARGET" in
+        1[3-9] | 1[3-9].* | [2-9][0-9] | [2-9][0-9].*) ;;
+        *) echo "make-app.sh: MACOSX_DEPLOYMENT_TARGET must be 13.0 or later" >&2; exit 1 ;;
+    esac
+    min_macos="$MACOSX_DEPLOYMENT_TARGET"
+    # The last -target wins over the one SwiftPM derives from the package's platforms.
+    set -- "$@" -Xswiftc -target -Xswiftc "$(uname -m)-apple-macosx$min_macos"
 fi
 swift build -c "$config" "$@"
 bin="$(swift build -c "$config" "$@" --show-bin-path)"
@@ -60,7 +72,7 @@ cat > "$app/Contents/Info.plist" <<EOF
     <key>CFBundleVersion</key>
     <string>$version</string>
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>$min_macos</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.utilities</string>
     <key>NSHighResolutionCapable</key>

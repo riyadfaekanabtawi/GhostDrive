@@ -1,0 +1,52 @@
+GhostDrive for Linux (x86_64)
+=============================
+
+This folder holds the GhostDrive desktop app and the command-line programs:
+
+  bin/ghostdrive-app          the desktop app (GTK 4 and libadwaita)
+  bin/ghostdrive              the CLI, which the app runs for everything
+  bin/ghostdrived             the daemon that mounts the drive
+  bin/ghostdrive-rendezvous   the optional rendezvous and relay server
+  share/applications/         the app's menu entry (org.ghostdrive.GhostDrive.desktop)
+  share/icons/                the app's icon
+  install.sh                  installs all of the above for your user only
+
+Runtime dependencies (install them with your distribution's package manager first):
+
+                                   Debian and Ubuntu          Fedora
+  GTK 4.10 or later                libgtk-4-1                 gtk4
+  libadwaita 1.5 or later          libadwaita-1-0             libadwaita
+  libfuse3, for mounting           fuse3 and libfuse3-3       fuse3 and fuse3-libs
+                                   (libfuse3-4 on Debian 13)
+  avahi-client, for LAN discovery  libavahi-client3           avahi-libs
+
+  Ubuntu 24.04, Debian 13 and Fedora 40 or later have new enough GTK and libadwaita.
+  Only ghostdrive-app needs GTK and libadwaita; the other programs run without them.
+
+Install
+-------
+
+  ./install.sh
+
+copies the programs to ~/.local/bin, the menu entry to ~/.local/share/applications and the
+icon to ~/.local/share/icons (or under $XDG_DATA_HOME if it is set). It never uses sudo and
+writes nothing outside your home directory. Then open GhostDrive from your desktop's
+application menu, or run ~/.local/bin/ghostdrive-app.
+
+Keep ghostdrive, ghostdrived and ghostdrive-app in the same folder: the app runs the
+ghostdrive next to it, and Start and Start at login run the ghostdrived next to that.
+
+The app also runs straight from this folder without installing: bin/ghostdrive-app.
+
+Uninstall
+---------
+
+  rm ~/.local/bin/ghostdrive ~/.local/bin/ghostdrived ~/.local/bin/ghostdrive-rendezvous \
+     ~/.local/bin/ghostdrive-app \
+     ~/.local/share/applications/org.ghostdrive.GhostDrive.desktop \
+     ~/.local/share/icons/hicolor/scalable/apps/org.ghostdrive.GhostDrive.svg
+
+Run `ghostdrive autostart off` and `ghostdrive stop` first if you turned them on. Your drive's
+data folder (~/.local/share/ghostdrive by default) is left alone.
+
+More: README.md in share/doc/ghostdrive, and https://github.com/riyadfaekanabtawi/GhostDrive
