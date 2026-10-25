@@ -74,6 +74,7 @@ CREATE TABLE signers (
 CREATE TABLE skipped (
     peer BLOB NOT NULL REFERENCES devices(key) ON DELETE CASCADE,
     author INTEGER NOT NULL,
+    noted INTEGER NOT NULL,
     PRIMARY KEY (peer, author)
 ) WITHOUT ROWID;
 INSERT INTO signers(short_id, key) SELECT short_id, key FROM devices;
@@ -449,6 +450,10 @@ Status MetadataIndex::Impl::verify(FileRecord& record) const {
     }
     // A removed device's record counts only as adopted: countersigned by a pinned member.
     if (record.countersigner == 0) {
+        // Retired only on the inviter's word: the device may turn out a member here.
+        if (author->second.provisional) {
+            return Error{Errc::not_found, "record by a device possibly removed: " + record.path};
+        }
         return Error{Errc::invalid_argument, "record by a removed device: " + record.path};
     }
     auto adopter = signers.find(record.countersigner);
@@ -927,20 +932,41 @@ bool MetadataIndex::is_confirmed_retired(std::uint64_t id) const {
 Status MetadataIndex::note_skipped(const PublicKey& peer, std::uint64_t author) {
     std::lock_guard lock(impl_->mutex);
     sqlite3* db = impl_->db.get();
-    auto count = prepare(db,
-                         "SELECT (SELECT COUNT(*) FROM skipped), "
-                         "(SELECT COUNT(*) FROM skipped WHERE peer = ?)");
-    if (!count) return count.error();
-    count.value().bind_blob(1, peer);
-    auto row = count.value().step();
-    if (!row) return row.error();
-    if (count.value().col_i64(0) >= static_cast<std::int64_t>(kMaxSkipped) ||
-        count.value().col_i64(1) >= static_cast<std::int64_t>(kMaxSkippedPerPeer)) {
-        return {};  // full: those records are only fetched again with the whole index
-    }
-    auto ins = prepare(db, "INSERT OR IGNORE INTO skipped(peer, author) VALUES(?, ?)");
+    // When full, the oldest row goes (the peer's own oldest at the per-peer cap), so authors
+    // that are never pinned cannot crowd out new skips. Those records are then fetched again
+    // only with the peer's whole index.
+    Transaction tx(db);
+    if (auto st = tx.begin(); !st) return st;
+    auto evict = prepare(db,
+                         "DELETE FROM skipped WHERE (peer, author) IN (SELECT peer, author FROM "
+                         "skipped WHERE peer = ?1 AND NOT EXISTS (SELECT 1 FROM skipped WHERE "
+                         "peer = ?1 AND author = ?2) ORDER BY noted LIMIT max(0, (SELECT "
+                         "COUNT(*) FROM skipped WHERE peer = ?1) - ?3 + 1))");
+    if (!evict) return evict.error();
+    auto est = evict.value()
+                   .bind_blob(1, peer)
+                   .bind_u64(2, author)
+                   .bind_i64(3, static_cast<std::int64_t>(kMaxSkippedPerPeer))
+                   .run();
+    if (!est) return est;
+    auto evict_all = prepare(db,
+                             "DELETE FROM skipped WHERE (peer, author) IN (SELECT peer, author "
+                             "FROM skipped WHERE NOT EXISTS (SELECT 1 FROM skipped WHERE peer = "
+                             "?1 AND author = ?2) ORDER BY noted LIMIT max(0, (SELECT COUNT(*) "
+                             "FROM skipped) - ?3 + 1))");
+    if (!evict_all) return evict_all.error();
+    auto ast = evict_all.value()
+                   .bind_blob(1, peer)
+                   .bind_u64(2, author)
+                   .bind_i64(3, static_cast<std::int64_t>(kMaxSkipped))
+                   .run();
+    if (!ast) return ast;
+    auto ins = prepare(db,
+                       "INSERT OR REPLACE INTO skipped(peer, author, noted) VALUES(?, ?, "
+                       "(SELECT COALESCE(MAX(noted), 0) + 1 FROM skipped))");
     if (!ins) return ins.error();
-    return ins.value().bind_blob(1, peer).bind_u64(2, author).run();
+    if (auto st = ins.value().bind_blob(1, peer).bind_u64(2, author).run(); !st) return st;
+    return tx.commit();
 }
 
 Result<std::vector<PublicKey>> MetadataIndex::take_skipped(std::uint64_t author) {
