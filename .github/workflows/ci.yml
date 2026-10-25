@@ -98,6 +98,64 @@ jobs:
       - name: Test
         run: ctest --preset ${{ matrix.preset }} -LE "mount|e2e"
 
+  # Windows builds with clang-cl: the same Clang front end as the Linux and macOS jobs, so the
+  # C++20 and coroutine behaviour and the warnings match, while it stays ABI-compatible with the
+  # MSVC-built x64-windows vcpkg packages and the MSVC standard library. There is no filesystem
+  # mount on Windows yet (WinFsp is phase 2), so no mount or e2e tests exist there.
+  windows:
+    name: windows
+    runs-on: windows-latest
+    env:
+      VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      # Ninja needs the compiler environment that vcvars64.bat sets up (INCLUDE, LIB, PATH).
+      - name: Set up the MSVC environment
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { "$($matches[1])=$($matches[2])" >> $env:GITHUB_ENV }
+          }
+
+      - name: Bootstrap vcpkg
+        id: vcpkg
+        run: |
+          .\external\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "commit=$(git rev-parse HEAD:external/vcpkg)" >> $env:GITHUB_OUTPUT
+
+      - name: Restore vcpkg installed tree
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.VCPKG_INSTALLED_DIR }}
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-windows-${{ hashFiles('vcpkg.json') }}-${{ steps.vcpkg.outputs.commit }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-windows-
+
+      - name: Configure
+        id: configure
+        run: cmake --preset windows "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_DIR"
+
+      - name: Save vcpkg installed tree
+        if: always() && steps.configure.outcome == 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.VCPKG_INSTALLED_DIR }}
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Build
+        run: cmake --build --preset windows
+
+      - name: Test
+        run: ctest --preset windows -LE "mount|e2e"
+
   # The macOS menu-bar app is a separate Swift package; its tests need no daemon.
   menu-app:
     name: macos-menu-app
