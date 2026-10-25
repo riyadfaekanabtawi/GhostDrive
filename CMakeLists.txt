@@ -21,9 +21,20 @@ add_library(ghostdrive_version INTERFACE)
 target_include_directories(ghostdrive_version INTERFACE ${PROJECT_BINARY_DIR}/generated/include)
 
 add_library(ghostdrive_warnings INTERFACE)
+# clang-cl reads -Wall as /Wall, which is -Weverything; /W4 is its -Wall -Wextra.
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    set(ghostdrive_warning_level /W4)
+else()
+    set(ghostdrive_warning_level -Wall -Wextra)
+endif()
 target_compile_options(ghostdrive_warnings INTERFACE
-    -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
+    ${ghostdrive_warning_level} -Wpedantic -Wshadow -Wconversion -Wsign-conversion
     $<$<BOOL:${GHOSTDRIVE_WERROR}>:-Werror>)
+
+if(WIN32)
+    # Windows 10 is the minimum: it has AF_UNIX sockets, used by the control socket.
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+endif()
 
 if(GHOSTDRIVE_SANITIZERS)
     add_compile_options(-fsanitize=${GHOSTDRIVE_SANITIZERS} -fno-sanitize-recover=all

@@ -1,18 +1,12 @@
 #include "ghostdrive/daemon/drive.hpp"
 
 #include <gtest/gtest.h>
-#include <sys/stat.h>
 
+#include "permissions.hpp"
 #include "temp_dir.hpp"
 
 namespace ghostdrive::daemon {
 namespace {
-
-std::uint32_t mode_of(const std::filesystem::path& p) {
-    struct stat st{};
-    EXPECT_EQ(::stat(p.c_str(), &st), 0) << p;
-    return st.st_mode & 0777;
-}
 
 TEST(Drive, CreateThenOpenGivesTheSameDrive) {
     test::TempDir dir;
@@ -38,12 +32,12 @@ TEST(Drive, SecretsArePrivate) {
     auto root = dir.path() / "a";
     ASSERT_TRUE(Drive::create(root, "desk"));
     DrivePaths paths(root);
-    EXPECT_EQ(mode_of(paths.drive), 0600u);
-    EXPECT_EQ(mode_of(paths.key), 0600u);
-    EXPECT_EQ(mode_of(paths.discovery), 0600u);
-    EXPECT_EQ(mode_of(paths.root), 0700u);
+    EXPECT_TRUE(test::has_private_mode(paths.drive, 0600));
+    EXPECT_TRUE(test::has_private_mode(paths.key, 0600));
+    EXPECT_TRUE(test::has_private_mode(paths.discovery, 0600));
+    EXPECT_TRUE(test::has_private_mode(paths.root, 0700));
 
-    ASSERT_EQ(::chmod(paths.drive.c_str(), 0644), 0);
+    ASSERT_TRUE(test::let_others_read(paths.drive, 0644));
     auto opened = Drive::open(root);
     ASSERT_FALSE(opened);
     EXPECT_EQ(opened.error().code, core::Errc::permission);
@@ -183,7 +177,7 @@ TEST(Drive, OpenRefusesADataDirectoryOthersCanRead) {
     test::TempDir dir;
     auto root = dir.path() / "a";
     ASSERT_TRUE(Drive::create(root, "desk"));
-    ASSERT_EQ(::chmod(root.c_str(), 0755), 0);
+    ASSERT_TRUE(test::let_others_read(root, 0755));
     auto opened = Drive::open(root);
     ASSERT_FALSE(opened);
     EXPECT_EQ(opened.error().code, core::Errc::permission);

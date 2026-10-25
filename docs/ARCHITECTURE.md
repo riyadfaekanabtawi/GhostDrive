@@ -17,7 +17,8 @@ Goals:
 Non-goals for the MVP:
 - Multi-writer merging. Concurrent edits produce conflict copies.
 - Storing data on other people's devices (friends). The design keeps room for it (section 9).
-- Windows (phase 2) and mobile (phase 3), beyond keeping the C ABI boundary clean.
+- Windows (phase 2) and mobile (phase 3), beyond keeping the C ABI boundary clean. Phase 1 of
+  the Windows port (section 3.8) builds everything but the mount and passes the tests.
 
 ## 2. Corrections to the original requirements
 
@@ -568,6 +569,50 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   there by it until it catches up. A removed device can still make members on its LAN dial it
   by posing as a member that has not sent a newer key since the daemon started, which tells
   it that the dialing host belongs to the drive.
+
+### 3.8 Windows (phase 1: builds and passes the tests, no mount)
+- **Toolchain.** clang-cl with Ninja and the `x64-windows` vcpkg triplet (preset `windows`, CI
+  job `windows`). It is the same Clang front end as on macOS and Linux, so the C++20 coroutine
+  behaviour and the warnings match, and it links against the MSVC-built vcpkg packages and the
+  MSVC standard library. Windows 10 is the minimum (`_WIN32_WINNT=0x0A00`), for AF_UNIX.
+- **Files.** `core::File` (core/include/ghostdrive/core/file.hpp) wraps a descriptor on POSIX
+  and a HANDLE on Windows: positional `ReadFile`/`WriteFile` with an OVERLAPPED offset,
+  `FlushFileBuffers` for fsync, `SetFileInformationByHandle(FileEndOfFileInfo)` for truncate,
+  `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` for the rename that
+  replaces secret files. Handles share read, write and delete, as POSIX descriptors do. The vfs
+  staging file is marked sparse (`FSCTL_SET_SPARSE`).
+- **Private files.** Where POSIX uses 0600/0700 and the owner's uid, Windows uses the current
+  user's SID (from the process token) as owner and a protected DACL with one entry granting
+  that SID full access. Secret files are created with that security descriptor, so they are
+  never readable by others, even briefly. Private directories (the data directory, the chunk
+  store) get the entry with object and container inheritance, so the index, chunks, staging
+  files and the control socket inside are private too. On read, `device.key`, `drive`,
+  `membership` and `discovery` are opened without following reparse points (the equivalent of
+  `O_NOFOLLOW`) and refused unless they are regular files owned by the user whose DACL has no
+  allow entry for any other SID (deny and inherit-only entries are ignored, a null DACL and
+  object or callback allow entries are refused); the data directory is checked the same way.
+- **Control socket.** AF_UNIX, which Windows 10 supports and Asio drives as
+  `local::stream_protocol`, so the daemon and CLI share one code path. Windows has no peer
+  credentials for AF_UNIX; the server and client take the peer's process ID with
+  `SIO_AF_UNIX_GETPEERPID` and compare its token's user SID with their own. A named pipe would
+  have needed a second, overlapped-I/O implementation for the same guarantees.
+- **Daemon.** Interface addresses come from `GetAdaptersAddresses`. Ctrl-C arrives as SIGINT
+  through `asio::signal_set`; console close, Ctrl-Break, logoff and shutdown go through
+  `SetConsoleCtrlHandler`, which requests the stop and waits for it (Windows allows about five
+  seconds). The default data directory is `%LOCALAPPDATA%\GhostDrive`.
+- **Not on Windows yet.** No mount (`ghostdrived` needs `--no-mount`); the vfs core
+  (Filesystem, Tree, Fetcher, write handles) builds and its unit tests run. No LAN discovery:
+  the `lan_discovery_none` backend is built, and devices are reached by stored addresses and
+  the rendezvous server. No `ghostdrive autostart`, which says so. The mount and e2e tests are
+  not built there.
+- **Phase 2 (WinFsp).** A WinFsp front end in vfs/ (`FSP_FILE_SYSTEM_INTERFACE`) over the same
+  `vfs::Filesystem`: `Read`/`Write` with offsets map directly, with `FspFileSystemSendResponse`
+  for replies completed later on the io executor; open, create, cleanup and close mapped to the
+  write-handle lifecycle (commit on cleanup); Windows names (case-insensitive lookups, reserved
+  names and characters); security descriptors for the volume instead of mode bits; a drive
+  letter or directory mountpoint; and WinFsp installed on CI so the mount tests run. LAN
+  discovery (DNS-SD through `windns.h` `DnsServiceBrowse`/`DnsServiceRegister`, Windows 10
+  1903+, unverified) and autostart (a per-user scheduled task or Run key) are separate follow-ups.
 
 ## 4. Data path of one read()
 

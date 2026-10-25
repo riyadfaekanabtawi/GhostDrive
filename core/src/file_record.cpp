@@ -64,7 +64,11 @@ std::string conflict_copy_path(std::string_view path, std::int64_t mtime_ns, std
 
     const std::time_t seconds = static_cast<std::time_t>(mtime_ns / 1'000'000'000);
     std::tm utc{};
+#ifdef _WIN32
+    gmtime_s(&utc, &seconds);
+#else
     gmtime_r(&seconds, &utc);
+#endif
     std::array<char, 32> stamp{};
     std::snprintf(stamp.data(), stamp.size(), "%04d%02d%02d-%02d%02d%02d", utc.tm_year + 1900,
                   utc.tm_mon + 1, utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec);

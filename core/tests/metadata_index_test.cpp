@@ -732,7 +732,7 @@ class V1Database {
 public:
     explicit V1Database(const std::filesystem::path& path) {
         sqlite3* raw = nullptr;
-        EXPECT_EQ(sqlite3_open(path.c_str(), &raw), SQLITE_OK);
+        EXPECT_EQ(sqlite3_open(path.string().c_str(), &raw), SQLITE_OK);
         db_.reset(raw);
         exec(kSchemaV1);
     }

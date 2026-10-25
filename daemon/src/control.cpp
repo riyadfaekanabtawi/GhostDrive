@@ -1,10 +1,12 @@
 #include "ghostdrive/daemon/control.hpp"
 
-#include <sys/stat.h>
+#ifndef _WIN32
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
+#endif
 
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -15,6 +17,12 @@
 #include <asio/streambuf.hpp>
 #include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
+#ifdef _WIN32
+// After Asio, which includes winsock2.h, a prerequisite of afunix.h.
+#include <afunix.h>
+
+#include "ghostdrive/core/file.hpp"
+#endif
 
 namespace ghostdrive::daemon {
 
@@ -28,7 +36,17 @@ constexpr std::size_t kMaxCommand = 1024;
 
 // True if the process at the other end of `fd` runs as this user. The socket's directory
 // already keeps other users out; this also covers a socket file someone else put in place.
-bool same_user(int fd) {
+bool same_user(Local::socket::native_handle_type fd) {
+#ifdef _WIN32
+    // Windows has no peer credentials for AF_UNIX, but it reports the peer's process ID.
+    ULONG pid = 0;
+    DWORD returned = 0;
+    if (::WSAIoctl(fd, SIO_AF_UNIX_GETPEERPID, nullptr, 0, &pid, sizeof(pid), &returned, nullptr,
+                   nullptr) != 0) {
+        return false;
+    }
+    return core::process_is_current_user(pid);
+#else
 #ifdef __APPLE__
     uid_t uid = 0;
     gid_t gid = 0;
@@ -40,6 +58,7 @@ bool same_user(int fd) {
     uid_t uid = cred.uid;
 #endif
     return uid == ::geteuid();
+#endif
 }
 
 // Constructing an endpoint from a longer path throws; check first.
@@ -80,18 +99,23 @@ core::Result<std::unique_ptr<ControlServer>> ControlServer::start(
     // A socket file left by a daemon that did not exit cleanly blocks bind; a live daemon still
     // answering on it means another one is already running.
     if (!fits(socket)) return Error{Errc::invalid_argument, "control socket path is too long"};
-    if (std::filesystem::exists(socket)) {
+    std::error_code ec;
+    // symlink_status: on Windows the socket file is a reparse point that status() cannot open.
+    if (std::filesystem::exists(std::filesystem::symlink_status(socket, ec))) {
         if (control_request(socket, "ping")) {
             return Error{Errc::already_exists, "a daemon is already running for this drive"};
         }
-        ::unlink(socket.c_str());
+        std::filesystem::remove(socket, ec);
     }
     auto server = std::make_unique<ControlServer>(Private{}, executor, socket, std::move(handler));
-    std::error_code ec;
+    ec.clear();
     auto& acceptor = server->acceptor_;
     acceptor.open(Local(), ec);
     if (!ec) acceptor.bind(Local::endpoint(socket.string()), ec);
+#ifndef _WIN32
+    // On Windows the socket file inherits the private directory's owner-only access list.
     if (!ec) ::chmod(socket.c_str(), 0600);
+#endif
     if (!ec) acceptor.listen(asio::socket_base::max_listen_connections, ec);
     if (ec) return Error{Errc::io, "control socket " + socket.string() + ": " + ec.message()};
     server->accept_next();
@@ -113,7 +137,7 @@ void ControlServer::stop() {
     if (!acceptor_.is_open()) return;
     std::error_code ec;
     acceptor_.close(ec);
-    ::unlink(path_.c_str());
+    std::filesystem::remove(path_, ec);
 }
 
 core::Result<std::string> control_request(const std::filesystem::path& socket,

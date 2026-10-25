@@ -1,13 +1,8 @@
 #include "ghostdrive/daemon/drive.hpp"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cctype>
 #include <charconv>
-#include <cerrno>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -16,6 +11,7 @@
 #include <sstream>
 
 #include "ghostdrive/core/bytes.hpp"
+#include "ghostdrive/core/file.hpp"
 
 namespace ghostdrive::daemon {
 
@@ -26,75 +22,18 @@ using core::Status;
 namespace {
 
 constexpr std::array<char, 4> kDriveMagic{'G', 'D', 'D', '1'};
+#ifdef _WIN32
+constexpr const char* kPrivateDirRule = " must be a directory owned by you that only you can access";
+#else
+constexpr const char* kPrivateDirRule = " must be a directory owned by you with mode 0700";
+#endif
 
-Error errno_error(const std::string& what, const std::filesystem::path& path) {
-    return Error{Errc::io, what + " " + path.string() + ": " + std::strerror(errno)};
-}
-
-// Writes `data` to `path` via a 0600 temp file and rename, so a crash never leaves a partial
-// file and the secret is never readable by others, even briefly.
-Status write_private_file(const std::filesystem::path& path, std::span<const std::byte> data) {
-    auto tmp = path;
-    tmp += ".tmp";
-    ::unlink(tmp.c_str());
-    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (fd < 0) return errno_error("open", tmp);
-    const std::byte* p = data.data();
-    std::size_t left = data.size();
-    while (left > 0) {
-        ssize_t n = ::write(fd, p, left);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            auto err = errno_error("write", tmp);
-            ::close(fd);
-            return err;
-        }
-        p += n;
-        left -= static_cast<std::size_t>(n);
-    }
-    if (::fsync(fd) != 0) {
-        auto err = errno_error("fsync", tmp);
-        ::close(fd);
-        ::unlink(tmp.c_str());
-        return err;
-    }
-    if (::close(fd) != 0 || ::rename(tmp.c_str(), path.c_str()) != 0) {
-        auto err = errno_error("rename", tmp);
-        ::unlink(tmp.c_str());  // never leave a stray copy of the secret behind
-        return err;
-    }
-    return {};
-}
+using core::write_private_file;
 
 core::Result<core::Bytes> read_private_file(const std::filesystem::path& path) {
-    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) {
-        if (errno == ENOENT)
-            return Error{Errc::not_found, "no drive at " + path.parent_path().string()};
-        return errno_error("open", path);
-    }
-    struct stat st{};
-    if (::fstat(fd, &st) != 0) {
-        ::close(fd);
-        return errno_error("fstat", path);
-    }
-    if ((st.st_mode & 077) != 0 || st.st_uid != ::geteuid() || !S_ISREG(st.st_mode)) {
-        ::close(fd);
-        return Error{Errc::permission,
-                     path.string() + " must be a regular file owned by you with mode 0600"};
-    }
-    core::Bytes data(static_cast<std::size_t>(st.st_size));
-    std::size_t got = 0;
-    while (got < data.size()) {
-        ssize_t n = ::read(fd, data.data() + got, data.size() - got);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
-            break;
-        }
-        got += static_cast<std::size_t>(n);
-    }
-    ::close(fd);
-    if (got != data.size()) return Error{Errc::io, "short read of " + path.string()};
+    auto data = core::read_private_file(path);
+    if (!data && data.error().code == Errc::not_found)
+        return Error{Errc::not_found, "no drive at " + path.parent_path().string()};
     return data;
 }
 
@@ -133,27 +72,27 @@ core::Result<std::unique_ptr<Drive>> assemble(const DrivePaths& paths, core::Dev
 // Unix socket paths are limited to about 104 bytes (sun_path). A data directory deep enough to
 // exceed that gets its socket in the per-user temporary directory instead, named by a hash of
 // the data directory so each drive still has its own.
-// A directory only this user can enter: owned by us, no group or other access.
-bool private_dir(const std::filesystem::path& dir) {
-    struct stat st{};
-    return ::stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == ::geteuid() &&
-           (st.st_mode & 077) == 0;
-}
-
 std::filesystem::path control_socket_for(const std::filesystem::path& root) {
     constexpr std::size_t kMaxSocketPath = 100;
     auto preferred = root / "control.sock";
     if (preferred.string().size() < kMaxSocketPath) return preferred;
-    // Only a per-user private directory will do (macOS TMPDIR, Linux XDG_RUNTIME_DIR). A shared
+    // Only a per-user private directory will do (macOS TMPDIR, Linux XDG_RUNTIME_DIR, the
+    // Windows user temporary directory if private). A shared
     // one such as /tmp would let another user squat the name and answer `invite` with their
     // own drive. With neither, keep the preferred path and let binding report it as too long.
+#ifdef _WIN32
+    std::error_code ec;
+    const std::filesystem::path base = std::filesystem::temp_directory_path(ec);
+    if (ec || !core::is_private_dir(base)) return preferred;
+#else
 #ifdef __APPLE__
     const char* dir = std::getenv("TMPDIR");
 #else
     const char* dir = std::getenv("XDG_RUNTIME_DIR");
 #endif
-    if (dir == nullptr || *dir == '\0' || !private_dir(dir)) return preferred;
+    if (dir == nullptr || *dir == '\0' || !core::is_private_dir(dir)) return preferred;
     std::filesystem::path base = dir;
+#endif
     auto hash = std::hash<std::string>{}(std::filesystem::absolute(root).string());
     char name[64];
     std::snprintf(name, sizeof(name), "ghostdrive-%016zx.sock", hash);
@@ -176,6 +115,11 @@ DrivePaths::DrivePaths(std::filesystem::path r)
       discovery(root / "discovery") {}
 
 std::filesystem::path default_data_dir() {
+#ifdef _WIN32
+    if (const char* local = std::getenv("LOCALAPPDATA"); local && *local) {
+        return std::filesystem::path(local) / "GhostDrive";
+    }
+#endif
     const char* home = std::getenv("HOME");
     std::filesystem::path base = home ? home : ".";
 #ifdef __APPLE__
@@ -189,7 +133,11 @@ std::filesystem::path default_data_dir() {
 }
 
 std::filesystem::path default_mountpoint() {
+#ifdef _WIN32
+    const char* home = std::getenv("USERPROFILE");
+#else
     const char* home = std::getenv("HOME");
+#endif
     return std::filesystem::path(home ? home : ".") / "GhostDrive";
 }
 
@@ -220,9 +168,8 @@ core::Result<core::DeviceKey> Drive::load_or_create_key(const std::filesystem::p
     DrivePaths paths(root);
     std::error_code ec;
     std::filesystem::create_directories(paths.root, ec);
-    if (::chmod(paths.root.c_str(), 0700) != 0 || !private_dir(paths.root)) {
-        return Error{Errc::permission,
-                     paths.root.string() + " must be a directory owned by you with mode 0700"};
+    if (!core::make_private_dir(paths.root) || !core::is_private_dir(paths.root)) {
+        return Error{Errc::permission, paths.root.string() + kPrivateDirRule};
     }
     auto loaded = core::DeviceKey::load(paths.key);
     if (loaded) return loaded;
@@ -308,9 +255,8 @@ core::Result<std::unique_ptr<Drive>> Drive::join(const std::filesystem::path& ro
 core::Result<std::unique_ptr<Drive>> Drive::open(const std::filesystem::path& root) {
     DrivePaths paths(root);
     // The index, chunks and staging files rely on the directory's mode for their privacy.
-    if (std::filesystem::exists(paths.root) && !private_dir(paths.root)) {
-        return Error{Errc::permission,
-                     paths.root.string() + " must be a directory owned by you with mode 0700"};
+    if (std::filesystem::exists(paths.root) && !core::is_private_dir(paths.root)) {
+        return Error{Errc::permission, paths.root.string() + kPrivateDirRule};
     }
     auto data = read_private_file(paths.drive);
     if (!data) return data.error();

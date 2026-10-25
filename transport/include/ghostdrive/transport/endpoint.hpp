@@ -382,9 +382,14 @@ private:
 
     std::optional<Impairer> impairer_;
 
-    // The receive buffer outlives the socket member, which is destroyed first.
-    std::vector<std::uint8_t> rx_buffer_;
-    Udp::endpoint rx_from_;
+    // Where a datagram is received. Shared with the pending receive, because on Windows (IOCP)
+    // a cancelled receive still completes after the socket is gone, and writes the sender's
+    // address then.
+    struct Receive {
+        std::vector<std::uint8_t> buffer;
+        Udp::endpoint from;
+    };
+    std::shared_ptr<Receive> rx_;
     Udp::socket socket_;
     bool closed_ = false;
 };

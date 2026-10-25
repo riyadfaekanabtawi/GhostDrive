@@ -1,13 +1,11 @@
 #include "ghostdrive/core/identity.hpp"
 
-#include <fcntl.h>
 #include <openssl/evp.h>
-#include <sys/stat.h>
 
 #include <cstring>
 
 #include "ghostdrive/core/bytes.hpp"
-#include "posix_file.hpp"
+#include "ghostdrive/core/file.hpp"
 
 namespace ghostdrive::core {
 
@@ -59,19 +57,15 @@ Result<DeviceKey> DeviceKey::from_seed(std::span<const std::byte, kSeedSize> see
 }
 
 Result<DeviceKey> DeviceKey::load(const std::filesystem::path& path) {
-    auto fd = detail::open_file(path, O_RDONLY);
-    if (!fd) return fd.error();
-    struct stat st{};
-    if (::fstat(fd.value().get(), &st) != 0) return detail::errno_error("fstat", path);
-    if ((st.st_mode & 077) != 0) {
-        return Error{Errc::permission,
-                     "key file " + path.string() + " is accessible by group or others"};
-    }
-    if (static_cast<std::uint64_t>(st.st_size) != kKeyFileSize) {
+    auto file = File::open_private(path);
+    if (!file) return file.error();
+    auto size = file.value().size();
+    if (!size) return size.error();
+    if (size.value() != kKeyFileSize) {
         return Error{Errc::corrupt, "key file " + path.string() + " has the wrong size"};
     }
     std::array<std::byte, kKeyFileSize> buffer{};
-    auto n = detail::pread_full(fd.value().get(), buffer, 0, path);
+    auto n = file.value().read_at(buffer, 0);
     if (!n || n.value() != buffer.size() ||
         std::memcmp(buffer.data(), kKeyFileMagic.data(), kKeyFileMagic.size()) != 0) {
         secure_zero(buffer);
@@ -95,7 +89,13 @@ Status DeviceKey::save(const std::filesystem::path& path) const {
         secure_zero(buffer);
         return Error{Errc::crypto, "EVP_PKEY_get_raw_private_key failed"};
     }
-    auto st = detail::write_new_file(path, buffer, 0600);
+    auto file = File::create_private(path);
+    if (!file) {
+        secure_zero(buffer);
+        return file.error();
+    }
+    auto st = file.value().write_at(buffer, 0);
+    if (st) st = file.value().sync();
     secure_zero(buffer);
     return st;
 }

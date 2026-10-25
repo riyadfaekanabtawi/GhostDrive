@@ -9,14 +9,20 @@ add_library(ghostdrive_transport
 )
 add_library(ghostdrive::transport ALIAS ghostdrive_transport)
 
+# vcpkg builds ngtcp2 as static libraries on macOS and Linux, and as DLLs for x64-windows.
+if(TARGET ngtcp2::ngtcp2_static)
+    set(ghostdrive_ngtcp2 ngtcp2::ngtcp2_crypto_ossl_static ngtcp2::ngtcp2_static)
+else()
+    set(ghostdrive_ngtcp2 ngtcp2::ngtcp2_crypto_ossl ngtcp2::ngtcp2)
+endif()
+
 target_include_directories(ghostdrive_transport PUBLIC include PRIVATE src)
 target_link_libraries(ghostdrive_transport
     PUBLIC
         ghostdrive::core
         asio::asio
     PRIVATE
-        ngtcp2::ngtcp2_crypto_ossl_static
-        ngtcp2::ngtcp2_static
+        ${ghostdrive_ngtcp2}
         OpenSSL::SSL
         OpenSSL::Crypto
         ghostdrive_warnings

@@ -1,8 +1,10 @@
 #include "ghostdrive/daemon/service.hpp"
 
+#ifndef _WIN32
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#endif
 #include <openssl/crypto.h>
 
 #include <algorithm>
@@ -13,6 +15,11 @@
 #include <asio/steady_timer.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
+
+#ifdef _WIN32
+// After Asio, which includes winsock2.h, a prerequisite of iphlpapi.h.
+#include <iphlpapi.h>
+#endif
 
 #include "async.hpp"
 #include "ghostdrive/discovery/lan_discovery.hpp"
@@ -76,6 +83,36 @@ std::string format_address(const Udp::endpoint& ep) {
 // Non-loopback IPv4 addresses of interfaces that are up.
 std::vector<asio::ip::address> local_ipv4_addresses() {
     std::vector<asio::ip::address> out;
+#ifdef _WIN32
+    // Microsoft recommends starting with a 15 KB buffer and growing it when told to.
+    std::vector<std::byte> buffer(15 * 1024);
+    ULONG size = static_cast<ULONG>(buffer.size());
+    ULONG rc = ERROR_BUFFER_OVERFLOW;
+    for (int attempt = 0; attempt < 3 && rc == ERROR_BUFFER_OVERFLOW; ++attempt) {
+        buffer.resize(size);
+        rc = ::GetAdaptersAddresses(
+            AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+            nullptr, reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &size);
+    }
+    if (rc != NO_ERROR) return out;
+    for (auto* adapter = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()); adapter;
+         adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp ||
+            adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) {
+            continue;
+        }
+        for (auto* a = adapter->FirstUnicastAddress; a; a = a->Next) {
+            const sockaddr* sa = a->Address.lpSockaddr;
+            if (sa == nullptr || sa->sa_family != AF_INET) continue;
+            auto* sin = reinterpret_cast<const sockaddr_in*>(sa);
+            asio::ip::address_v4 v4(ntohl(sin->sin_addr.s_addr));
+            if (v4.is_loopback()) continue;
+            if (std::find(out.begin(), out.end(), asio::ip::address(v4)) == out.end())
+                out.push_back(v4);
+        }
+    }
+    return out;
+#else
     ifaddrs* list = nullptr;
     if (::getifaddrs(&list) != 0) return out;
     for (auto* it = list; it != nullptr; it = it->ifa_next) {
@@ -88,6 +125,7 @@ std::vector<asio::ip::address> local_ipv4_addresses() {
     }
     ::freeifaddrs(list);
     return out;
+#endif
 }
 
 std::set<core::PublicKey> member_keys(const MembershipView& view) {

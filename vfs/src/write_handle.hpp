@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "ghostdrive/core/chunk_store.hpp"
+#include "ghostdrive/core/file.hpp"
 #include "ghostdrive/core/file_record.hpp"
 #include "ghostdrive/core/hlc.hpp"
 #include "ghostdrive/core/metadata_index.hpp"
@@ -73,7 +74,7 @@ public:
 
     struct Private {};
     WriteHandle(Private, Context context, std::string path, std::optional<core::FileRecord> base,
-                std::uint32_t new_file_mode, std::filesystem::path staging_file, int fd);
+                std::uint32_t new_file_mode, std::filesystem::path staging_file, core::File file);
 
 private:
     bool from_base(std::uint64_t block) const noexcept;
@@ -87,7 +88,7 @@ private:
     std::optional<core::FileRecord> base_;
     std::uint32_t new_file_mode_;
     std::filesystem::path staging_file_;
-    int fd_;
+    core::File file_;
 
     std::uint32_t block_ = 0;       // 0 until a block size is chosen (new or emptied file)
     std::uint64_t valid_base_ = 0;  // blocks below this may still come from base_

@@ -20,6 +20,10 @@ target_link_libraries(ghostdrive_daemon
         OpenSSL::Crypto
         ghostdrive_warnings
 )
+if(WIN32)
+    # iphlpapi: GetAdaptersAddresses; ws2_32: WSAIoctl for the control socket's peer.
+    target_link_libraries(ghostdrive_daemon PRIVATE iphlpapi ws2_32)
+endif()
 
 add_executable(ghostdrived ghostdrived.cpp)
 target_include_directories(ghostdrived PRIVATE src)
