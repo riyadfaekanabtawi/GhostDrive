@@ -1,13 +1,17 @@
 #include "autostart.hpp"
 
 #include <blake3.h>
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <array>
 #include <cerrno>
 #include <cstring>
+
+#include "ghostdrive/core/file.hpp"
 
 namespace ghostdrive::autostart {
 
@@ -25,14 +29,17 @@ Error control_error(std::string_view text) {
     return Error{Errc::invalid_argument, "path contains a control character: " + std::string(text)};
 }
 
+#ifndef _WIN32
 Error errno_error(const std::string& what, const std::filesystem::path& path) {
     return Error{Errc::io, what + " " + path.string() + ": " + std::strerror(errno)};
 }
+#endif
 
 }  // namespace
 
 std::string data_dir_id(const std::filesystem::path& data) {
-    const std::string text = data.string();
+    // The native text on POSIX, UTF-8 on Windows (where path::string() can throw).
+    const std::string text = core::path_utf8(data);
     blake3_hasher hasher;
     blake3_hasher_init(&hasher);
     blake3_hasher_update(&hasher, text.data(), text.size());
@@ -53,6 +60,10 @@ std::string launchd_label(const std::filesystem::path& data) {
 
 std::string systemd_unit_name(const std::filesystem::path& data) {
     return "ghostdrive-" + data_dir_id(data) + ".service";
+}
+
+std::string task_name(const std::filesystem::path& data) {
+    return "GhostDrive-" + data_dir_id(data);
 }
 
 std::filesystem::path launch_agent_path(const std::filesystem::path& home,
@@ -113,6 +124,25 @@ core::Result<std::string> systemd_quote(std::string_view text) {
                 out += c;
         }
     }
+    out += '"';
+    return out;
+}
+
+core::Result<std::string> windows_quote(std::string_view text) {
+    std::string out = "\"";
+    std::size_t backslashes = 0;
+    for (char c : text) {
+        if (is_control(c)) return control_error(text);
+        if (c == '\\') {
+            ++backslashes;
+            continue;
+        }
+        // Backslashes are literal except before a quote, where each pair stands for one.
+        out.append(c == '"' ? 2 * backslashes + 1 : backslashes, '\\');
+        backslashes = 0;
+        out += c;
+    }
+    out.append(2 * backslashes, '\\');  // before the closing quote
     out += '"';
     return out;
 }
@@ -197,6 +227,78 @@ core::Result<std::string> systemd_unit(const Spec& spec) {
            "WantedBy=default.target\n";
 }
 
+core::Result<std::string> task_xml(const Spec& spec, const WindowsUser& user) {
+    auto daemon_utf8 = core::exact_utf8(spec.daemon);
+    auto data_utf8 = core::exact_utf8(spec.data);
+    auto mount_utf8 = core::exact_utf8(spec.mount);
+    for (auto* r : {&daemon_utf8, &data_utf8, &mount_utf8}) {
+        if (!*r) return r->error();
+    }
+    auto data_arg = windows_quote(data_utf8.value());
+    auto mount_arg = windows_quote(mount_utf8.value());
+    for (auto* r : {&data_arg, &mount_arg}) {
+        if (!*r) return r->error();
+    }
+    // Command is the program alone, Arguments the rest of its command line.
+    auto command = xml_escape(daemon_utf8.value());
+    auto arguments = xml_escape("--data " + data_arg.value() + " --mount " + mount_arg.value());
+    auto sid = xml_escape(user.sid);
+    auto name = xml_escape(user.name);
+    for (auto* r : {&command, &arguments, &sid, &name}) {
+        if (!*r) return r->error();
+    }
+    // The Task Scheduler is handed the text as UTF-16, hence the declared encoding. An
+    // InteractiveToken task runs in the user's own session, where the mount is visible, and
+    // LeastPrivilege keeps it unelevated. RestartOnFailure needs both Interval (a minute at
+    // least) and Count. ExecutionTimeLimit PT0S lifts the default 72-hour limit, and the battery
+    // settings keep a laptop from refusing or stopping it.
+    return "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n"
+           "<Task version=\"1.2\" "
+           "xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n"
+           "  <RegistrationInfo>\n"
+           "    <Description>Starts the GhostDrive daemon at logon.</Description>\n"
+           "  </RegistrationInfo>\n"
+           "  <Triggers>\n"
+           "    <LogonTrigger>\n"
+           "      <Enabled>true</Enabled>\n"
+           "      <UserId>" +
+           name.value() +
+           "</UserId>\n"
+           "    </LogonTrigger>\n"
+           "  </Triggers>\n"
+           "  <Principals>\n"
+           "    <Principal id=\"Author\">\n"
+           "      <UserId>" +
+           sid.value() +
+           "</UserId>\n"
+           "      <LogonType>InteractiveToken</LogonType>\n"
+           "      <RunLevel>LeastPrivilege</RunLevel>\n"
+           "    </Principal>\n"
+           "  </Principals>\n"
+           "  <Settings>\n"
+           "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+           "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
+           "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
+           "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n"
+           "    <RestartOnFailure>\n"
+           "      <Interval>PT1M</Interval>\n"
+           "      <Count>3</Count>\n"
+           "    </RestartOnFailure>\n"
+           "  </Settings>\n"
+           "  <Actions Context=\"Author\">\n"
+           "    <Exec>\n"
+           "      <Command>" +
+           command.value() +
+           "</Command>\n"
+           "      <Arguments>" +
+           arguments.value() +
+           "</Arguments>\n"
+           "    </Exec>\n"
+           "  </Actions>\n"
+           "</Task>\n";
+}
+
+#ifndef _WIN32
 core::Status write_file_atomic(const std::filesystem::path& path, std::string_view text) {
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
@@ -233,5 +335,6 @@ core::Status write_file_atomic(const std::filesystem::path& path, std::string_vi
     }
     return {};
 }
+#endif
 
 }  // namespace ghostdrive::autostart

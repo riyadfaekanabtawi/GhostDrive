@@ -616,7 +616,14 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   `local::stream_protocol`, so the daemon and CLI share one code path. Windows has no peer
   credentials for AF_UNIX; the server and client take the peer's process ID with
   `SIO_AF_UNIX_GETPEERPID` and compare its token's user SID with their own. A named pipe would
-  have needed a second, overlapped-I/O implementation for the same guarantees.
+  have needed a second, overlapped-I/O implementation for the same guarantees. The reply ends
+  where the daemon closes the connection, and on Windows that close was sometimes never seen
+  by the client: about one connection in a few hundred on the CI runner, the whole reply
+  arrived but the read never reported the end, whether it was blocking or overlapped and
+  whether the daemon called `shutdown` (either direction) before `closesocket` or not. It did
+  not happen once the client shut down its sending side after the request (no hang in 24,000
+  connections), so `control_request` does that on every platform; the daemon reads only up to
+  the newline.
 - **Daemon.** Interface addresses come from `GetAdaptersAddresses`. Ctrl-C arrives as SIGINT
   through `asio::signal_set`; console close, Ctrl-Break, logoff and shutdown go through
   `SetConsoleCtrlHandler`, which requests the stop and waits for it (Windows allows about five
@@ -711,11 +718,26 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   - *Not handled.* Named streams, extended attributes, reparse points and hard links are not
     supported; file attributes other than read-only are not stored. Case-insensitive lookups
     scan the directory.
+- **Autostart.** `ghostdrive autostart on` registers a Task Scheduler task,
+  `GhostDrive-<data_dir_id>` in the root folder, through the Task Scheduler COM API
+  (cli/autostart_windows.cpp; no schtasks.exe command line or temporary file). Its XML
+  (`autostart::task_xml`, a pure function with unit tests) has a logon trigger for this user,
+  a principal with this user's SID, `InteractiveToken` and `LeastPrivilege`, so it runs
+  unelevated in the user's own session, where the WinFsp mount is visible, and registering it
+  needs no administrator rights (Microsoft's "Security Contexts for Tasks"). It sets no time
+  limit (`ExecutionTimeLimit` PT0S instead of 72 hours), allows battery power, and
+  `RestartOnFailure` retries three times a minute apart. The action is `ghostdrived.exe` from
+  the directory of `ghostdrive.exe`, with `--data` and `--mount` quoted by
+  `autostart::windows_quote` for `CommandLineToArgvW` and the C runtime. `on` starts the task
+  at once unless a daemon already answers, `off` deletes the task, asks the daemon to stop
+  over the control socket and waits for it to unmount, and `status` reports whether the task
+  exists and the daemon answers. A Run key entry was the other option; it cannot restart the
+  daemon, and its command line would need the same quoting. The daemon keeps its console
+  window, so closing that window stops it as `ghostdrive stop` does. The tests never register
+  a task: one hands the generated XML to the Task Scheduler with `TASK_VALIDATE_ONLY`.
 - **Not on Windows yet.** No LAN discovery: the `lan_discovery_none` backend is built, and
-  devices are reached by stored addresses and the rendezvous server. No `ghostdrive autostart`,
-  which says so. LAN discovery (DNS-SD through `windns.h` `DnsServiceBrowse`/`DnsServiceRegister`,
-  Windows 10 1903+, unverified) and autostart (a per-user scheduled task or Run key) are
-  separate follow-ups.
+  devices are reached by stored addresses and the rendezvous server. LAN discovery (DNS-SD
+  through `windns.h`) is a separate follow-up.
 
 ## 4. Data path of one read()
 

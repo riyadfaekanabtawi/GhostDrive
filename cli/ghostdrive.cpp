@@ -25,9 +25,7 @@
 #include <thread>
 #include <vector>
 
-#ifndef _WIN32
 #include "autostart.hpp"
-#endif
 #include "ghostdrive/core/file.hpp"
 #include "ghostdrive/daemon/control.hpp"
 #include "ghostdrive/daemon/drive.hpp"
@@ -35,7 +33,10 @@
 #include "ghostdrive/daemon/service.hpp"
 #include "ghostdrive/version.hpp"
 
-#ifndef _WIN32
+#ifdef _WIN32
+// After Asio, which includes winsock2.h and windows.h in the right order.
+#include <windows.h>
+#else
 extern char** environ;
 #endif
 
@@ -61,7 +62,8 @@ constexpr const char* kUsage =
     "  id                               print this device's ID\n"
     "\n"
     "Starting at login:\n"
-    "  autostart on [--mount DIR]       start ghostdrived at login (launchd or systemd --user)\n"
+    "  autostart on [--mount DIR]       start ghostdrived at login (launchd, systemd --user, or\n"
+    "                                   a Task Scheduler logon task on Windows)\n"
     "  autostart off                    stop starting it at login, and stop it now\n"
     "  autostart status                 show whether it is set up and running\n"
     "\n"
@@ -431,8 +433,124 @@ int cmd_autostart(const Args& args) {
 }
 #else
 
-int cmd_autostart(const Args&) {
-    return fail("autostart is not supported on Windows yet; start ghostdrived yourself");
+std::optional<std::filesystem::path> self_path() {
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD n = ::GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+        if (n == 0) return std::nullopt;
+        if (n < buf.size()) {
+            buf.resize(n);
+            break;
+        }
+        buf.resize(buf.size() * 2);  // truncated
+    }
+    std::error_code ec;
+    auto resolved = std::filesystem::canonical(std::filesystem::path(buf), ec);
+    if (ec) return std::nullopt;
+    return resolved;
+}
+
+// As on POSIX: ghostdrived.exe next to this binary, or else in the build tree's daemon/.
+std::optional<std::filesystem::path> daemon_path() {
+    auto self = self_path();
+    if (!self) return std::nullopt;
+    auto daemon = self->parent_path() / "ghostdrived.exe";
+    std::error_code ec;
+    if (auto built = self->parent_path().parent_path() / "daemon" / "ghostdrived.exe";
+        !std::filesystem::is_regular_file(daemon, ec) &&
+        std::filesystem::is_regular_file(built, ec)) {
+        daemon = built;
+    }
+    return daemon;
+}
+
+std::filesystem::path absolute_path(const std::filesystem::path& p) {
+    std::error_code ec;
+    auto out = std::filesystem::weakly_canonical(std::filesystem::absolute(p, ec), ec);
+    return ec ? std::filesystem::absolute(p).lexically_normal() : out;
+}
+
+// "X:" names a drive letter for ghostdrived, not the current directory on drive X.
+bool is_drive_letter(const std::filesystem::path& p) {
+    const auto& n = p.native();
+    return n.size() == 2 && n[1] == L':' &&
+           ((n[0] >= L'A' && n[0] <= L'Z') || (n[0] >= L'a' && n[0] <= L'z'));
+}
+
+// A per-user Task Scheduler task, started at logon (docs/ARCHITECTURE.md section 3.8).
+int cmd_autostart(const Args& args) {
+    if (args.positional.size() != 1) return fail("autostart needs on, off or status");
+    const std::string& action = args.positional[0];
+    if (action != "on" && action != "off" && action != "status") {
+        return fail("autostart needs on, off or status");
+    }
+    const auto data = absolute_path(args.data);
+    const std::string name = autostart::task_name(data);
+    const auto control = daemon::DrivePaths(data).control;
+    auto running = [&] { return static_cast<bool>(daemon::control_request(control, "ping")); };
+
+    if (action == "status") {
+        auto exists = autostart::task_exists(name);
+        if (!exists) return fail(exists.error().message);
+        auto daemon = daemon_path();
+        std::error_code ec;
+        std::cout << "login task: " << (exists.value() ? name : std::string("not set up")) << "\n"
+                  << "running:    " << (running() ? "yes" : "no") << "\n"
+                  << "daemon:     "
+                  << (daemon && std::filesystem::is_regular_file(*daemon, ec)
+                          ? core::path_utf8(*daemon)
+                          : std::string("not found"))
+                  << "\n";
+        return 0;
+    }
+
+    if (action == "off") {
+        auto removed = autostart::delete_task(name);
+        if (!removed) return fail(removed.error().message);
+        // As on macOS: stop the daemon now, and wait until it has unmounted.
+        if (running()) {
+            (void)daemon::control_request(control, "stop");
+            bool stopped = false;
+            for (int i = 0; i < 300 && !stopped; ++i) {
+                stopped = !running();
+                if (!stopped) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (!stopped) std::cerr << "ghostdrive: the daemon is still shutting down\n";
+        }
+        std::cout << (removed.value() ? "GhostDrive will no longer start at login.\n"
+                                      : "GhostDrive was not set to start at login.\n");
+        return 0;
+    }
+
+    if (!daemon::Drive::exists(data)) {
+        return fail("no drive at " + core::path_utf8(data) +
+                    "; run `ghostdrive init` or `ghostdrive join` first");
+    }
+    auto daemon = daemon_path();
+    if (!daemon) return fail("cannot find the path of the running ghostdrive binary");
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(*daemon, ec)) {
+        return fail("cannot find ghostdrived next to ghostdrive (" + core::path_utf8(*daemon) +
+                    ")");
+    }
+    autostart::Spec spec;
+    spec.daemon = *daemon;
+    spec.data = data;
+    spec.mount = is_drive_letter(args.mount) ? args.mount : absolute_path(args.mount);
+    auto user = autostart::current_windows_user();
+    if (!user) return fail(user.error().message);
+    auto xml = autostart::task_xml(spec, user.value());
+    if (!xml) return fail(xml.error().message);
+    if (auto st = autostart::register_task(name, xml.value()); !st) return fail(st.error().message);
+    // A daemon already running for this drive keeps running; a second one would not start.
+    if (!running()) {
+        if (auto st = autostart::run_task(name); !st) return fail(st.error().message);
+    }
+    std::cout << "GhostDrive will start at login and is starting now.\n"
+              << "  login task: " << name << " (Task Scheduler)\n"
+              << "  mount:      " << core::path_utf8(spec.mount) << "\n"
+              << "Turn it off with `ghostdrive autostart off`.\n";
+    return 0;
 }
 #endif
 

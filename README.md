@@ -100,6 +100,11 @@ On macOS this installs a LaunchAgent in `~/Library/LaunchAgents` (its log goes t
 it if it crashes, and leaves it stopped after `ghostdrive stop` until the next login. `on`
 accepts `--mount DIR`, and all three accept `--data DIR`, which gets its own login item.
 
+On Windows it registers a Task Scheduler task named `GhostDrive-<id>` that starts `ghostdrived`
+when you log on, as you and without administrator rights; the Task Scheduler retries it up to
+three times if it fails. The daemon runs in its own console window: minimise it, since closing
+it stops GhostDrive as `ghostdrive stop` does. `--mount X:` mounts at a drive letter.
+
 ### Menu-bar app
 
 On macOS 13 or later, `macos/GhostDriveMenu` is a small menu-bar app. It shows this device,
@@ -149,11 +154,11 @@ is also usable from scripts.
 - Streaming speed is bounded by the upload bandwidth of the device serving the data.
 - MVP platforms are Linux and macOS. Windows is phase 2; iOS and Android are phase 3. On
   Windows the drive mounts through WinFsp (`ghostdrived` mounts at `%USERPROFILE%\GhostDrive`,
-  or `--mount X:` for a drive letter), but there is no LAN discovery yet (devices are reached by
-  stored addresses and the rendezvous server) and no `ghostdrive autostart`. The Windows volume
-  is case-insensitive: files from other devices whose names Windows cannot use (such as `a:b`
-  or `CON`) are not shown there, and of names that differ only in case only one is shown (the
-  one whose name sorts first, so `Report.txt` before `report.txt`); the others stay on the
+  or `--mount X:` for a drive letter) and `ghostdrive autostart` works, but there is no LAN
+  discovery yet (devices are reached by stored addresses and the rendezvous server). The Windows
+  volume is case-insensitive: files from other devices whose names Windows cannot use (such as
+  `a:b` or `CON`) are not shown there, and of names that differ only in case only one is shown
+  (the one whose name sorts first, so `Report.txt` before `report.txt`); the others stay on the
   drive but cannot be reached from Windows.
 - Saving on Windows to the exact name of such a hidden variant writes to the visible one:
   saving `report.txt` overwrites what Linux and macOS devices see as `Report.txt`. A folder

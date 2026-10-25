@@ -164,6 +164,12 @@ core::Result<std::string> control_request(const std::filesystem::path& socket,
     std::string line = command + "\n";
     asio::write(s, asio::buffer(line), ec);
     if (ec) return Error{Errc::io, "control request failed: " + ec.message()};
+    // The reply ends where the daemon closes the connection. On Windows AF_UNIX that close is
+    // sometimes never seen (about one connection in a few hundred on CI: the whole reply arrives
+    // but the read never reports the end) while this side still has its sending direction
+    // open; half-closing it first avoids that. The daemon reads only up to the newline.
+    s.shutdown(Local::socket::shutdown_send, ec);
+    if (ec) return Error{Errc::io, "control request failed: " + ec.message()};
     std::string reply;
     asio::read(s, asio::dynamic_buffer(reply), ec);
     if (ec && ec != asio::error::eof)
