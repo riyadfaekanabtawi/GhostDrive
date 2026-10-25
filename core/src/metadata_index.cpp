@@ -615,8 +615,10 @@ Result<MetadataIndex> MetadataIndex::open(const std::filesystem::path& db_path,
                                           const DriveId& drive, const DeviceKey& key) {
     const std::uint64_t local_device = short_id(key.public_key());
     sqlite3* raw = nullptr;
+    // SQLite takes UTF-8 file names on every platform, including Windows.
+    const std::u8string name = db_path.u8string();
     const int rc =
-        sqlite3_open_v2(db_path.c_str(), &raw,
+        sqlite3_open_v2(reinterpret_cast<const char*>(name.c_str()), &raw,
                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX, nullptr);
     Db db(raw);
     if (rc != SQLITE_OK) {

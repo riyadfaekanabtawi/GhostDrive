@@ -33,7 +33,7 @@ target_compile_options(ghostdrive_warnings INTERFACE
 
 if(WIN32)
     # Windows 10 is the minimum: it has AF_UNIX sockets, used by the control socket.
-    add_compile_definitions(_WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
 endif()
 
 if(GHOSTDRIVE_SANITIZERS)

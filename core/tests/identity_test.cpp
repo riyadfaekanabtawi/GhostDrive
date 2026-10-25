@@ -1,11 +1,12 @@
 #include "ghostdrive/core/identity.hpp"
 
 #include <gtest/gtest.h>
-#include <sys/stat.h>
 
 #include <algorithm>
 
 #include "ghostdrive/core/bytes.hpp"
+#include "ghostdrive/core/file.hpp"
+#include "permissions.hpp"
 #include "temp_dir.hpp"
 
 namespace ghostdrive::core {
@@ -68,9 +69,7 @@ TEST(Identity, SaveLoadRoundTrip) {
     ASSERT_TRUE(key.ok());
     ASSERT_TRUE(key.value().save(path).ok());
 
-    struct stat st{};
-    ASSERT_EQ(::stat(path.c_str(), &st), 0);
-    EXPECT_EQ(st.st_mode & 0777, 0600u);
+    EXPECT_TRUE(test::has_private_mode(path, 0600));
 
     auto loaded = DeviceKey::load(path);
     ASSERT_TRUE(loaded.ok()) << loaded.error().message;
@@ -95,7 +94,7 @@ TEST(Identity, LoadRejectsPermissiveKeyFile) {
     auto key = DeviceKey::generate();
     ASSERT_TRUE(key.ok());
     ASSERT_TRUE(key.value().save(path).ok());
-    ASSERT_EQ(::chmod(path.c_str(), 0644), 0);
+    ASSERT_TRUE(test::let_others_read(path, 0644));
     auto loaded = DeviceKey::load(path);
     ASSERT_FALSE(loaded.ok());
     EXPECT_EQ(loaded.error().code, Errc::permission);
@@ -104,14 +103,8 @@ TEST(Identity, LoadRejectsPermissiveKeyFile) {
 TEST(Identity, LoadRejectsWrongFormat) {
     test::TempDir dir;
     const auto path = dir.path() / "device.key";
-    {
-        std::FILE* f = std::fopen(path.c_str(), "wb");
-        ASSERT_NE(f, nullptr);
-        const char junk[36] = "not a key file, just junk bytes....";
-        std::fwrite(junk, 1, sizeof(junk), f);
-        std::fclose(f);
-    }
-    ASSERT_EQ(::chmod(path.c_str(), 0600), 0);
+    const char junk[36] = "not a key file, just junk bytes....";
+    ASSERT_TRUE(write_private_file(path, std::as_bytes(std::span(junk))));
     auto loaded = DeviceKey::load(path);
     ASSERT_FALSE(loaded.ok());
     EXPECT_EQ(loaded.error().code, Errc::corrupt);

@@ -1,9 +1,11 @@
 // ghostdrive: sets up a drive and talks to the running daemon.
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -11,6 +13,7 @@
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
 #include <asio/io_context.hpp>
+#include <asio/ip/host_name.hpp>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -22,14 +25,18 @@
 #include <thread>
 #include <vector>
 
+#ifndef _WIN32
 #include "autostart.hpp"
+#endif
 #include "ghostdrive/daemon/control.hpp"
 #include "ghostdrive/daemon/drive.hpp"
 #include "ghostdrive/daemon/invite.hpp"
 #include "ghostdrive/daemon/service.hpp"
 #include "ghostdrive/version.hpp"
 
+#ifndef _WIN32
 extern char** environ;
+#endif
 
 namespace {
 
@@ -61,9 +68,9 @@ constexpr const char* kUsage =
     "`ghostdrive --version` prints the version.\n";
 
 std::string host_name() {
-    char buf[256] = {};
-    if (::gethostname(buf, sizeof(buf) - 1) != 0) return "device";
-    std::string name(buf);
+    std::error_code ec;
+    std::string name = asio::ip::host_name(ec);
+    if (ec) return "device";
     if (auto dot = name.find('.'); dot != std::string::npos) name.resize(dot);
     return name.empty() ? "device" : name;
 }
@@ -235,6 +242,7 @@ int cmd_join(const Args& args) {
     return 0;
 }
 
+#ifndef _WIN32
 // Runs a program found on PATH without a shell and returns its exit status, or -1.
 int run(const std::vector<std::string>& command, bool quiet) {
     std::vector<char*> argv;
@@ -420,6 +428,12 @@ int cmd_autostart(const Args& args) {
               << "Turn it off with `ghostdrive autostart off`.\n";
     return 0;
 }
+#else
+
+int cmd_autostart(const Args&) {
+    return fail("autostart is not supported on Windows yet; start ghostdrived yourself");
+}
+#endif
 
 }  // namespace
 

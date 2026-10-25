@@ -1,11 +1,9 @@
 #include "ghostdrive/core/chunk_store.hpp"
 
-#include <fcntl.h>
-
 #include <system_error>
 
 #include "ghostdrive/core/chunking.hpp"
-#include "posix_file.hpp"
+#include "ghostdrive/core/file.hpp"
 
 namespace ghostdrive::core {
 
@@ -28,8 +26,7 @@ Result<ChunkStore> ChunkStore::open(fs::path root, ChunkHasher hasher) {
         fs::create_directories(dir, ec);
         if (ec) return fs_error("create_directories", dir, ec);
     }
-    fs::permissions(root, fs::perms::owner_all, fs::perm_options::replace, ec);
-    if (ec) return fs_error("chmod", root, ec);
+    if (auto st = make_private_dir(root); !st) return st.error();
     // Leftover temp files are from interrupted writes and were never renamed into place.
     for (const auto& entry : fs::directory_iterator(root / "tmp", ec)) {
         fs::remove(entry.path(), ec);
@@ -50,7 +47,13 @@ Status ChunkStore::write_object(const ChunkId& id, std::span<const std::byte> da
     std::array<std::byte, 16> nonce{};
     if (auto st = random_bytes(nonce); !st) return st;
     const fs::path temp = root_ / "tmp" / to_hex(nonce);
-    if (auto st = detail::write_new_file(temp, data, 0600); !st) {
+    auto file = File::create_private(temp);
+    if (!file) return file.error();
+    auto st = file.value().write_at(data, 0);
+    if (st) st = file.value().sync();
+    if (st) st = file.value().close();
+    if (!st) {
+        (void)file.value().close();
         fs::remove(temp, ec);
         return st;
     }
@@ -102,21 +105,21 @@ Result<std::uint64_t> ChunkStore::size(const ChunkId& id) const {
 Result<std::size_t> ChunkStore::read(const ChunkId& id, std::uint64_t offset,
                                      std::span<std::byte> out) const {
     const fs::path path = object_path(id);
-    auto fd = detail::open_file(path, O_RDONLY);
-    if (!fd) return fd.error();
+    auto file = File::open_read(path);
+    if (!file) return file.error();
     // COPY: chunk file -> caller buffer (copy point C1 in docs/ARCHITECTURE.md section 4.1).
-    return detail::pread_full(fd.value().get(), out, offset, path);
+    return file.value().read_at(out, offset);
 }
 
 Result<Bytes> ChunkStore::read_verified(const ChunkId& id) const {
     const fs::path path = object_path(id);
-    auto fd = detail::open_file(path, O_RDONLY);
-    if (!fd) return fd.error();
-    auto bytes = detail::file_size(fd.value().get(), path);
+    auto file = File::open_read(path);
+    if (!file) return file.error();
+    auto bytes = file.value().size();
     if (!bytes) return bytes.error();
     Bytes data(static_cast<std::size_t>(bytes.value()));
     // COPY: chunk file -> owned buffer, so the bytes that were hashed are the bytes returned.
-    auto n = detail::pread_full(fd.value().get(), data, 0, path);
+    auto n = file.value().read_at(data, 0);
     if (!n) return n.error();
     data.resize(n.value());
     if (hasher_.hash(data) != id) {
@@ -136,9 +139,9 @@ Status ChunkStore::remove(const ChunkId& id) {
 }
 
 Result<ImportedFile> ChunkStore::import_file(const fs::path& file) {
-    auto fd = detail::open_file(file, O_RDONLY);
-    if (!fd) return fd.error();
-    auto bytes = detail::file_size(fd.value().get(), file);
+    auto source = File::open_read(file);
+    if (!source) return source.error();
+    auto bytes = source.value().size();
     if (!bytes) return bytes.error();
 
     ImportedFile imported;
@@ -150,7 +153,7 @@ Result<ImportedFile> ChunkStore::import_file(const fs::path& file) {
     Bytes buffer(imported.block_size);
     for (std::uint64_t offset = 0; offset < imported.size; offset += imported.block_size) {
         // COPY: source file -> chunk buffer, needed to hash and store the chunk.
-        auto n = detail::pread_full(fd.value().get(), buffer, offset, file);
+        auto n = source.value().read_at(buffer, offset);
         if (!n) return n.error();
         if (n.value() == 0) {
             return Error{Errc::io, "file " + file.string() + " shrank while importing"};

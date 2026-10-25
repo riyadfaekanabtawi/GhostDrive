@@ -1,5 +1,6 @@
 add_executable(ghostdrive_daemon_tests
     codec_test.cpp
+    control_test.cpp
     discovery_keys_test.cpp
     drive_test.cpp
     invite_test.cpp
@@ -21,4 +22,4 @@ gtest_discover_tests(ghostdrive_daemon_tests DISCOVERY_TIMEOUT 30 PROPERTIES LAB
 string(REPLACE "." "\\." version_regex "${PROJECT_VERSION}")
 add_test(NAME daemon.version COMMAND ghostdrived --version)
 set_tests_properties(daemon.version PROPERTIES
-    LABELS unit PASS_REGULAR_EXPRESSION "^ghostdrived ${version_regex}\n$")
+    LABELS unit PASS_REGULAR_EXPRESSION "^ghostdrived ${version_regex}\r?\n$")

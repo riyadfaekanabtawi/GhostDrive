@@ -1,10 +1,6 @@
 #include "write_handle.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <cstring>
 
@@ -19,42 +15,12 @@ using core::Status;
 
 namespace {
 
-Error errno_error(const char* what, const std::filesystem::path& path) {
-    int err = errno;
-    return Error{Errc::io, std::string(what) + " " + path.string() + ": " + std::strerror(err)};
-}
-
-Status pwrite_full(int fd, std::span<const std::byte> data, std::uint64_t offset,
-                   const std::filesystem::path& path) {
-    while (!data.empty()) {
-        ssize_t n = ::pwrite(fd, data.data(), data.size(), static_cast<off_t>(offset));
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return errno_error("pwrite", path);
-        }
-        data = data.subspan(static_cast<std::size_t>(n));
-        offset += static_cast<std::uint64_t>(n);
-    }
-    return {};
-}
-
 // Reads exactly out.size() bytes; holes in the sparse staging file read as zeros, and bytes
 // past its end (never expected) are zero-filled.
-Status pread_full(int fd, std::span<std::byte> out, std::uint64_t offset,
-                  const std::filesystem::path& path) {
-    while (!out.empty()) {
-        ssize_t n = ::pread(fd, out.data(), out.size(), static_cast<off_t>(offset));
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return errno_error("pread", path);
-        }
-        if (n == 0) {
-            std::fill(out.begin(), out.end(), std::byte{0});
-            return {};
-        }
-        out = out.subspan(static_cast<std::size_t>(n));
-        offset += static_cast<std::uint64_t>(n);
-    }
+Status pread_full(const core::File& file, std::span<std::byte> out, std::uint64_t offset) {
+    auto n = file.read_at(out, offset);
+    if (!n) return n.error();
+    std::fill(out.begin() + static_cast<std::ptrdiff_t>(n.value()), out.end(), std::byte{0});
     return {};
 }
 
@@ -82,11 +48,11 @@ core::Result<std::shared_ptr<WriteHandle>> WriteHandle::open(Context context, st
                                                              std::uint32_t new_file_mode,
                                                              std::filesystem::path staging_file,
                                                              bool truncate) {
-    int fd = ::open(staging_file.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0) return errno_error("open", staging_file);
-    auto handle =
-        std::make_shared<WriteHandle>(Private{}, std::move(context), std::move(path),
-                                      std::move(base), new_file_mode, std::move(staging_file), fd);
+    auto file = core::File::open_scratch(staging_file);
+    if (!file) return file.error();
+    auto handle = std::make_shared<WriteHandle>(Private{}, std::move(context), std::move(path),
+                                                std::move(base), new_file_mode,
+                                                std::move(staging_file), std::move(file).value());
     if (truncate && handle->size() > 0) {
         // Emptying the file drops every block, so the block size is chosen afresh at commit.
         handle->block_ = 0;
@@ -95,21 +61,19 @@ core::Result<std::shared_ptr<WriteHandle>> WriteHandle::open(Context context, st
         handle->size_ = 0;
         handle->dirty_any_ = true;
     }
-    if (::ftruncate(fd, static_cast<off_t>(handle->size())) != 0) {
-        return errno_error("ftruncate", handle->staging_file_);
-    }
+    if (auto st = handle->file_.truncate(handle->size()); !st) return st.error();
     return handle;
 }
 
 WriteHandle::WriteHandle(Private, Context context, std::string path,
                          std::optional<core::FileRecord> base, std::uint32_t new_file_mode,
-                         std::filesystem::path staging_file, int fd)
+                         std::filesystem::path staging_file, core::File file)
     : ctx_(std::move(context)),
       path_(std::move(path)),
       base_(std::move(base)),
       new_file_mode_(new_file_mode),
       staging_file_(std::move(staging_file)),
-      fd_(fd) {
+      file_(std::move(file)) {
     if (base_ && base_->size > 0) {
         block_ = base_->block_size;
         valid_base_ = base_->chunks.size();
@@ -118,7 +82,7 @@ WriteHandle::WriteHandle(Private, Context context, std::string path,
 }
 
 WriteHandle::~WriteHandle() {
-    ::close(fd_);
+    (void)file_.close();
     std::error_code ec;
     std::filesystem::remove(staging_file_, ec);
 }
@@ -145,7 +109,7 @@ asio::awaitable<Status> WriteHandle::copy_up(std::uint64_t block) {
     auto st = co_await detail::run_on(ctx_.disk, [this, data, block] {
         // COPY: the block's original bytes enter the staging file so a partial write can land
         // on top of them.
-        return pwrite_full(fd_, *data, block * block_, staging_file_);
+        return file_.write_at(*data, block * block_);
     });
     if (!st) co_return st;
     mark_dirty(block);
@@ -179,10 +143,7 @@ asio::awaitable<Status> WriteHandle::resize(std::uint64_t new_size) {
         }
     }
     auto st = co_await detail::run_on(ctx_.disk, [this, new_size]() -> Status {
-        if (::ftruncate(fd_, static_cast<off_t>(new_size)) != 0) {
-            return errno_error("ftruncate", staging_file_);
-        }
-        return {};
+        return file_.truncate(new_size);
     });
     if (!st) co_return st;
     size_ = new_size;
@@ -215,7 +176,7 @@ asio::awaitable<Status> WriteHandle::write(std::uint64_t offset, core::Bytes dat
     }
     auto shared = std::make_shared<core::Bytes>(std::move(data));
     auto st = co_await detail::run_on(ctx_.disk, [this, shared, offset] {
-        return pwrite_full(fd_, *shared, offset, staging_file_);
+        return file_.write_at(*shared, offset);
     });
     if (!st) co_return st;
     if (block_ != 0) {
@@ -250,7 +211,7 @@ asio::awaitable<core::Result<ReadReply>> WriteHandle::read(std::uint64_t offset,
         } else {
             auto buffer = std::make_shared<core::Bytes>(static_cast<std::size_t>(run_end - pos));
             auto st = co_await detail::run_on(ctx_.disk, [this, buffer, pos] {
-                return pread_full(fd_, *buffer, pos, staging_file_);
+                return pread_full(file_, *buffer, pos);
             });
             if (!st) co_return st.error();
             reply.slices.push_back(*buffer);
@@ -289,7 +250,7 @@ asio::awaitable<Status> WriteHandle::commit() {
                 }
                 buffer.resize(static_cast<std::size_t>(
                     std::min<std::uint64_t>(block, file_size - i * block)));
-                if (auto st = pread_full(fd_, buffer, i * block, staging_file_); !st) {
+                if (auto st = pread_full(file_, buffer, i * block); !st) {
                     return st.error();
                 }
                 auto id = ctx_.store.put(buffer);

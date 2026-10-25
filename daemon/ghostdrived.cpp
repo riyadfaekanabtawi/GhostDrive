@@ -7,6 +7,7 @@
 #include <asio/thread_pool.hpp>
 #include <charconv>
 #include <cstdio>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <mutex>
@@ -21,6 +22,9 @@
 #include "status_text.hpp"
 #ifdef GHOSTDRIVE_HAVE_FUSE
 #include "ghostdrive/vfs/fuse_mount.hpp"
+#endif
+#ifdef _WIN32
+#include <windows.h>
 #endif
 
 namespace {
@@ -71,6 +75,28 @@ bool parse_args(int argc, char** argv, Args& args) {
     return true;
 }
 
+#ifdef _WIN32
+// Closing the console window, logging off and shutting down end the process as soon as the
+// handler returns, so it asks for a stop and waits for main to finish shutting down (Windows
+// allows about five seconds). Ctrl-C arrives as SIGINT through the signal_set instead.
+std::function<void()> console_stop;
+HANDLE console_stopped = nullptr;
+
+BOOL WINAPI on_console_event(DWORD event) {
+    switch (event) {
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            console_stop();
+            ::WaitForSingleObject(console_stopped, 5000);
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -85,7 +111,11 @@ int main(int argc, char** argv) {
     }
 #ifndef GHOSTDRIVE_HAVE_FUSE
     if (args.mount) {
+#ifdef _WIN32
+        std::cerr << "ghostdrived cannot mount the drive on Windows yet; run with --no-mount\n";
+#else
         std::cerr << "ghostdrived was built without FUSE support; run with --no-mount\n";
+#endif
         return 1;
     }
 #endif
@@ -153,6 +183,14 @@ int main(int argc, char** argv) {
     signals.async_wait([&](const std::error_code& ec, int) {
         if (!ec) request_stop();
     });
+#ifdef _WIN32
+    console_stop = request_stop;
+    console_stopped = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (console_stopped == nullptr || !::SetConsoleCtrlHandler(on_console_event, TRUE)) {
+        std::cerr << "ghostdrived: cannot handle console close events\n";
+        return 1;
+    }
+#endif
 
     std::thread io_thread([&] { io.run(); });
 
@@ -202,5 +240,9 @@ int main(int argc, char** argv) {
     io_thread.join();
     disk.join();
     std::cout << "Stopped.\n" << std::flush;
+#ifdef _WIN32
+    ::SetConsoleCtrlHandler(on_console_event, FALSE);
+    ::SetEvent(console_stopped);
+#endif
     return 0;
 }
