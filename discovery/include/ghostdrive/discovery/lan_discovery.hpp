@@ -27,7 +27,7 @@ struct LanSighting {
 };
 
 // Advertises this device and browses for others with DNS-SD over mDNS, through the system's
-// responder (mDNSResponder on macOS, Avahi's compatibility library on Linux). An advertisement
+// responder (mDNSResponder; Avahi's compatibility library lacks the API used). An advertisement
 // is only a hint: dialing it still pins the member's key, so a forged one costs one dial.
 // Use from one executor.
 class LanDiscovery {

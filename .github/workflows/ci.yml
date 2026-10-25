@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+            preset: default
+          - name: linux-ubsan
+            os: ubuntu-latest
+            preset: ubsan
+          # No asan job: ASan binaries hang at startup on macOS (see CLAUDE.md), and UBSan on
+          # Linux covers the sanitizer run.
+          - name: macos
+            os: macos-latest
+            preset: default
+    env:
+      # The presets set VCPKG_BINARY_SOURCES=clear, so vcpkg keeps no binary cache. In CI the
+      # vcpkg installed tree lives outside the build directory and is cached between runs;
+      # vcpkg reuses every package whose ABI hash still matches. Local builds are unaffected.
+      VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Install system packages (Linux)
+        if: runner.os == 'Linux'
+        # Avahi's DNS-SD compatibility library is not installed: it lacks the API LAN discovery
+        # uses, so CMake would reject it and build without LAN discovery either way.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libfuse3-dev
+
+      - name: Install system packages (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja pkgconf
+
+      - name: Install FUSE-T (macOS)
+        if: runner.os == 'macOS'
+        # Only so the FUSE front end is compiled and linked; mount tests are not run (below).
+        # Without FUSE-T the build still succeeds and simply skips the FUSE front end.
+        continue-on-error: true
+        run: brew install --cask fuse-t
+
+      - name: Bootstrap vcpkg
+        id: vcpkg
+        run: |
+          ./external/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          echo "commit=$(git rev-parse HEAD:external/vcpkg)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore vcpkg installed tree
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.VCPKG_INSTALLED_DIR }}
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ matrix.preset }}-${{ hashFiles('vcpkg.json') }}-${{ steps.vcpkg.outputs.commit }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ matrix.preset }}-
+
+      - name: Configure
+        id: configure
+        run: cmake --preset ${{ matrix.preset }} -DVCPKG_INSTALLED_DIR="$VCPKG_INSTALLED_DIR"
+
+      # Saved right after configure (where vcpkg installs), so a failing build or test does not
+      # throw away the dependency build.
+      - name: Save vcpkg installed tree
+        if: always() && steps.configure.outcome == 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.VCPKG_INSTALLED_DIR }}
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      # Mount and e2e tests need a working FUSE device (/dev/fuse on Linux, FUSE-T on macOS),
+      # which hosted runners do not provide reliably, so they are excluded here. Run them
+      # locally with `ctest --preset default -L mount` and `-L e2e`.
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }} -LE "mount|e2e"

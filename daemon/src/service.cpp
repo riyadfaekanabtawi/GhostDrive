@@ -15,12 +15,10 @@
 #include <asio/use_awaitable.hpp>
 
 #include "async.hpp"
+#include "ghostdrive/discovery/lan_discovery.hpp"
 #include "ghostdrive/discovery/lan_id.hpp"
 #include "ghostdrive/discovery/rendezvous_codec.hpp"
 #include "ghostdrive/transport/demux.hpp"
-#ifdef GHOSTDRIVE_HAVE_DNSSD
-#include "ghostdrive/discovery/lan_discovery.hpp"
-#endif
 #include "ghostdrive/transport/frame.hpp"
 #include "ghostdrive/vfs/chunk_exchange.hpp"
 

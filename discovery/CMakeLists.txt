@@ -5,16 +5,31 @@ target_link_libraries(ghostdrive_discovery
     PUBLIC ghostdrive::core ghostdrive::transport asio::asio
     PRIVATE OpenSSL::Crypto ghostdrive_warnings)
 
-# LAN discovery goes through the system's DNS-SD API: built into macOS, and provided on Linux
-# by Avahi's compatibility library (libavahi-compat-libdnssd-dev). Without it, devices are
-# reached only by stored addresses.
+# LAN discovery goes through the system's DNS-SD API: built into macOS, and on Linux only an
+# Apple-compatible libdns_sd (mDNSResponder) will do. Avahi's compatibility library lacks
+# shared connections and DNSServiceGetAddrInfo, so it is rejected here. Without DNS-SD, devices
+# are reached only by stored addresses.
 if(APPLE)
     set(GHOSTDRIVE_DNSSD_FOUND TRUE)
 else()
     find_path(DNSSD_INCLUDE_DIR dns_sd.h PATH_SUFFIXES avahi-compat-libdns_sd)
     find_library(DNSSD_LIBRARY dns_sd)
     if(DNSSD_INCLUDE_DIR AND DNSSD_LIBRARY)
-        set(GHOSTDRIVE_DNSSD_FOUND TRUE)
+        include(CheckCXXSourceCompiles)
+        set(CMAKE_REQUIRED_INCLUDES ${DNSSD_INCLUDE_DIR})
+        set(CMAKE_REQUIRED_LIBRARIES ${DNSSD_LIBRARY})
+        check_cxx_source_compiles([[
+            #include <dns_sd.h>
+            int main() {
+                DNSServiceRef ref = nullptr;
+                return DNSServiceGetAddrInfo(&ref, kDNSServiceFlagsShareConnection, 0,
+                                             kDNSServiceProtocol_IPv4, "", nullptr, nullptr);
+            }]] GHOSTDRIVE_DNSSD_USABLE)
+        unset(CMAKE_REQUIRED_INCLUDES)
+        unset(CMAKE_REQUIRED_LIBRARIES)
+        if(GHOSTDRIVE_DNSSD_USABLE)
+            set(GHOSTDRIVE_DNSSD_FOUND TRUE)
+        endif()
     endif()
 endif()
 if(GHOSTDRIVE_DNSSD_FOUND)
@@ -26,7 +41,8 @@ if(GHOSTDRIVE_DNSSD_FOUND)
     endif()
     message(STATUS "LAN discovery: DNS-SD")
 else()
-    message(STATUS "LAN discovery: no DNS-SD library found, skipping")
+    target_sources(ghostdrive_discovery PRIVATE src/lan_discovery_none.cpp)
+    message(STATUS "LAN discovery: no usable DNS-SD library found, skipping")
 endif()
 
 if(GHOSTDRIVE_BUILD_TESTS)

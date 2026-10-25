@@ -191,8 +191,10 @@ document assumes the corrected version.
   each other; observers cannot track a device across epochs or learn its key. A forged
   advertisement only wastes one dial, because the TLS pin check rejects it. Announcements are
   rate-limited and the cache is capped.
-  As built in step (d): through the system DNS-SD API (mDNSResponder on macOS, Avahi's
-  compatibility library on Linux), one shared connection driven by Asio. The TXT record is
+  As built in step (d): through the system DNS-SD API (mDNSResponder on macOS, or an
+  mDNSResponder libdns_sd on Linux; Avahi's compatibility library lacks shared connections and
+  DNSServiceGetAddrInfo, so Linux builds against it skip LAN discovery), one shared connection
+  driven by Asio. The TXT record is
   `v=1 id=<base32>`, where the ID is `HMAC-SHA256(drive_secret, "ghostdrive-lan-v1" || epoch
   || device key)` truncated to 12 bytes, with one-hour epochs; members check the neighbouring
   epochs too, for clock skew. A sighting updates the stored address and dials right away, in
