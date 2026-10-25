@@ -405,9 +405,10 @@ NTSTATUS op_open(FSP_FILE_SYSTEM* fsp, PWSTR name, UINT32, UINT32 granted, PVOID
         if (found.attr.type == NodeType::directory) {
             node->directory = true;
         } else {
-            // As O_WRONLY or O_RDWR would: a handle that may write gets a staging file.
-            node->write =
-                self.fs.writable() && (granted & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+            // As O_WRONLY or O_RDWR would: a handle that may write gets a staging file. WinFsp
+            // grants write access on a read-only volume too, so it is refused here.
+            node->write = (granted & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+            if (node->write && !self.fs.writable()) return STATUS_MEDIA_WRITE_PROTECTED;
             auto handle = self.fs.open(found.ino, node->write, false);
             if (!handle) return to_ntstatus(handle.error());
             node->handle = handle.value();
@@ -628,6 +629,7 @@ NTSTATUS op_can_delete(FSP_FILE_SYSTEM* fsp, PVOID context, PWSTR) {
     return guarded([&] {
         auto& self = impl_of(fsp);
         auto& node = node_of(context);
+        if (!self.fs.writable()) return STATUS_MEDIA_WRITE_PROTECTED;
         if (node.directory) {
             auto entries = self.fs.readdir(node.ino);
             if (entries && !entries->empty()) return STATUS_DIRECTORY_NOT_EMPTY;
