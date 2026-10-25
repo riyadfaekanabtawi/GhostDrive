@@ -46,7 +46,7 @@
             </StackPanel>
         </StackPanel>
 
-        <InfoBar x:Name="Result" IsClosable="True" />
+        <InfoBar x:Name="Result" Visibility="Collapsed" IsClosable="True" />
 
         <TextBlock x:Name="DataFolderText" TextWrapping="Wrap" IsTextSelectionEnabled="True"
                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />

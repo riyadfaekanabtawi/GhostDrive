@@ -20,7 +20,7 @@
                           Toggled="OnLoginToggled" />
             <TextBlock TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                        Text="Start at login registers a Task Scheduler task that runs GhostDrive when you sign in, and starts it now. Turning it off also stops GhostDrive." />
-            <InfoBar x:Name="RunResult" IsClosable="True" />
+            <InfoBar x:Name="RunResult" Visibility="Collapsed" IsClosable="True" />
         </StackPanel>
 
         <StackPanel Spacing="12">
@@ -29,13 +29,13 @@
                        Text="Devices on different networks find each other through a rendezvous server you run (ghostdrive-rendezvous). It forwards only encrypted packets. Enter its address and the fingerprint it printed." />
             <TextBlock x:Name="RendezvousCurrent" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
             <TextBox x:Name="RendezvousAddress" Header="Address" PlaceholderText="rv.example.org:7374" />
-            <TextBox x:Name="RendezvousFingerprint" Header="Fingerprint" FontFamily="Consolas"
+            <TextBox x:Name="RendezvousFingerprint" Header="Fingerprint"
                      PlaceholderText="As printed by ghostdrive-rendezvous" />
             <StackPanel Orientation="Horizontal" Spacing="8">
                 <Button x:Name="RendezvousButton" Content="Set server" Click="OnSetRendezvous" />
                 <ProgressRing x:Name="RendezvousBusy" IsActive="False" Width="20" Height="20" />
             </StackPanel>
-            <InfoBar x:Name="RendezvousResult" IsClosable="True" />
+            <InfoBar x:Name="RendezvousResult" Visibility="Collapsed" IsClosable="True" />
         </StackPanel>
 
         <StackPanel Spacing="12">
@@ -46,7 +46,7 @@
             <TextBlock TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                        Text="Leave a box empty for the default. A new mount location applies the next time GhostDrive starts." />
             <Button x:Name="SaveButton" Content="Save" Click="OnSave" />
-            <InfoBar x:Name="SaveResult" IsClosable="True" />
+            <InfoBar x:Name="SaveResult" Visibility="Collapsed" IsClosable="True" />
         </StackPanel>
     </StackPanel>
 </UserControl>

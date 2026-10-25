@@ -84,6 +84,8 @@ function Save-Window([System.Diagnostics.Process] $p, [string] $file) {
     $bmp.Dispose()
 }
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
 
 $daemons = @()
 try {
@@ -99,23 +101,51 @@ try {
     $s = Wait-Status $a { param($s) @($s.peers | Where-Object online).Count -gt 0 } 60
     if ($s) { Write-Host 'ci-laptop is online' } else { Write-Warning 'ci-laptop did not come online' }
 
-    # The app's settings: this drive's data folder and the ghostdrive.exe from the build tree.
+    # The app's settings: a data folder and the ghostdrive.exe from the build tree.
     $settingsDir = Join-Path $env:LOCALAPPDATA 'GhostDriveApp'
     New-Item -ItemType Directory -Force $settingsDir | Out-Null
-    @{ DataFolder = $a; MountLocation = ''; CliPath = $Cli } | ConvertTo-Json |
-        Set-Content -Encoding utf8 (Join-Path $settingsDir 'settings.json')
+    function Set-AppData([string] $data) {
+        @{ DataFolder = $data; MountLocation = ''; CliPath = $Cli } | ConvertTo-Json |
+            Set-Content -Encoding utf8 (Join-Path $settingsDir 'settings.json')
+    }
 
-    foreach ($page in 'home', 'devices', 'add', 'settings') {
+    # Starts the app on a page, optionally clicks a button by its name through UI Automation,
+    # saves a screenshot and closes the app.
+    function Show-Page([string] $page, [string] $shot, [string] $click = '') {
         $p = Start-Process -FilePath (Join-Path $App 'GhostDriveApp.exe') -ArgumentList '--page', $page -PassThru
         Start-Sleep -Seconds 12
-        if ($p.HasExited) { throw "GhostDriveApp exited on its own with code $($p.ExitCode) (page $page)" }
-        Save-Window $p (Join-Path $OutDir "$page.png")
-        Write-Host "saved $page.png"
+        if ($p.HasExited) { throw "GhostDriveApp exited on its own with code $($p.ExitCode) ($shot)" }
+        if ($click) {
+            try {
+                $p.Refresh()
+                $root = [System.Windows.Automation.AutomationElement]::FromHandle($p.MainWindowHandle)
+                $cond = New-Object System.Windows.Automation.PropertyCondition(
+                    [System.Windows.Automation.AutomationElement]::NameProperty, $click)
+                $button = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+                $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+                Start-Sleep -Seconds 4
+            } catch {
+                Write-Warning "could not click '$click': $_"
+            }
+        }
+        Save-Window $p (Join-Path $OutDir "$shot.png")
+        Write-Host "saved $shot.png"
         if (-not $p.CloseMainWindow() -or -not $p.WaitForExit(10000)) {
             Write-Warning "GhostDriveApp did not close; stopping it"
             $p.Kill()
         }
+        if ($p.ExitCode -ne 0 -and $p.ExitCode -ne -1) { Write-Warning "GhostDriveApp exit code $($p.ExitCode)" }
     }
+
+    Set-AppData $a
+    Show-Page home home
+    Show-Page devices devices
+    Show-Page add add-invite 'Create invite code'
+    Show-Page settings settings
+
+    # A data folder without a drive shows the first-run choices.
+    Set-AppData (Join-Path $work 'empty')
+    Show-Page home first-run
 } finally {
     $ErrorActionPreference = 'Continue'
     foreach ($d in $a, $b) { & $Cli stop --data $d 2>$null | Out-Null }

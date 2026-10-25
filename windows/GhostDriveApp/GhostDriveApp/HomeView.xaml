@@ -11,9 +11,9 @@
                        TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
         </StackPanel>
 
-        <InfoBar x:Name="RemovedBar" Severity="Error" IsClosable="False" Title="Removed from the drive" />
-        <InfoBar x:Name="DiscoveryBar" Severity="Warning" IsClosable="False" Title="Finding devices" />
-        <InfoBar x:Name="ActionResult" IsClosable="True" />
+        <InfoBar x:Name="RemovedBar" Visibility="Collapsed" Severity="Error" IsClosable="False" Title="Removed from the drive" />
+        <InfoBar x:Name="DiscoveryBar" Visibility="Collapsed" Severity="Warning" IsClosable="False" Title="Finding devices" />
+        <InfoBar x:Name="ActionResult" Visibility="Collapsed" IsClosable="True" />
 
         <Grid ColumnSpacing="24" RowSpacing="18">
             <Grid.ColumnDefinitions>

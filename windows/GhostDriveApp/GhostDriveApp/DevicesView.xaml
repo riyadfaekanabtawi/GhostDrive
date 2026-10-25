@@ -7,7 +7,7 @@
         <TextBlock Text="Devices" Style="{StaticResource TitleTextBlockStyle}" />
         <TextBlock x:Name="Summary" TextWrapping="Wrap"
                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-        <InfoBar x:Name="Result" IsClosable="True" />
+        <InfoBar x:Name="Result" Visibility="Collapsed" IsClosable="True" />
         <StackPanel x:Name="List" Spacing="8" />
     </StackPanel>
 </UserControl>

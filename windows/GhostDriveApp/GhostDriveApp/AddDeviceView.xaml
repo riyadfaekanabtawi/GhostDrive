@@ -12,7 +12,7 @@
                     Click="OnCreate" />
             <ProgressRing x:Name="Busy" IsActive="False" Width="20" Height="20" />
         </StackPanel>
-        <InfoBar x:Name="Result" IsClosable="True" />
+        <InfoBar x:Name="Result" Visibility="Collapsed" IsClosable="True" />
 
         <Border x:Name="CodeCard" Visibility="Collapsed" Padding="20" CornerRadius="8" BorderThickness="1"
                 Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"

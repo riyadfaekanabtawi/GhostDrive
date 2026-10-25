@@ -15,15 +15,26 @@ internal static class Ui
 
     public static Visibility Visible(bool on) => on ? Visibility.Visible : Visibility.Collapsed;
 
+    // A closed InfoBar is also collapsed, so it takes no StackPanel spacing.
     public static void Show(InfoBar bar, InfoBarSeverity severity, string? message, string title = "")
     {
         bar.Severity = severity;
         bar.Title = title;
         bar.Message = message ?? "";
         bar.IsOpen = !string.IsNullOrEmpty(message) || !string.IsNullOrEmpty(title);
+        bar.Visibility = Visible(bar.IsOpen);
+        bar.Closed -= OnClosed;
+        bar.Closed += OnClosed;
     }
 
-    public static void Hide(InfoBar bar) => bar.IsOpen = false;
+    public static void Hide(InfoBar bar)
+    {
+        bar.IsOpen = false;
+        bar.Visibility = Visibility.Collapsed;
+    }
+
+    private static void OnClosed(InfoBar bar, InfoBarClosedEventArgs args) =>
+        bar.Visibility = Visibility.Collapsed;
 
     // Opens a folder or drive in Explorer, without a shell: explorer.exe with one argument.
     public static void OpenInExplorer(string path)
