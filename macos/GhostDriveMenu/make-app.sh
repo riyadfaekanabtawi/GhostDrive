@@ -7,10 +7,17 @@
 # cli/ghostdrive and daemon/ghostdrived are copied into the app.
 # GHOSTDRIVE_SWIFT_SCRATCH, an absolute path, moves .build and SwiftPM's caches and
 # configuration there instead (scripts/package.sh points it into the CMake build tree).
+# GHOSTDRIVE_VERSION sets the bundle version; by default it is the project() version in the
+# top-level CMakeLists.txt.
 set -eu
 
 cd "$(dirname "$0")"
 config="${1:-release}"
+version="${GHOSTDRIVE_VERSION:-}"
+if [ -z "$version" ]; then
+    version="$(sed -n 's/^project([^)]* VERSION \([0-9][0-9.]*\).*/\1/p' ../../CMakeLists.txt)"
+fi
+[ -n "$version" ] || { echo "make-app.sh: no project version in ../../CMakeLists.txt" >&2; exit 1; }
 scratch="${GHOSTDRIVE_SWIFT_SCRATCH:-}"
 if [ -n "$scratch" ]; then
     set -- --scratch-path "$scratch" --cache-path "$scratch/cache" \
@@ -32,7 +39,7 @@ if [ -n "${GHOSTDRIVE_BUILD_DIR:-}" ]; then
         "$app/Contents/MacOS/"
 fi
 
-cat > "$app/Contents/Info.plist" <<'EOF'
+cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -46,9 +53,9 @@ cat > "$app/Contents/Info.plist" <<'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1</string>
+    <string>$version</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>$version</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
