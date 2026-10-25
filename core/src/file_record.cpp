@@ -26,6 +26,12 @@ Status validate(const FileRecord& record) {
     if (!is_valid_drive_path(record.path)) {
         return Error{Errc::invalid_argument, "invalid drive path: " + record.path};
     }
+    if (!record.origin_path.empty() &&
+        (!is_valid_drive_path(record.origin_path) ||
+         record.path != conflict_copy_path(record.origin_path, record.mtime_ns,
+                                           record.modified_by))) {
+        return Error{Errc::invalid_argument, "conflict copy at the wrong path: " + record.path};
+    }
     if (record.deleted) {
         if (!record.chunks.empty()) {
             return Error{Errc::invalid_argument, "deleted record has chunks: " + record.path};
@@ -73,6 +79,39 @@ std::string conflict_copy_path(std::string_view path, std::int64_t mtime_ns, std
     out.reserve(path.size() + 40);
     out.append(dir).append(stem).append(".sync-conflict-").append(stamp.data());
     out.append("-").append(device_tag).append(ext);
+    return out;
+}
+
+Bytes record_signed_bytes(const DriveId& drive, const FileRecord& record) {
+    constexpr std::string_view kContext = "ghostdrive-file-record-v1";
+    const std::string& path = record.origin_path.empty() ? record.path : record.origin_path;
+    const Bytes version = record.version.serialize();
+    Bytes out;
+    out.reserve(kContext.size() + drive.size() + path.size() + version.size() + 64 +
+                record.chunks.size() * kChunkIdSize);
+    auto put = [&out](std::uint64_t v, int n) {
+        for (int i = 0; i < n; ++i) out.push_back(static_cast<std::byte>(v >> (8 * i)));
+    };
+    const auto context = as_bytes(kContext);
+    out.insert(out.end(), context.begin(), context.end());
+    out.insert(out.end(), drive.begin(), drive.end());
+    put(path.size(), 4);
+    const auto path_bytes = as_bytes(path);
+    out.insert(out.end(), path_bytes.begin(), path_bytes.end());
+    put(record.size, 8);
+    put(record.mode, 4);
+    put(static_cast<std::uint64_t>(record.mtime_ns), 8);
+    put(record.hlc, 8);
+    out.insert(out.end(), version.begin(), version.end());
+    put(record.modified_by, 8);
+    put(record.block_size, 4);
+    put(static_cast<std::uint8_t>(record.chunking), 1);
+    put(record.deleted ? 1 : 0, 1);
+    put(record.chunks.size(), 4);
+    for (const auto& id : record.chunks) {
+        const auto bytes = id.to_bytes();  // algorithm tag, then digest
+        out.insert(out.end(), bytes.begin(), bytes.end());
+    }
     return out;
 }
 

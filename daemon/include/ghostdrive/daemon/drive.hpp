@@ -51,6 +51,11 @@ struct RendezvousConfig {
     static std::optional<RendezvousConfig> parse(std::string_view text);
 };
 
+struct MembershipChange {
+    std::vector<core::PublicKey> unpinned;
+    std::vector<core::PublicKey> pinned;
+};
+
 // One device's membership of one drive: identity, secret, index, chunks and peer addresses.
 class Drive {
 public:
@@ -68,7 +73,7 @@ public:
     static bool exists(const std::filesystem::path& root);
 
     const DrivePaths& paths() const noexcept { return paths_; }
-    const core::DeviceKey& key() const noexcept { return key_; }
+    const core::DeviceKey& key() const noexcept { return *key_; }
     const DriveId& drive_id() const noexcept { return drive_id_; }
     const core::DriveSecret& secret() const noexcept { return secret_; }
     const std::string& device_name() const noexcept { return device_name_; }
@@ -79,9 +84,10 @@ public:
     // Not thread-safe; the daemon uses it from its I/O executor only.
     Membership& membership() noexcept { return membership_; }
     core::Status save_membership();
-    // Brings the pinned devices in the index in line with the membership view. Returns the
-    // devices that were unpinned.
-    core::Result<std::vector<core::PublicKey>> apply_membership();
+    // Brings the pinned devices in the index in line with the membership view. Unpinned
+    // devices' keys are retired as signers and their records adopted; pinning a device resets
+    // every peer's index progress.
+    core::Result<MembershipChange> apply_membership();
     // The same, from the I/O executor only.
     DiscoveryKeys& discovery_keys() noexcept { return discovery_keys_; }
     core::Status save_discovery_keys();
@@ -95,14 +101,15 @@ public:
     std::optional<RendezvousConfig> rendezvous() const;
     core::Status set_rendezvous(const RendezvousConfig& config);
 
-    Drive(DrivePaths paths, core::DeviceKey key, DriveId drive_id, core::DriveSecret secret,
-          std::string device_name, core::MetadataIndex index, core::ChunkStore store,
-          Membership membership, DiscoveryKeys discovery_keys);
+    // The index signs with *key, so the key lives on the heap and never moves.
+    Drive(DrivePaths paths, std::unique_ptr<core::DeviceKey> key, DriveId drive_id,
+          core::DriveSecret secret, std::string device_name, core::MetadataIndex index,
+          core::ChunkStore store, Membership membership, DiscoveryKeys discovery_keys);
     ~Drive();
 
 private:
     DrivePaths paths_;
-    core::DeviceKey key_;
+    std::unique_ptr<core::DeviceKey> key_;
     DriveId drive_id_;
     core::DriveSecret secret_;
     std::string device_name_;

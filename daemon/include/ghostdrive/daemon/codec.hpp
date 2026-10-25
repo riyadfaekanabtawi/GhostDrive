@@ -52,8 +52,8 @@ using Token = std::array<std::byte, kTokenSize>;
 using DriveId = std::array<std::byte, kDriveIdSize>;
 
 // Index exchange. The device sending records opens a stream with Hello; the receiver answers
-// with IndexRequest saying where to resume; IndexBatch frames follow for as long as the
-// connection lives.
+// with IndexRequest saying where to resume; IndexBatch frames (type index_batch2) follow for as
+// long as the connection lives. Records carry their author's signature, checked by the index.
 struct Hello {
     std::uint64_t index_id = 0;
     std::uint64_t max_sequence = 0;

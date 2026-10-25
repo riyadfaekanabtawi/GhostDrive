@@ -14,6 +14,7 @@ target_link_libraries(ghostdrive_core_tests
     PRIVATE
         ghostdrive::core
         GTest::gtest_main
+        unofficial::sqlite3::sqlite3  # metadata_index_test builds an index of an older schema
         ghostdrive_warnings
 )
 # Test scratch files stay inside the build tree.

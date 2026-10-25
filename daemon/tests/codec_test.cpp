@@ -36,6 +36,10 @@ core::FileRecord sample_record() {
         id.digest.fill(std::byte{i});
         r.chunks.push_back(id);
     }
+    core::Signature signature{};
+    for (std::size_t i = 0; i < signature.size(); ++i) signature[i] = static_cast<std::byte>(i);
+    r.signature = signature;
+    r.origin_path = "photos/2026/beach-original.jpg";
     return r;
 }
 
@@ -55,12 +59,13 @@ TEST(Codec, HelloAndRequestRoundTrip) {
 TEST(Codec, IndexBatchRoundTrip) {
     auto deleted = sample_record();
     deleted.path = "old.txt";
+    deleted.origin_path.clear();
     deleted.deleted = true;
     deleted.chunks.clear();
     deleted.size = 0;
     std::vector<IndexEntry> entries{{sample_record(), true}, {deleted, false}};
     auto frame = encode_index_batch(entries);
-    auto decoded = decode_index_batch(payload_of(frame, wire::FrameType::index_batch));
+    auto decoded = decode_index_batch(payload_of(frame, wire::FrameType::index_batch2));
     ASSERT_TRUE(decoded) << decoded.error().message;
     ASSERT_EQ(decoded.value().size(), 2u);
     const auto& a = decoded.value()[0].record;
@@ -76,6 +81,9 @@ TEST(Codec, IndexBatchRoundTrip) {
     EXPECT_EQ(a.block_size, expected.block_size);
     EXPECT_EQ(a.sequence, expected.sequence);
     EXPECT_EQ(a.chunks, expected.chunks);
+    EXPECT_EQ(a.signature, expected.signature);
+    EXPECT_EQ(a.origin_path, expected.origin_path);
+    EXPECT_TRUE(decoded.value()[1].record.origin_path.empty());
     EXPECT_FALSE(decoded.value()[1].sender_holds);
     EXPECT_TRUE(decoded.value()[1].record.deleted);
 }
@@ -83,8 +91,13 @@ TEST(Codec, IndexBatchRoundTrip) {
 TEST(Codec, TruncatedOrPaddedPayloadsAreRejected) {
     std::vector<IndexEntry> entries{{sample_record(), true}};
     auto frame = encode_index_batch(entries);
-    auto payload = payload_of(frame, wire::FrameType::index_batch);
+    auto payload = payload_of(frame, wire::FrameType::index_batch2);
     for (std::size_t cut = 0; cut < payload.size(); cut += 7) {
+        EXPECT_FALSE(decode_index_batch(payload.first(cut))) << "cut at " << cut;
+    }
+    // Cut inside the signature, which ends 2 + origin_path bytes before the end.
+    const std::size_t signature_end = payload.size() - 2 - sample_record().origin_path.size();
+    for (std::size_t cut = signature_end - core::kSignatureSize; cut < signature_end; ++cut) {
         EXPECT_FALSE(decode_index_batch(payload.first(cut))) << "cut at " << cut;
     }
     core::Bytes padded(payload.begin(), payload.end());

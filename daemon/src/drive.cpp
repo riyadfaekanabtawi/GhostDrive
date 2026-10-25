@@ -118,13 +118,14 @@ core::Result<std::unique_ptr<Drive>> assemble(const DrivePaths& paths, core::Dev
                                               std::string name) {
     std::error_code ec;
     std::filesystem::create_directories(paths.staging, ec);
-    auto index = core::MetadataIndex::open(paths.index, core::short_id(key.public_key()));
+    auto owned_key = std::make_unique<core::DeviceKey>(std::move(key));
+    auto index = core::MetadataIndex::open(paths.index, id, *owned_key);
     if (!index) return index.error();
     auto store = core::ChunkStore::open(paths.chunks, core::ChunkHasher(secret));
     if (!store) return store.error();
-    Membership membership(id, key.public_key());
-    DiscoveryKeys discovery_keys(id, key.public_key(), secret);
-    return std::make_unique<Drive>(paths, std::move(key), id, secret, std::move(name),
+    Membership membership(id, owned_key->public_key());
+    DiscoveryKeys discovery_keys(id, owned_key->public_key(), secret);
+    return std::make_unique<Drive>(paths, std::move(owned_key), id, secret, std::move(name),
                                    std::move(index).value(), std::move(store).value(),
                                    std::move(membership), std::move(discovery_keys));
 }
@@ -192,9 +193,9 @@ std::filesystem::path default_mountpoint() {
     return std::filesystem::path(home ? home : ".") / "GhostDrive";
 }
 
-Drive::Drive(DrivePaths paths, core::DeviceKey key, DriveId drive_id, core::DriveSecret secret,
-             std::string device_name, core::MetadataIndex index, core::ChunkStore store,
-             Membership membership, DiscoveryKeys discovery_keys)
+Drive::Drive(DrivePaths paths, std::unique_ptr<core::DeviceKey> key, DriveId drive_id,
+             core::DriveSecret secret, std::string device_name, core::MetadataIndex index,
+             core::ChunkStore store, Membership membership, DiscoveryKeys discovery_keys)
     : paths_(std::move(paths)),
       key_(std::move(key)),
       drive_id_(drive_id),
@@ -371,15 +372,20 @@ Status Drive::save_discovery_keys() {
     return st;
 }
 
-core::Result<std::vector<core::PublicKey>> Drive::apply_membership() {
+core::Result<MembershipChange> Drive::apply_membership() {
     auto view = membership_.view();
     auto devices = index_.devices();
     if (!devices) return devices.error();
-    std::vector<core::PublicKey> unpinned;
+    MembershipChange change;
     for (const auto& device : devices.value()) {
         if (view.members.contains(device.key)) continue;
         if (auto st = index_.remove_device(device.key); !st) return st.error();
-        unpinned.push_back(device.key);
+        // Its records stay readable here and are adopted, so devices that never knew its key
+        // can verify them.
+        if (auto adopted = index_.retire_signer(device.key, clock_); !adopted) {
+            return adopted.error();
+        }
+        change.unpinned.push_back(device.key);
     }
     for (const auto& [key, name] : view.members) {
         auto pinned = index_.is_pinned(key);
@@ -388,8 +394,19 @@ core::Result<std::vector<core::PublicKey>> Drive::apply_membership() {
         auto st = index_.add_device(key, name);
         // Another key with the same 64-bit short ID cannot be told apart in version vectors.
         if (!st && st.error().code != Errc::already_exists) return st.error();
+        if (st) change.pinned.push_back(key);
     }
-    return unpinned;
+    if (!change.pinned.empty()) {
+        // Records signed by the new keys may have been rejected already, when they arrived
+        // before the membership entries did: fetch every peer's index again from the start.
+        // Records already stored compare equal and are not verified again.
+        auto all = index_.devices();
+        if (!all) return all.error();
+        for (const auto& device : all.value()) {
+            if (auto st = index_.set_peer_progress(device.key, 0, 0); !st) return st.error();
+        }
+    }
+    return change;
 }
 
 std::map<core::PublicKey, std::string> Drive::peer_addresses() const {

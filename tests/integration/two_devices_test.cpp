@@ -7,12 +7,15 @@
 #include <asio/detached.hpp>
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
+#include <asio/steady_timer.hpp>
 #include <asio/thread_pool.hpp>
+#include <asio/use_awaitable.hpp>
 #include <random>
 
 #include "ghostdrive/daemon/drive.hpp"
 #include "ghostdrive/daemon/invite.hpp"
 #include "ghostdrive/daemon/service.hpp"
+#include "ghostdrive/transport/frame.hpp"
 #include "temp_dir.hpp"
 
 namespace ghostdrive::daemon {
@@ -40,10 +43,12 @@ ServiceOptions loopback_options() {
 class TwoDevices : public ::testing::Test {
 protected:
     ~TwoDevices() override {
+        if (d_) d_->stop();
         if (c_) c_->stop();
         if (b_) b_->stop();
         if (a_) a_->stop();
         drain([] { return false; }, 300ms);
+        d_.reset();
         c_.reset();
         b_.reset();
         a_.reset();
@@ -113,24 +118,34 @@ protected:
         })) << "devices did not connect";
     }
 
-    // A third device, invited by A. It is given B's address, so the test is about membership
-    // reaching B, not about finding B.
-    void start_c() {
+    // Another device, invited by A. It is given B's address, so the tests are about
+    // membership reaching B, not about finding B.
+    void join_by_invite(const std::string& root, std::unique_ptr<Drive>& out) {
         auto code = a_->create_invite(60s);
         ASSERT_TRUE(code);
-        auto joined = join_with(code.value(), "c");
+        auto joined = join_with(code.value(), root);
         ASSERT_TRUE(joined) << joined.error().message;
-        auto drive = Drive::join(dir_.path() / "c", "c", joined.value().info,
+        auto drive = Drive::join(dir_.path() / root, root, joined.value().info,
                                  drive_a_->key().public_key());
         ASSERT_TRUE(drive) << drive.error().message;
         ASSERT_TRUE(drive.value()->set_peer_address(drive_a_->key().public_key(),
                                                     "127.0.0.1:" + std::to_string(a_->port())));
         ASSERT_TRUE(drive.value()->set_peer_address(drive_b_->key().public_key(),
                                                     "127.0.0.1:" + std::to_string(b_->port())));
-        drive_c_ = std::move(drive).value();
-        c_ = std::make_unique<Service>(io_.get_executor(), disk_.get_executor(), *drive_c_,
-                                       loopback_options());
-        ASSERT_TRUE(c_->start());
+        out = std::move(drive).value();
+    }
+
+    std::unique_ptr<Service> start_service(Drive& drive) {
+        auto service = std::make_unique<Service>(io_.get_executor(), disk_.get_executor(), drive,
+                                                 loopback_options());
+        EXPECT_TRUE(service->start());
+        return service;
+    }
+
+    void start_c() {
+        join_by_invite("c", drive_c_);
+        ASSERT_TRUE(drive_c_);
+        c_ = start_service(*drive_c_);
     }
 
     // Writes a file in the root of `fs`.
@@ -173,9 +188,11 @@ protected:
     std::unique_ptr<Drive> drive_a_;
     std::unique_ptr<Drive> drive_b_;
     std::unique_ptr<Drive> drive_c_;
+    std::unique_ptr<Drive> drive_d_;
     std::unique_ptr<Service> a_;
     std::unique_ptr<Service> b_;
     std::unique_ptr<Service> c_;
+    std::unique_ptr<Service> d_;
 };
 
 TEST_F(TwoDevices, JoinedDeviceSharesTheDriveSecret) {
@@ -385,6 +402,143 @@ TEST_F(TwoDevices, ARemovedDeviceIsCutOffEverywhere) {
     c_->stop();
     auto rejoin = join_with(code.value(), "c");
     EXPECT_FALSE(rejoin);
+}
+
+TEST_F(TwoDevices, ForgedRecordsFromAMemberAreDropped) {
+    start_a();
+    start_b();
+    auto data = random_bytes(5000, 11);
+    write_file(a_->filesystem(), "a.txt", data);
+    ASSERT_TRUE(drain([&] {
+        auto r = drive_b_->index().get("a.txt");
+        return r && r.value() && r.value()->size == data.size();
+    }));
+    const auto genuine = drive_a_->index().get("a.txt").value().value();
+
+    // C is a member but misbehaves: instead of running a daemon it sends B made-up records.
+    join_by_invite("c", drive_c_);
+    ASSERT_TRUE(drive_c_);
+    const auto c = drive_c_->key().public_key();
+    ASSERT_TRUE(drain([&] { return drive_b_->index().is_pinned(c).value(); }));
+    const auto a_id = core::short_id(drive_a_->key().public_key());
+    const auto& drive = drive_a_->drive_id();
+    auto sign_as_c = [&](core::FileRecord r) {
+        r.signature = drive_c_->key().sign(core::record_signed_bytes(drive, r)).value();
+        return r;
+    };
+    auto altered = genuine;  // A's record with a new version, under A's old signature
+    altered.version.bump(a_id);
+    altered.mtime_ns += 1;
+    core::FileRecord made_up;  // a file A never wrote, signed by C in A's name
+    made_up.path = "made-up.txt";
+    made_up.version.bump(a_id);
+    made_up.modified_by = a_id;
+    made_up.hlc = drive_c_->clock().now();
+    made_up = sign_as_c(made_up);
+    core::FileRecord own;  // and one honest record, sent last
+    own.path = "from-c.txt";
+    own.version.bump(core::short_id(c));
+    own.modified_by = core::short_id(c);
+    own.hlc = drive_c_->clock().now();
+    own = sign_as_c(own);
+    altered.sequence = 1;
+    made_up.sequence = 2;
+    own.sequence = 3;
+    std::vector<IndexEntry> batch{{altered, false}, {made_up, false}, {own, false}};
+
+    auto endpoint = transport::Endpoint::create(io_.get_executor(), drive_c_->key(), {}).value();
+    std::optional<bool> sent;
+    asio::co_spawn(
+        io_,
+        [&]() -> asio::awaitable<void> {
+            auto conn = co_await endpoint->connect(
+                asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), b_->port()),
+                drive_b_->key().public_key());
+            if (!conn) {
+                sent = false;
+                co_return;
+            }
+            auto stream = co_await conn.value()->open_stream();
+            if (!stream) {
+                sent = false;
+                co_return;
+            }
+            auto hello = encode_hello(Hello{7, 3});
+            if (!co_await stream.value()->write(hello)) {
+                sent = false;
+                co_return;
+            }
+            auto request = co_await transport::wire::read_frame(*stream.value(), 64);
+            if (!request) {
+                sent = false;
+                co_return;
+            }
+            auto frame = encode_index_batch(batch);
+            sent = static_cast<bool>(co_await stream.value()->write(frame));
+            // Stay connected until the test is done with B.
+            co_await asio::steady_timer(io_, 10s).async_wait(asio::use_awaitable);
+        },
+        asio::detached);
+    ASSERT_TRUE(drain([&] { return sent.has_value(); }));
+    ASSERT_TRUE(*sent);
+    ASSERT_TRUE(drain([&] {
+        return b_->filesystem().lookup(vfs::kRootIno, "from-c.txt").has_value();
+    })) << "B never applied C's own record";
+    EXPECT_FALSE(drive_b_->index().get("made-up.txt").value().has_value());
+    EXPECT_FALSE(b_->filesystem().lookup(vfs::kRootIno, "made-up.txt").has_value());
+    auto at_b = drive_b_->index().get("a.txt").value().value();
+    EXPECT_EQ(at_b.version, genuine.version);
+    EXPECT_EQ(at_b.mtime_ns, genuine.mtime_ns);
+    endpoint->close();
+}
+
+TEST_F(TwoDevices, ANewMemberReadsTheFilesOfARemovedDevice) {
+    start_a();
+    start_b();
+    start_c();
+    auto c = drive_c_->key().public_key();
+    ASSERT_TRUE(drain([&] { return b_->connected_to(c) && a_->connected_to(c); }));
+    // A holds the same content, so the chunks outlive C.
+    auto data = random_bytes(300'000, 12);
+    write_file(a_->filesystem(), "on-a.bin", data);
+    write_file(c_->filesystem(), "from-c.bin", data);
+    auto has_file = [&](Drive& drive, const char* path) {
+        auto r = drive.index().get(path);
+        return r && r.value() && r.value()->size == data.size();
+    };
+    ASSERT_TRUE(drain(
+        [&] { return has_file(*drive_a_, "from-c.bin") && has_file(*drive_b_, "from-c.bin"); }));
+
+    ASSERT_TRUE(a_->remove_member("c"));
+    ASSERT_TRUE(drain([&] { return !drive_b_->index().is_pinned(c).value(); }));
+    c_->stop();
+    // Both remaining members adopt C's record.
+    const auto c_id = core::short_id(c);
+    ASSERT_TRUE(drain([&] {
+        auto at_a = drive_a_->index().get("from-c.bin").value();
+        auto at_b = drive_b_->index().get("from-c.bin").value();
+        return at_a && at_b && at_a->modified_by != c_id && at_b->modified_by != c_id;
+    }));
+
+    // D joins after the removal and never learns C's key.
+    join_by_invite("d", drive_d_);
+    ASSERT_TRUE(drive_d_);
+    EXPECT_FALSE(drive_d_->index().is_active_signer(c_id));
+    d_ = start_service(*drive_d_);
+    ASSERT_TRUE(drain([&] {
+        auto ino = d_->filesystem().lookup(vfs::kRootIno, "from-c.bin");
+        return ino && d_->filesystem().getattr(*ino)->size == data.size();
+    })) << "D never got the removed device's file";
+    auto got = read_file(d_->filesystem(), "from-c.bin");
+    ASSERT_TRUE(got);
+    EXPECT_TRUE(*got == data);
+    // Two adoptions of the same content are not a conflict.
+    drain([] { return false; }, 500ms);
+    auto entries = d_->filesystem().readdir(vfs::kRootIno);
+    ASSERT_TRUE(entries);
+    for (const auto& e : *entries) {
+        EXPECT_EQ(e.name.find(".sync-conflict-"), std::string::npos) << e.name;
+    }
 }
 
 }  // namespace

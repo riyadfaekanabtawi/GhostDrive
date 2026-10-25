@@ -39,11 +39,13 @@ struct ApplyOutcome {
 
 // Replicated metadata index backed by SQLite (WAL). Every change, local or remote, gets the next
 // local sequence number so peers can fetch only what changed since their last exchange.
-// Thread-safe: calls are serialized internally.
+// Local changes are signed with the device key; remote ones must carry a valid signature by the
+// device in their modified_by. Thread-safe: calls are serialized internally.
 class MetadataIndex {
 public:
-    static Result<MetadataIndex> open(const std::filesystem::path& db_path,
-                                      std::uint64_t local_device);
+    // `key` signs local changes and must outlive the index. The local device is its short ID.
+    static Result<MetadataIndex> open(const std::filesystem::path& db_path, const DriveId& drive,
+                                      const DeviceKey& key);
 
     MetadataIndex(MetadataIndex&&) noexcept;
     MetadataIndex& operator=(MetadataIndex&&) noexcept;
@@ -54,18 +56,29 @@ public:
     Result<std::uint64_t> max_sequence() const;
 
     Result<std::optional<FileRecord>> get(std::string_view path) const;
-    // Records with sequence > after, in sequence order, tombstones included.
-    Result<std::vector<FileRecord>> records_since(std::uint64_t after, std::size_t limit) const;
+    // Records with sequence > after, in sequence order, tombstones included. signed_only leaves
+    // out records stored unsigned before records were signed; only those may be sent to peers.
+    Result<std::vector<FileRecord>> records_since(std::uint64_t after, std::size_t limit,
+                                                  bool signed_only = false) const;
 
     // Records a change made on this device. Version, hlc, modified_by and sequence are assigned
     // here; the caller fills content fields.
     Result<FileRecord> commit_local(FileRecord record, HybridClock& clock);
     Result<FileRecord> delete_local(std::string_view path, HybridClock& clock);
+    // Rejects with invalid_argument a record that is malformed or not signed by a known signer
+    // that is not retired.
     Result<ApplyOutcome> apply_remote(const FileRecord& record, HybridClock& clock);
 
     // Pinned peers. Only pinned keys may connect; see docs/ARCHITECTURE.md section 7.
+    // Pinning also makes the key a signer, for good: a short ID stays bound to its first key.
     Status add_device(const PublicKey& key, std::string_view name);
     Status remove_device(const PublicKey& key);
+    // Stops accepting new records signed by `key` (a device removed from the drive) and adopts
+    // the stored records it signed: each is committed again unchanged by this device, so
+    // devices that never knew the key can still verify them. Returns how many were adopted.
+    Result<std::size_t> retire_signer(const PublicKey& key, HybridClock& clock);
+    // The device's key is known and not retired.
+    bool is_active_signer(std::uint64_t short_id) const;
     Result<bool> is_pinned(const PublicKey& key) const;
     Result<std::vector<DeviceRecord>> devices() const;
     Status set_peer_progress(const PublicKey& key, std::uint64_t peer_index_id,

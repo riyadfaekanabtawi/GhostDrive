@@ -39,7 +39,8 @@ protected:
     FileViewTest()
         : secret_(core::generate_drive_secret().value()),
           store_(core::ChunkStore::open(dir_.path() / "store", core::ChunkHasher(secret_)).value()),
-          index_(core::MetadataIndex::open(dir_.path() / "index.db", 0xA1).value()),
+          index_(
+              core::MetadataIndex::open(dir_.path() / "index.db", core::DriveId{}, key_).value()),
           cache_(64 * 1024 * 1024),
           fetcher_(io_.get_executor(), disk_.get_executor(), store_, index_, cache_, nullptr) {}
 
@@ -86,6 +87,7 @@ protected:
     asio::thread_pool disk_{2};
     core::DriveSecret secret_;
     core::ChunkStore store_;
+    core::DeviceKey key_ = core::DeviceKey::generate().value();
     core::MetadataIndex index_;
     core::ChunkCache cache_;
     Fetcher fetcher_;

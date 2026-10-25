@@ -81,7 +81,8 @@ protected:
           client_store_(
               core::ChunkStore::open(dir_.path() / "client-store", core::ChunkHasher(secret_))
                   .value()),
-          index_(core::MetadataIndex::open(dir_.path() / "client.db", 0xC1).value()),
+          index_(core::MetadataIndex::open(dir_.path() / "client.db", core::DriveId{}, client_key_)
+                     .value()),
           cache_(256 * 1024 * 1024) {}
 
     ~RemoteRead() override {

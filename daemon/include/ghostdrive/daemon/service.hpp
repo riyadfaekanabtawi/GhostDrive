@@ -185,6 +185,9 @@ private:
     std::map<core::PublicKey, int> member_connections_;
     // Every open member connection, including the second one when both sides dialed.
     std::set<std::shared_ptr<transport::Connection>> member_conns_;
+    // Connections that sent records by devices not pinned here yet. They are closed when a
+    // device is pinned, so the index is sent again on the next one.
+    std::set<std::shared_ptr<transport::Connection>> unknown_signer_conns_;
     // When each member was first seen as one, for countersign_after.
     std::map<core::PublicKey, std::chrono::steady_clock::time_point> member_since_;
     // When each device was first seen removed by a member, for the same delay.
