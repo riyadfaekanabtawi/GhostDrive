@@ -14,12 +14,14 @@
 #include <string>
 #ifdef GHOSTDRIVE_LAN_WINDNS
 #include <optional>
-#include <set>
 #include <utility>
 #include <vector>
 #endif
 
 #include "ghostdrive/core/result.hpp"
+#ifdef GHOSTDRIVE_LAN_WINDNS
+#include "ghostdrive/discovery/seen_names.hpp"
+#endif
 
 #ifdef GHOSTDRIVE_LAN_AVAHI
 struct AvahiAddress;
@@ -128,7 +130,7 @@ private:
     std::uint64_t registration_ = 0;
     Registration registration_state_ = Registration::gone;
     std::string registered_id_;
-    std::set<std::string> known_;  // advertisements resolved or being resolved
+    SeenNames seen_{256, std::chrono::minutes(3)};  // advertisements resolved recently
 #else
     DNSServiceRef main_ = nullptr;
     DNSServiceRef register_ = nullptr;

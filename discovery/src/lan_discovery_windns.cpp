@@ -43,7 +43,6 @@ constexpr int kMaxResolvesPerWindow = 32;  // per kRateWindow
 constexpr std::chrono::seconds kRateWindow{10};
 constexpr std::chrono::seconds kOpTimeout{10};
 constexpr std::chrono::seconds kRefreshEvery{60};
-constexpr std::size_t kMaxKnown = 256;     // advertisements remembered, so each resolves once
 constexpr std::size_t kMaxPerBrowse = 64;  // names taken from one browse callback
 constexpr std::size_t kMaxIdLength = 64;
 constexpr const wchar_t* kServiceDomain = L"_ghostdrive._udp.local";
@@ -59,6 +58,7 @@ struct Api {
     decltype(&DnsServiceBrowseCancel) browse_cancel = nullptr;
     decltype(&DnsServiceResolve) resolve = nullptr;
     decltype(&DnsServiceResolveCancel) resolve_cancel = nullptr;
+    decltype(&DnsFree) free_records = nullptr;  // what DnsRecordListFree expands to
     bool ok = false;
 };
 
@@ -73,7 +73,8 @@ bool load(HMODULE module, const char* name, F& out) {
 const Api& api() {
     static const Api loaded = [] {
         Api a;
-        // dnsapi.dll stays loaded for the life of the process (the import of DnsFree holds it).
+        // Only from System32, never through the default search order (nothing links
+        // dnsapi.lib). Never freed, so the functions stay valid for the life of the process.
         HMODULE module = ::LoadLibraryExW(L"dnsapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (module == nullptr) return a;
         a.ok = load(module, "DnsServiceConstructInstance", a.construct_instance) &&
@@ -84,7 +85,8 @@ const Api& api() {
                load(module, "DnsServiceBrowse", a.browse) &&
                load(module, "DnsServiceBrowseCancel", a.browse_cancel) &&
                load(module, "DnsServiceResolve", a.resolve) &&
-               load(module, "DnsServiceResolveCancel", a.resolve_cancel);
+               load(module, "DnsServiceResolveCancel", a.resolve_cancel) &&
+               load(module, "DnsFree", a.free_records);
         return a;
     }();
     return loaded;
@@ -185,16 +187,23 @@ struct Call {
 };
 
 // Process-wide, so a callback that arrives after its owner is gone still finds valid memory.
-// Destroyed at exit after every LanDiscovery is gone; dnsapi is done with all requests by then.
 struct Registry {
     std::mutex mutex;
     std::uint64_t next = 1;
     std::map<std::uint64_t, std::shared_ptr<Call>> calls;
 };
 
+// Never destroyed, so a callback that runs while the process exits never finds a destroyed
+// mutex or map.
+union ImmortalRegistry {
+    ImmortalRegistry() : value() {}
+    ~ImmortalRegistry() {}
+    Registry value;
+};
+
 Registry& registry() {
-    static Registry r;
-    return r;
+    static ImmortalRegistry r;
+    return r.value;
 }
 
 std::shared_ptr<Call> add_call(Call::Kind kind, asio::any_io_executor executor, LanDiscovery* owner,
@@ -235,7 +244,7 @@ VOID WINAPI browse_reply(DWORD status, PVOID context, PDNS_RECORD records) {
         auto name = narrow(r->Data.PTR.pNameHost);
         if (!name.empty()) names.emplace_back(std::move(name), r->dwTtl != 0);
     }
-    if (records != nullptr) DnsRecordListFree(records, DnsFreeRecordList);
+    if (records != nullptr) api().free_records(records, DnsFreeRecordList);  // DnsRecordListFree
 
     auto token = token_of(context);
     if (status == ERROR_CANCELLED) {
@@ -299,6 +308,13 @@ VOID WINAPI register_reply(DWORD status, PVOID context, PDNS_SERVICE_INSTANCE in
     auto it = r.calls.find(token);
     if (it == r.calls.end()) return;
     Call& call = *it->second;
+    if (call.deregistering && !call.registered && status == ERROR_SUCCESS) {
+        // The registration completed just as cancel_call began to cancel it. That cancel fails
+        // and cancel_call deregisters instead, so the Call, whose instance and request the
+        // deregistration uses, stays until the deregistration's own callback.
+        call.registered = true;
+        return;
+    }
     LanDiscovery::Registration state = LanDiscovery::Registration::failed;
     if (call.deregistering) {
         state = LanDiscovery::Registration::gone;
@@ -407,7 +423,6 @@ core::Status LanDiscovery::begin() {
 
     if (auto st = register_service(); !st) return st;
     auto browse = add_call(Call::Kind::browse, executor_, this, alive_);
-    calls_.push_back(browse->token);
     browse->query = kServiceDomain;
     browse->browse.Version = DNS_QUERY_REQUEST_VERSION1;
     browse->browse.InterfaceIndex = 0;  // every interface
@@ -418,13 +433,13 @@ core::Status LanDiscovery::begin() {
         erase_call(browse->token);
         return Error{Errc::io, "mDNS browse failed (" + std::to_string(err) + ")"};
     }
+    calls_.push_back(browse->token);
     refresh_id();
     return {};
 }
 
 core::Status LanDiscovery::register_service() {
     auto call = add_call(Call::Kind::registration, executor_, this, alive_);
-    calls_.push_back(call->token);
     const std::wstring full = widen(instance_) + L"." + kServiceDomain;
     const std::wstring id = widen(advertised_id_);
     PCWSTR keys[] = {L"v", L"id"};
@@ -448,6 +463,7 @@ core::Status LanDiscovery::register_service() {
         erase_call(call->token);
         return Error{Errc::io, "mDNS registration failed (" + std::to_string(err) + ")"};
     }
+    calls_.push_back(call->token);
     registration_ = call->token;
     registration_state_ = Registration::pending;
     registered_id_ = advertised_id_;
@@ -526,15 +542,15 @@ void LanDiscovery::on_register(std::uint64_t token, Registration state) {
 void LanDiscovery::on_browse(std::vector<std::pair<std::string, bool>> names) {
     for (auto& [name, added] : names) {
         if (!added) {
-            known_.erase(name);
+            seen_.forget(name);
             continue;
         }
         auto instance = instance_of(name);
         if (instance.empty() || instance == instance_) continue;  // not ours, or ourselves
-        if (known_.contains(name) || known_.size() >= kMaxKnown) continue;
+        auto now = std::chrono::steady_clock::now();
+        if (!seen_.due(name, now)) continue;
         expire_ops();
         if (ops_.size() >= kMaxOps) return;
-        auto now = std::chrono::steady_clock::now();
         if (now - window_start_ > kRateWindow) {
             window_start_ = now;
             window_count_ = 0;
@@ -560,7 +576,7 @@ void LanDiscovery::on_browse(std::vector<std::pair<std::string, bool>> names) {
         op->instance = std::move(instance);
         op->started = now;
         ops_.push_back(std::move(op));
-        known_.insert(name);
+        seen_.remember(name, now);
     }
 }
 
@@ -573,7 +589,7 @@ void LanDiscovery::on_resolve(std::uint64_t token, bool ok, std::string id, std:
     auto op = std::move(*it);
     ops_.erase(it);
     if (!ok || !address || id.empty() || id.size() > kMaxIdLength) {
-        known_.erase(op->name);  // a later announcement may try again
+        seen_.forget(op->name);  // a later announcement may try again
         return;
     }
     LanSighting sighting{op->instance, std::move(id), asio::ip::udp::endpoint(*address, port)};
@@ -587,7 +603,7 @@ void LanDiscovery::expire_ops() {
             ++it;
             continue;
         }
-        known_.erase((*it)->name);
+        seen_.forget((*it)->name);
         if (auto call = find_call((*it)->token)) cancel_call(call);
         std::erase(calls_, (*it)->token);
         it = ops_.erase(it);

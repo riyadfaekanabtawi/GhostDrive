@@ -47,9 +47,9 @@ if(GHOSTDRIVE_WINDNS_FOUND)
     target_sources(ghostdrive_discovery PRIVATE src/lan_discovery_windns.cpp)
     target_compile_definitions(ghostdrive_discovery
         PUBLIC GHOSTDRIVE_HAVE_LAN_DISCOVERY=1 GHOSTDRIVE_LAN_WINDNS=1)
-    # The DNS-SD functions are looked up at run time, so ghostdrived still starts on a Windows
-    # without them; dnsapi.lib provides DnsFree (DnsRecordListFree).
-    target_link_libraries(ghostdrive_discovery PRIVATE dnsapi)
+    # Not linked with dnsapi.lib: its functions are looked up at run time in dnsapi.dll from
+    # System32, so ghostdrived still starts on a Windows without them and never loads the DLL
+    # through the default search order.
     message(STATUS "LAN discovery: windns.h DNS-SD")
 elseif(AVAHI_CLIENT_FOUND)
     target_sources(ghostdrive_discovery PRIVATE src/lan_discovery_avahi.cpp)
