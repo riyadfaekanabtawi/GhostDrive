@@ -75,8 +75,19 @@ struct MenuContent: View {
             Button("Settings...") { model.openSettings() }
                 .keyboardShortcut(",")
         }
+        Divider()
+        Text(versionText)
         Button("Quit GhostDrive Menu") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")
+    }
+
+    // From the bundle's Info.plist (make-app.sh); `swift run` has no bundle version.
+    private var versionText: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+        if let version = version as? String, !version.isEmpty {
+            return "GhostDrive Menu \(version)"
+        }
+        return "GhostDrive Menu"
     }
 }
 

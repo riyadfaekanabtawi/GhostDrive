@@ -45,7 +45,7 @@ cmake --install "$build" --prefix "$stage/$name" --strip
 
 if [ "$os" = macos ]; then
     app="$(GHOSTDRIVE_BUILD_DIR="$build" GHOSTDRIVE_SWIFT_SCRATCH="$build/swift" \
-        "$root/macos/GhostDriveMenu/make-app.sh" release | tail -n 1)"
+        GHOSTDRIVE_VERSION="$version" "$root/macos/GhostDriveMenu/make-app.sh" release | tail -n 1)"
     cp -R "$app" "$stage/$name/"
     # Bundle the stripped programs rather than the build tree's, and sign the result again.
     bundled="$stage/$name/$(basename "$app")"
