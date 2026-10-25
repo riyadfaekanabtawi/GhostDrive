@@ -23,7 +23,7 @@ target_link_libraries(ghostdrive_daemon
 
 add_executable(ghostdrived ghostdrived.cpp)
 target_include_directories(ghostdrived PRIVATE src)
-target_link_libraries(ghostdrived PRIVATE ghostdrive::daemon ghostdrive_warnings)
+target_link_libraries(ghostdrived PRIVATE ghostdrive::daemon ghostdrive_version ghostdrive_warnings)
 if(TARGET ghostdrive_vfs_fuse)
     target_link_libraries(ghostdrived PRIVATE ghostdrive::vfs_fuse)
     target_compile_definitions(ghostdrived PRIVATE GHOSTDRIVE_HAVE_FUSE=1)
