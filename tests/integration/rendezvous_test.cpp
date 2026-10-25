@@ -400,6 +400,33 @@ protected:
         return to.received->size() == 1 && to.received->front() == frame;
     }
 
+    // `from` sends Connect for `peer`; waits for the server's answer.
+    bool ask(Probe& from, const core::PublicKey& peer) {
+        std::optional<bool> answered;
+        asio::co_spawn(
+            io_,
+            [&]() -> asio::awaitable<void> {
+                if (!co_await from.control->write(discovery::encode(discovery::Connect{peer}))) {
+                    answered = false;
+                    co_return;
+                }
+                for (;;) {
+                    auto reply = co_await wire::read_frame(*from.control, 64);
+                    if (!reply) break;
+                    if (reply.value().type != wire::FrameType::rendezvous_peer_at) continue;
+                    auto at = discovery::decode_peer_at(reply.value().payload);
+                    if (at && at.value().peer == peer) {
+                        answered = true;
+                        co_return;
+                    }
+                }
+                answered = false;
+            },
+            asio::detached);
+        drain([&] { return answered.has_value(); }, 5s);
+        return answered.value_or(false);
+    }
+
     static core::DriveSecret secret(std::uint8_t fill) {
         core::DriveSecret s{};
         s.fill(std::byte{fill});
@@ -516,12 +543,123 @@ TEST_F(RelayRules, TheServerForwardsOnlyWithinTheGroupRules) {
     EXPECT_TRUE(relays(y, x, 2));
     EXPECT_FALSE(relays(other, y, 3)) << "forwarded between groups";
     EXPECT_FALSE(relays(y, other, 4)) << "forwarded between groups";
+    ASSERT_TRUE(ask(looking, y.key));
     EXPECT_TRUE(relays(looking, y, 5));
     EXPECT_TRUE(relays(y, looking, 6));
     EXPECT_FALSE(relays(unregistered, y, 7)) << "forwarded for an unregistered client";
     EXPECT_FALSE(relays(y, unregistered, 8)) << "forwarded to an unregistered client";
     EXPECT_FALSE(relays(x, x, 9)) << "forwarded to the sender itself";
     for (auto* p : {&x, &y, &other, &looking, &unregistered}) p->close();
+}
+
+TEST_F(RelayRules, RelayFromAnUnaskedKeyInAHiddenGroupIsDropped) {
+    // A member hidden in an earlier group, and someone visible there who knows that key (a
+    // removed device): its frames would use up the member's receive budget.
+    auto earlier = secret(1);
+    auto current = secret(2);
+    auto member = open_probe(register_in(current, {earlier}));
+    auto intruder = open_probe(register_in(earlier));
+    ASSERT_TRUE(member.registered && intruder.registered);
+    auto dropped = server_->stats().dropped_datagrams;
+    EXPECT_FALSE(relays(intruder, member, 1)) << "forwarded to a hidden member that never asked";
+    EXPECT_FALSE(relays(member, intruder, 2));
+    EXPECT_EQ(server_->stats().dropped_datagrams, dropped + 2);
+    EXPECT_EQ(server_->stats().relayed_datagrams, 0u);
+    // Asking for the intruder does not let it ask for the member in its place.
+    ASSERT_TRUE(ask(intruder, member.key));
+    EXPECT_FALSE(relays(intruder, member, 3));
+    for (auto* p : {&member, &intruder}) p->close();
+}
+
+TEST_F(RelayRules, RelayWorksAfterTheHiddenSideAsks) {
+    auto earlier = secret(1);
+    auto current = secret(2);
+    auto member = open_probe(register_in(current, {earlier}));
+    auto laggard = open_probe(register_in(earlier));  // a member that missed the new key
+    auto other = open_probe(register_in(earlier));
+    ASSERT_TRUE(member.registered && laggard.registered && other.registered);
+    ASSERT_TRUE(ask(member, laggard.key));
+    // Both directions of one connection.
+    EXPECT_TRUE(relays(member, laggard, 1));
+    EXPECT_TRUE(relays(laggard, member, 2));
+    EXPECT_FALSE(relays(other, member, 3)) << "the ask let in another key";
+
+    // The ask survives a new Register, so relayed connections survive a change of key.
+    std::optional<bool> moved;
+    asio::co_spawn(
+        io_,
+        [&]() -> asio::awaitable<void> {
+            (void)co_await member.control->write(
+                discovery::encode(register_in(secret(3), {current, earlier})));
+            for (;;) {
+                auto reply = co_await wire::read_frame(*member.control, 64);
+                if (!reply) break;
+                if (reply.value().type == wire::FrameType::rendezvous_registered) {
+                    moved = true;
+                    co_return;
+                }
+            }
+            moved = false;
+        },
+        asio::detached);
+    ASSERT_TRUE(drain([&] { return moved.has_value(); }, 5s) && *moved);
+    EXPECT_TRUE(relays(laggard, member, 4));
+    EXPECT_TRUE(relays(member, laggard, 5));
+    for (auto* p : {&member, &laggard, &other}) p->close();
+}
+
+TEST_F(RelayRules, AskedKeysExpire) {
+    server_->stop();
+    rendezvous::ServerOptions options;
+    options.listen = asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0);
+    options.asked_ttl = 400ms;
+    server_ = rendezvous::Server::start(io_.get_executor(), *server_key_, options).value();
+
+    auto earlier = secret(1);
+    auto member = open_probe(register_in(secret(2), {earlier}));
+    auto laggard = open_probe(register_in(earlier));
+    ASSERT_TRUE(member.registered && laggard.registered);
+    ASSERT_TRUE(ask(member, laggard.key));
+    EXPECT_TRUE(relays(laggard, member, 1));
+    drain([] { return false; }, 600ms);
+    EXPECT_FALSE(relays(laggard, member, 2)) << "an old ask still let frames through";
+    EXPECT_FALSE(relays(member, laggard, 3));
+    // Asking again, as members do every rendezvous interval while relayed, renews it.
+    ASSERT_TRUE(ask(member, laggard.key));
+    EXPECT_TRUE(relays(laggard, member, 4));
+    for (auto* p : {&member, &laggard}) p->close();
+}
+
+TEST_F(RelayRules, AClientRemembersOnlyItsLatestAskedKeys) {
+    auto earlier = secret(1);
+    auto member = open_probe(register_in(secret(2), {earlier}));
+    auto laggard = open_probe(register_in(earlier));
+    ASSERT_TRUE(member.registered && laggard.registered);
+    ASSERT_TRUE(ask(member, laggard.key));
+    EXPECT_TRUE(relays(laggard, member, 1));
+    // 64 more keys push the first one out. The server answers only 30 Connect per 10 s but
+    // remembers every one, so the rest are only sent.
+    for (int i = 0; i < 28; ++i) {
+        ASSERT_TRUE(ask(member, core::DeviceKey::generate().value().public_key()));
+    }
+    std::optional<bool> sent;
+    asio::co_spawn(
+        io_,
+        [&]() -> asio::awaitable<void> {
+            for (int i = 28; i < 64; ++i) {
+                auto other = core::DeviceKey::generate().value().public_key();
+                if (!co_await member.control->write(discovery::encode(discovery::Connect{other}))) {
+                    sent = false;
+                    co_return;
+                }
+            }
+            sent = true;
+        },
+        asio::detached);
+    ASSERT_TRUE(drain([&] { return sent.has_value(); }, 5s) && *sent);
+    drain([] { return false; }, 500ms);
+    EXPECT_FALSE(relays(laggard, member, 2)) << "the oldest asked key was kept";
+    for (auto* p : {&member, &laggard}) p->close();
 }
 
 TEST_F(RelayRules, BudgetsCountWholeFramesPerSenderAndPerReceiver) {
