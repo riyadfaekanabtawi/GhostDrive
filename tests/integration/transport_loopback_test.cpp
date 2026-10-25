@@ -6,6 +6,7 @@
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
 #include <asio/io_context.hpp>
+#include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
 #include <chrono>
@@ -120,14 +121,17 @@ protected:
 
     void TearDown() override {
         // Let close packets and posted completions drain.
-        for (auto* ep : endpoints_) ep->close();
+        for (auto& weak : endpoints_) {
+            if (auto ep = weak.lock()) ep->close();
+        }
         io_.run_for(50ms);
     }
 
-    void track(Peer& peer) { endpoints_.push_back(peer.endpoint.get()); }
+    void track(Peer& peer) { endpoints_.push_back(peer.endpoint); }
 
     asio::io_context io_;
-    std::vector<Endpoint*> endpoints_;
+    // Weak: an endpoint the test body has let go of is already destroyed by TearDown.
+    std::vector<std::weak_ptr<Endpoint>> endpoints_;
 };
 
 awaitable<void> echo_stream(std::shared_ptr<Stream> stream) {
@@ -230,7 +234,7 @@ TEST_F(Loopback, ServerWithoutPinsAcceptsNobody) {
     EndpointOptions options;  // accept_peer left empty
     auto server = Endpoint::create(io_.get_executor(), key, options);
     ASSERT_TRUE(server);
-    endpoints_.push_back(server.value().get());
+    endpoints_.push_back(server.value());
 
     run(
         [&]() -> awaitable<void> {
@@ -254,7 +258,7 @@ TEST_F(Loopback, HandshakeLimitDropsNewInitials) {
     options.max_pending_handshakes = 0;
     auto server = Endpoint::create(io_.get_executor(), key, options);
     ASSERT_TRUE(server);
-    endpoints_.push_back(server.value().get());
+    endpoints_.push_back(server.value());
 
     run(
         [&]() -> awaitable<void> {
@@ -274,11 +278,11 @@ TEST_F(Loopback, ThrowingPinCheckRejects) {
     options.accept_peer = [](const core::PublicKey&) -> bool { throw std::runtime_error("boom"); };
     auto server = Endpoint::create(io_.get_executor(), key, options);
     ASSERT_TRUE(server);
-    endpoints_.push_back(server.value().get());
+    endpoints_.push_back(server.value());
 
     run([&]() -> awaitable<void> {
-        auto conn = co_await client.endpoint->connect(server.value()->local_endpoint(),
-                                                      key.public_key());
+        auto conn =
+            co_await client.endpoint->connect(server.value()->local_endpoint(), key.public_key());
         CO_ASSERT_TRUE(!conn);
         EXPECT_NE(conn.error().code, core::Errc::timeout) << conn.error().message;
     });
@@ -540,8 +544,8 @@ TEST_F(Loopback, DatagramFramesFlowOnlyWhenBothSidesEnableThem) {
     options.accept_peer = [client_public](const core::PublicKey& k) { return k == client_public; };
     options.accept_datagrams = true;
     auto server = Endpoint::create(io_.get_executor(), server_key, options).value();
-    endpoints_.push_back(client.get());
-    endpoints_.push_back(server.get());
+    endpoints_.push_back(client);
+    endpoints_.push_back(server);
 
     // The largest frame must fit in one packet of the connection.
     auto big = random_payload(Connection::kMaxDatagram, 7);
@@ -597,8 +601,8 @@ TEST_F(Loopback, AFloodOfDatagramsDoesNotStarveStreams) {
     options.accept_peer = [client_public](const core::PublicKey& k) { return k == client_public; };
     options.accept_datagrams = true;
     auto server = Endpoint::create(io_.get_executor(), server_key, options).value();
-    endpoints_.push_back(client.get());
-    endpoints_.push_back(server.get());
+    endpoints_.push_back(client);
+    endpoints_.push_back(server);
 
     auto payload = random_payload(512 * 1024, 8);
     // Shared with the flooding coroutine, which may outlive this test if the echo stalls.
@@ -611,8 +615,8 @@ TEST_F(Loopback, AFloodOfDatagramsDoesNotStarveStreams) {
     bool echoed = false;
     run({[&]() -> awaitable<void> { co_await echo_server(server, 1); },
          [&]() -> awaitable<void> {
-             auto conn = co_await client->connect(server->local_endpoint(),
-                                                  server_key.public_key(), {.datagrams = true});
+             auto conn = co_await client->connect(server->local_endpoint(), server_key.public_key(),
+                                                  {.datagrams = true});
              CO_ASSERT_OK(conn);
              // Keeps the frame queue full for as long as the echo runs.
              asio::co_spawn(
@@ -620,7 +624,14 @@ TEST_F(Loopback, AFloodOfDatagramsDoesNotStarveStreams) {
                  [flood, c = conn.value()]() -> awaitable<void> {
                      while (!flood->done) {
                          while (c->send_datagram(flood->frame)) ++flood->queued;
+#ifdef _WIN32
+                         // Windows timers tick every 15.6 ms, too coarse to keep the queue
+                         // full; yield to the executor instead.
+                         co_await asio::post(co_await asio::this_coro::executor,
+                                             asio::use_awaitable);
+#else
                          co_await sleep_for(1ms);
+#endif
                      }
                  },
                  asio::detached);
@@ -634,7 +645,8 @@ TEST_F(Loopback, AFloodOfDatagramsDoesNotStarveStreams) {
     EXPECT_TRUE(echoed) << "the stream starved behind DATAGRAM frames";
     // The queue was refilled throughout, so frames really competed with the stream: more were
     // queued than the 64 the queue holds at once, and more than the echo's own packets.
-    EXPECT_GT(flood->queued, 2 * payload.size() / Connection::kMaxDatagram) << "the flood was too thin";
+    EXPECT_GT(flood->queued, 2 * payload.size() / Connection::kMaxDatagram)
+        << "the flood was too thin";
 }
 
 // A relayed connection must authenticate the key behind its virtual address. A malicious
@@ -654,10 +666,12 @@ TEST_F(Loopback, ARelayedConnectionMustBeWithTheKeyOfItsVirtualAddress) {
     auto server_key = new_key();
     EndpointOptions server_options;
     std::set<core::PublicKey> clients{a_public, c_key.public_key()};
-    server_options.accept_peer = [clients](const core::PublicKey& k) { return clients.contains(k); };
+    server_options.accept_peer = [clients](const core::PublicKey& k) {
+        return clients.contains(k);
+    };
     server_options.accept_datagrams = true;
     auto server = Endpoint::create(io_.get_executor(), server_key, server_options).value();
-    for (auto* e : {a.get(), c.get(), server.get()}) endpoints_.push_back(e);
+    for (const auto& e : {a, c, server}) endpoints_.push_back(e);
 
     core::PublicKey claimed{};  // the source key the server puts on C's frames
     std::shared_ptr<Connection> at_a;

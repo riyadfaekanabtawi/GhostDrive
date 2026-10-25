@@ -4,9 +4,6 @@
 
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
-#include <asio/read.hpp>
-#include <asio/write.hpp>
-#include <iostream>
 #include <thread>
 
 #include "ghostdrive/core/file.hpp"
@@ -72,59 +69,6 @@ TEST_F(Control, RefusesASecondServer) {
     EXPECT_EQ(second.error().code, core::Errc::already_exists);
     EXPECT_TRUE(control_request(socket_, "ping"));
 }
-
-#ifdef _WIN32
-TEST(ControlDiag, Accept) {
-    test::TempDir dir;
-    using Local = asio::local::stream_protocol;
-    asio::io_context io;
-    Local::acceptor a(io);
-    std::error_code ec;
-    auto path = (dir.path() / "s").string();
-    a.open(Local(), ec);
-    std::cerr << "open " << ec.message() << "\n";
-    a.bind(Local::endpoint(path), ec);
-    std::cerr << "bind " << ec.message() << "\n";
-    a.listen(4, ec);
-    std::cerr << "listen " << ec.message() << "\n";
-    bool done = false;
-    std::error_code aec;
-    Local::socket server(io);
-    a.async_accept([&](const std::error_code& e, Local::socket s) {
-        aec = e;
-        done = true;
-        server = std::move(s);
-    });
-    Local::socket c(io);
-    c.connect(Local::endpoint(path), ec);
-    std::cerr << "connect " << ec.message() << "\n";
-    io.run_for(std::chrono::seconds(2));
-    std::cerr << "accept done " << done << " " << aec.message() << "\n";
-    if (done && !aec) {
-        std::error_code wec;
-        asio::write(c, asio::buffer(std::string("hi\n")), wec);
-        std::cerr << "write " << wec.message() << "\n";
-        char buf[3];
-        bool rdone = false;
-        std::error_code rec;
-        server.async_read_some(asio::buffer(buf), [&](const std::error_code& e, std::size_t n) {
-            rec = e;
-            rdone = true;
-            std::cerr << "read " << n << "\n";
-        });
-        io.restart();
-        io.run_for(std::chrono::seconds(2));
-        std::cerr << "read done " << rdone << " " << rec.message() << "\n";
-        server.shutdown(Local::socket::shutdown_both, rec);
-        std::cerr << "shutdown " << rec.message() << "\n";
-        server.close();
-        std::string rest;
-        asio::read(c, asio::dynamic_buffer(rest), rec);
-        std::cerr << "client eof " << rec.message() << "\n";
-    }
-    ADD_FAILURE() << "diagnostic";
-}
-#endif
 
 TEST_F(Control, NotRunning) {
     auto reply = control_request(socket_, "ping");
