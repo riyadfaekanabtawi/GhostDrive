@@ -13,7 +13,15 @@
 
 #include "ghostdrive/core/result.hpp"
 
+#ifdef GHOSTDRIVE_LAN_AVAHI
+struct AvahiAddress;
+struct AvahiClient;
+struct AvahiEntryGroup;
+struct AvahiServiceBrowser;
+struct AvahiStringList;
+#else
 typedef struct _DNSServiceRef_t* DNSServiceRef;
+#endif
 
 namespace ghostdrive::discovery {
 
@@ -27,7 +35,7 @@ struct LanSighting {
 };
 
 // Advertises this device and browses for others with DNS-SD over mDNS, through the system's
-// responder (mDNSResponder; Avahi's compatibility library lacks the API used). An advertisement
+// responder (mDNSResponder, or avahi-daemon through avahi-client on Linux). An advertisement
 // is only a hint: dialing it still pins the member's key, so a forged one costs one dial.
 // Use from one executor.
 class LanDiscovery {
@@ -55,15 +63,28 @@ public:
                  SightingHandler on_sighting);
 
     // Called from the C callbacks.
+#ifdef GHOSTDRIVE_LAN_AVAHI
+    void on_client_state(AvahiClient* client, int state);
+    void on_group_state(int state);
+    void on_browse(int interface, int protocol, int event, const char* name, const char* type,
+                   const char* domain, unsigned flags);
+    void on_resolve(Op* op, int event, const AvahiAddress* address, std::uint16_t port,
+                    AvahiStringList* txt);
+#else
     void on_browse(std::uint32_t flags, std::uint32_t interface, int error, const char* name,
                    const char* type, const char* domain);
     void on_resolve(Op* op, int error, const char* host, std::uint16_t port_be,
                     std::uint16_t txt_len, const unsigned char* txt);
     void on_address(Op* op, std::uint32_t flags, int error, const void* address);
+#endif
 
 private:
     core::Status begin();
+#ifdef GHOSTDRIVE_LAN_AVAHI
+    void add_service();
+#else
     void wait_readable();
+#endif
     void refresh_id();
     void finish(Op* op);
     void expire_ops();
@@ -75,10 +96,19 @@ private:
     std::string instance_;
     std::string advertised_id_;
 
+#ifdef GHOSTDRIVE_LAN_AVAHI
+    // Avahi's event loop, run on the executor (lan_discovery_avahi.cpp).
+    struct Poll;
+    std::unique_ptr<Poll> poll_;
+    AvahiClient* client_ = nullptr;
+    AvahiEntryGroup* group_ = nullptr;
+    AvahiServiceBrowser* browser_ = nullptr;
+#else
     DNSServiceRef main_ = nullptr;
     DNSServiceRef register_ = nullptr;
     DNSServiceRef browse_ = nullptr;
     asio::posix::stream_descriptor descriptor_;
+#endif
     asio::steady_timer refresh_timer_;
     std::list<std::unique_ptr<Op>> ops_;
 

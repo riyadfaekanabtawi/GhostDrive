@@ -222,10 +222,17 @@ document assumes the corrected version.
   each other; observers cannot track a device across epochs or learn its key. A forged
   advertisement only wastes one dial, because the TLS pin check rejects it. Announcements are
   rate-limited and the cache is capped.
-  As built in step (d): through the system DNS-SD API (mDNSResponder on macOS, or an
-  mDNSResponder libdns_sd on Linux; Avahi's compatibility library lacks shared connections and
-  DNSServiceGetAddrInfo, so Linux builds against it skip LAN discovery), one shared connection
-  driven by Asio. The TXT record is
+  As built in step (d): on macOS through the system DNS-SD API (mDNSResponder), one shared
+  connection driven by Asio. On Linux through avahi-daemon with avahi-client
+  (discovery/src/lan_discovery_avahi.cpp), whose event loop is an AvahiPoll implemented on Asio
+  (descriptor waits and steady timers on the executor, no extra thread); one entry group
+  advertises the service and its TXT record is updated in place, and one resolver per sighting
+  returns the TXT record and IPv4 address together. Avahi's DNS-SD compatibility library lacks
+  shared connections and DNSServiceGetAddrInfo, so it is not used; an mDNSResponder libdns_sd
+  is used when avahi-client is absent. Without avahi-client or libdns_sd at build time, or with
+  no responder running (avahi-daemon stopped), start() fails and the daemon carries on with
+  stored addresses and the rendezvous server. If the responder goes away later, discovery stops
+  until the daemon restarts. The TXT record is
   `v=1 id=<base32>`, where the ID is `HMAC-SHA256(drive_secret, "ghostdrive-lan-v1" || epoch
   || device key)` truncated to 12 bytes, with one-hour epochs; members check the neighbouring
   epochs too, for clock skew. A sighting updates the stored address and dials right away, in
