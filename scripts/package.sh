@@ -18,9 +18,21 @@ mkdir -p "$build"
 export VCPKG_DOWNLOADS
 mkdir -p "$VCPKG_DOWNLOADS"
 
+# On macOS, everything (dependencies, programs, menu-bar app) targets this version, so the
+# release runs on it and later rather than only on the build machine's macOS. 13 is the floor of
+# the menu-bar app (MenuBarExtra).
+osx_target=""
+if [ "$(uname -s)" = Darwin ]; then
+    : "${MACOSX_DEPLOYMENT_TARGET:=13.0}"
+    export MACOSX_DEPLOYMENT_TARGET
+    osx_target="$MACOSX_DEPLOYMENT_TARGET"
+fi
+
 cd "$root"
 cmake --preset release -DGHOSTDRIVE_BUILD_TESTS=OFF \
     "-DVCPKG_INSTALL_OPTIONS=--x-buildtrees-root=$build/vcpkg/buildtrees;--x-packages-root=$build/vcpkg/packages" \
+    ${osx_target:+"-DCMAKE_OSX_DEPLOYMENT_TARGET=$osx_target"} \
+    ${osx_target:+"-DVCPKG_OVERLAY_TRIPLETS=$root/packaging/vcpkg-triplets"} \
     "$@"
 cmake --build --preset release
 

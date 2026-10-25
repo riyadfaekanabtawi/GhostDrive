@@ -167,7 +167,8 @@ Mounting needs FUSE-T on macOS (`brew install --cask fuse-t`) and libfuse3 on Li
 
 Each [release](https://github.com/riyadfaekanabtawi/GhostDrive/releases) has
 `ghostdrive-<version>-<os>-<arch>.tar.gz` for macOS (arm64) and Linux (x86_64), with a
-`.sha256` file next to it.
+`.sha256` file next to it. The macOS build runs on macOS 13 or later (from 0.1.1; 0.1.0 may
+need the macOS version it was built on). On Linux it needs libfuse3 and avahi-client.
 
 ```
 shasum -a 256 -c ghostdrive-0.1.0-macos-arm64.tar.gz.sha256   # sha256sum -c on Linux
