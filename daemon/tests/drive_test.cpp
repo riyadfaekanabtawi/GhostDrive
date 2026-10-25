@@ -177,6 +177,48 @@ TEST(Drive, OpenRefusesADataDirectoryOthersCanRead) {
     EXPECT_EQ(opened.error().code, core::Errc::permission);
 }
 
+TEST(Drive, AnInvitersRetiredListDoesNotHoldBackAMember) {
+    test::TempDir dir;
+    auto inviter = Drive::create(dir.path() / "a", "desk");
+    ASSERT_TRUE(inviter);
+    auto& a = *inviter.value();
+    auto x_key = core::DeviceKey::generate().value();
+    const auto x = x_key.public_key();
+    // A malicious inviter calls member X retired and leaves out the entries adding it.
+    DriveInfo info;
+    info.drive_id = a.drive_id();
+    info.secret = a.secret();
+    info.members.push_back(Member{a.key().public_key(), "desk", ""});
+    info.membership = a.membership().entries();
+    info.retired_signers = {x};
+    auto joined = Drive::join(dir.path() / "b", "laptop", info, a.key().public_key());
+    ASSERT_TRUE(joined) << joined.error().message;
+    auto& b = *joined.value();
+    EXPECT_TRUE(b.index().is_retired_signer(core::short_id(x)));
+    EXPECT_FALSE(b.index().is_confirmed_retired(core::short_id(x)));
+
+    // X's membership reaches B; its records are then accepted.
+    ASSERT_TRUE(a.membership().add(a.key(), x, "x", false));
+    b.membership().merge(a.membership().entries());
+    ASSERT_TRUE(b.apply_membership());
+    ASSERT_TRUE(b.index().is_pinned(x).value());
+    EXPECT_FALSE(b.index().is_retired_signer(core::short_id(x)));
+    core::FileRecord r;
+    r.path = "from-x.txt";
+    r.modified_by = core::short_id(x);
+    r.version.bump(r.modified_by);
+    r.hlc = b.clock().now();
+    r.signature = x_key.sign(core::record_signed_bytes(b.drive_id(), r)).value();
+    auto applied = b.index().apply_remote(r, b.clock());
+    ASSERT_TRUE(applied) << applied.error().message;
+
+    // Reopened, it stays a signer.
+    joined.value().reset();
+    auto reopened = Drive::open(dir.path() / "b");
+    ASSERT_TRUE(reopened) << reopened.error().message;
+    EXPECT_TRUE(reopened.value()->index().is_active_signer(core::short_id(x)));
+}
+
 TEST(Drive, PinningADeviceLeavesOtherPeersProgressAlone) {
     test::TempDir dir;
     auto created = Drive::create(dir.path() / "a", "desk");

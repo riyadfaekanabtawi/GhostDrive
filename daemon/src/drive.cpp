@@ -283,11 +283,12 @@ core::Result<std::unique_ptr<Drive>> Drive::join(const std::filesystem::path& ro
     if (auto applied = d.apply_membership(); !applied) return applied.error();
     // The inviter's keys already account for the devices removed so far.
     auto view = d.membership().view();
-    // Its retired signers too, which the membership entries may no longer name. A device this
-    // device sees as a member is left alone.
+    // Its retired signers too, which the membership entries may no longer name. On the
+    // inviter's word only, so provisionally: they let adopted records be checked, and a device
+    // this one sees as a member, now or later, is not held to them.
     for (const auto& key : info.retired_signers) {
         if (view.members.contains(key) || key == d.key().public_key()) continue;
-        if (auto st = d.index().retire_signer(key); !st) return st.error();
+        if (auto st = d.index().retire_signer(key, true); !st) return st.error();
     }
     std::set<core::PublicKey> members;
     for (const auto& [k, name] : view.members) members.insert(k);
@@ -410,9 +411,9 @@ Status Drive::retire_removed(std::vector<core::PublicKey>* newly) {
     for (const auto& key : view.removed) {
         if (view.removal_pending.contains(key)) continue;
         const auto id = core::short_id(key);
-        if (index_.is_retired_signer(id)) continue;
+        if (index_.is_confirmed_retired(id)) continue;
         if (auto adopted = index_.retire_signer(key); !adopted) return adopted.error();
-        if (newly && index_.is_retired_signer(id)) newly->push_back(key);
+        if (newly && index_.is_confirmed_retired(id)) newly->push_back(key);
     }
     return {};
 }

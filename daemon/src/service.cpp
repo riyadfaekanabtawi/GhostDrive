@@ -33,6 +33,8 @@ using Udp = asio::ip::udp;
 namespace {
 
 constexpr std::size_t kBatchRecords = 256;
+// Devices remembered per connection whose pin or retirement closes it (pending records).
+constexpr std::size_t kMaxPendingIds = 64;
 // The first frame of any stream is small: a GetChunk, Hello or Join.
 constexpr std::uint32_t kMaxFirstFrame = 4096;
 constexpr std::uint32_t kMaxDriveInfo = 8 * 1024 * 1024;  // the largest membership log fits
@@ -694,8 +696,10 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
     if (!co_await stream->write(request)) co_return;
 
     // Progress on this stream never passes a record that may still become valid (its signer
-    // is not known yet), so the next connection sends it again.
+    // is not known yet), so the next connection sends it again. held names the devices those
+    // records wait for (bounded).
     std::optional<std::uint64_t> cap;
+    std::set<std::uint64_t> held;
     for (;;) {
         auto frame = co_await wire::read_frame(*stream);
         if (!*alive || !frame) co_return;
@@ -716,15 +720,22 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
         const auto now = std::chrono::steady_clock::now();
         // Such records hold this peer's progress back for pending_hold at most, so keys that
         // are never established here cannot make every connection resend them.
-        auto held = pending_since_.find(peer);
+        auto since = pending_since_.find(peer);
         const bool may_hold =
-            held == pending_since_.end() || now - held->second < options_.pending_hold;
+            since == pending_since_.end() || now - since->second < options_.pending_hold;
         auto applied = co_await detail::run_on(
-            disk_, [drive, fs, peer, hello, may_hold, &pending, &any_pending, &cap,
+            disk_, [drive, fs, peer, hello, may_hold, &pending, &any_pending, &cap, &held,
                     entries = std::move(entries).value()]() -> Status {
                 auto& index = drive->index();
                 std::uint64_t last = 0;
                 Status failure;
+                // Once the hold is over the stream stops holding back, for earlier batches too;
+                // what it held is remembered as skipped.
+                if (!may_hold && cap) {
+                    for (auto id : held) (void)index.note_skipped(peer, id);
+                    held.clear();
+                    cap.reset();
+                }
                 for (const auto& e : entries) {
                     // apply_remote validates the record (paths, block size, clocks) and its
                     // signature first.
@@ -735,6 +746,16 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
                             pending.insert(e.record.modified_by);
                             if (e.record.countersigner != 0) pending.insert(e.record.countersigner);
                             cap = std::min(cap.value_or(UINT64_MAX), e.record.sequence - 1);
+                            for (auto id : {e.record.modified_by, e.record.countersigner}) {
+                                if (id != 0 && held.size() < kMaxPendingIds) held.insert(id);
+                            }
+                        } else {
+                            // Skipped: remembered, so pinning or retiring the device fetches
+                            // this peer's index again.
+                            (void)index.note_skipped(peer, e.record.modified_by);
+                            if (e.record.countersigner != 0) {
+                                (void)index.note_skipped(peer, e.record.countersigner);
+                            }
                         }
                     } else if (!outcome && outcome.error().code != Errc::invalid_argument) {
                         // A database failure: stop here so the next exchange resends this record.
@@ -764,9 +785,11 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
                 return {};
             });
         if (!*alive) co_return;
-        if (!any_pending) {
+        if (!any_pending || pending.empty()) {
+            // Nothing held back now (none pending, or the hold ran out and they were skipped):
+            // the next pending record starts a new hold.
             pending_since_.erase(peer);
-        } else if (!pending.empty()) {
+        } else {
             pending_since_.emplace(peer, now);
             // One of those devices pinned or retired while the batch was applied may make the
             // records valid already; otherwise wait for that.
@@ -777,7 +800,12 @@ asio::awaitable<void> Service::receive_index(std::shared_ptr<transport::Connecti
             if (changed) {
                 conn->close();
             } else if (conn->is_open()) {
-                pending_conns_[conn].insert(pending.begin(), pending.end());
+                // Bounded, so a member naming random devices cannot grow it.
+                auto& ids = pending_conns_[conn];
+                for (auto id : pending) {
+                    if (ids.size() >= kMaxPendingIds) break;
+                    ids.insert(id);
+                }
             }
         }
         if (!applied) {
@@ -895,15 +923,27 @@ Status Service::refresh_membership(bool changed) {
     if (!applied.value().pinned.empty() || !applied.value().retired.empty()) {
         // Close only the connections that sent records naming one of these devices.
         ++signer_epoch_;
-        std::set<std::uint64_t> changed;
-        for (const auto& key : applied.value().pinned) changed.insert(core::short_id(key));
-        for (const auto& key : applied.value().retired) changed.insert(core::short_id(key));
-        for (auto id : changed) changed_at_[id] = signer_epoch_;
+        std::set<std::uint64_t> changed_ids;
+        for (const auto& key : applied.value().pinned) changed_ids.insert(core::short_id(key));
+        for (const auto& key : applied.value().retired) changed_ids.insert(core::short_id(key));
+        for (auto id : changed_ids) changed_at_[id] = signer_epoch_;
         std::vector<std::shared_ptr<transport::Connection>> stale;
         for (const auto& [conn, ids] : pending_conns_) {
             if (std::any_of(ids.begin(), ids.end(),
-                            [&](std::uint64_t id) { return changed.contains(id); })) {
+                            [&](std::uint64_t id) { return changed_ids.contains(id); })) {
                 stale.push_back(conn);
+            }
+        }
+        // Peers whose records naming these devices were skipped after the hold send their
+        // index again.
+        for (auto id : changed_ids) {
+            auto peers = drive_.index().take_skipped(id);
+            if (!peers) continue;
+            for (const auto& peer : peers.value()) {
+                (void)drive_.index().set_peer_progress(peer, 0, 0);
+                for (const auto& conn : member_conns_) {
+                    if (conn->peer_key() == peer) stale.push_back(conn);
+                }
             }
         }
         for (const auto& conn : stale) {
