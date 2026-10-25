@@ -352,11 +352,16 @@ int cmd_autostart(const Args& args) {
     if (!self) return fail("cannot find the path of the running ghostdrive binary");
     autostart::Spec spec;
     spec.daemon = self->parent_path() / "ghostdrived";
+    // In a build tree the two binaries sit in sibling directories (cli/ and daemon/).
+    if (auto built = self->parent_path().parent_path() / "daemon" / "ghostdrived";
+        ::access(spec.daemon.c_str(), X_OK) != 0 && ::access(built.c_str(), X_OK) == 0) {
+        spec.daemon = built;
+    }
     spec.data = data;
     spec.mount = absolute_path(args.mount);
     spec.log = data / "ghostdrived.log";
     if (::access(spec.daemon.c_str(), X_OK) != 0) {
-        return fail("ghostdrived is not next to ghostdrive (" + spec.daemon.string() + ")");
+        return fail("cannot find ghostdrived next to ghostdrive (" + spec.daemon.string() + ")");
     }
 #ifdef __APPLE__
     auto text = autostart::launch_agent_plist(label, spec);
