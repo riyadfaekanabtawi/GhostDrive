@@ -48,3 +48,22 @@ start_daemon_any_port() {
     done
     return $started
 }
+
+# On Windows the mountpoints go in the user's temp folder: mounting refuses parent folders that
+# other users could change, and the build tree may lie below one (on CI runners, D:\ lets all
+# users modify its folders). Only empty folders are created there; WinFsp removes each
+# mountpoint on unmount and cleanup_mount_parent removes the rest.
+case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*)
+        MNT="$(cygpath -u "$LOCALAPPDATA")/Temp/ghostdrive-e2e/$(basename "$WORK")"
+        MA="$MNT/mnt-a" MB="$MNT/mnt-b"
+        rmdir "$MA" "$MB" "$MNT" 2>/dev/null
+        ;;
+esac
+
+# Removes the folders made for the mountpoints above once the daemons have stopped. rmdir only
+# removes empty folders, so nothing on a drive that is still mounted is touched.
+cleanup_mount_parent() {
+    [ -n "${MNT:-}" ] && rmdir "$MNT" "$(dirname "$MNT")" 2>/dev/null
+    return 0
+}

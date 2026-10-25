@@ -34,7 +34,8 @@ endif()
 
 if(TARGET ghostdrive_vfs_winfsp)
     add_executable(ghostdrive_winfsp_tests winfsp_mount_test.cpp)
-    target_include_directories(ghostdrive_winfsp_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/tests)
+    target_include_directories(ghostdrive_winfsp_tests
+        PRIVATE ${PROJECT_SOURCE_DIR}/core/tests ${PROJECT_SOURCE_DIR}/vfs/src)
     target_link_libraries(ghostdrive_winfsp_tests
         PRIVATE
             ghostdrive::vfs_winfsp

@@ -24,7 +24,8 @@ struct WinFspMountOptions {
 // A WinFsp mount of a Filesystem (native FSP_FILE_SYSTEM_INTERFACE), read-only unless the
 // Filesystem has WriteSupport. The mountpoint is a drive letter ("X:") or a directory that does
 // not exist yet; WinFsp creates it and removes it on unmount, and missing parents are created
-// owner-only. Files still open at unmount have their writes committed.
+// owner-only. Existing parents that another user could rename or change are refused with
+// Errc::permission. Files still open at unmount have their writes committed.
 // Only the current user can open anything in it. mount() fails with Errc::not_found when WinFsp
 // is not installed.
 class WinFspMount {

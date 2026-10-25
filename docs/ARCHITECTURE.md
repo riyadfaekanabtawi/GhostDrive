@@ -670,8 +670,18 @@ As built after step (c), before discovery (ahead of the planned order so the dri
     only in case (possible from POSIX devices), only the first in the Tree's order (UTF-8 byte
     order, `Report.txt` before `report.txt`) is listed, and every spelling, including the exact
     name of a hidden one, resolves to it; the others stay on the drive but are unreachable from
-    Windows. Names are compared by their file-system uppercase (`LCMapStringEx` with
-    `LCMAP_UPPERCASE` and no linguistic casing). New names with
+    Windows. Saving to the exact name of a hidden variant therefore writes to the visible one:
+    on Windows, saving `report.txt` overwrites what POSIX devices see as `Report.txt`, and
+    `report.txt` stays as it was. Names are compared by their file-system uppercase
+    (`LCMapStringEx` with `LCMAP_UPPERCASE` and no linguistic casing); if that mapping fails,
+    the name matches nothing (lookups report it missing, new names are refused as invalid, and
+    entries whose names fail are not listed), since the raw name would no longer compare the
+    way the kernel does. Names are resolved again on every open, so while a file is open a
+    rename from another device, or a new case variant that sorts before it, can make the same
+    name lead to a different file (inode) than the open handle. The handle keeps reading and
+    writing the file it opened, and its delete-on-close or rename, which check the inode, does
+    nothing or fails with `STATUS_OBJECT_NAME_NOT_FOUND`; the next open of that name gets the
+    other file. New names with
     control characters, `<>:"/\|?*`, a trailing dot or space, or a device name (`CON`, `NUL`,
     `COM1`, ...) are refused with `STATUS_OBJECT_NAME_INVALID`; existing names like that, from
     other platforms, are left out of listings. Names are converted strictly between UTF-16 and
@@ -682,9 +692,22 @@ As built after step (c), before discovery (ahead of the planned order so the dri
     anything. `SetSecurity` is not implemented.
   - *Mountpoint.* A drive letter, or a directory that does not exist: anything already at the
     path (a directory, even an empty one, a junction, a file) is the user's and mounting
-    refuses it. WinFsp creates the directory and removes it on unmount; missing parents are
-    created owner-only (`core::make_private_dir`), existing ones are not checked. A mount that
-    would contain the data directory is refused.
+    refuses it. WinFsp creates the directory and removes it on unmount. Every existing ancestor,
+    up to the drive or share root, is opened by handle without following reparse points
+    (`FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`) and must be a plain directory
+    owned by the user, SYSTEM, Administrators or TrustedInstaller whose DACL grants no one else
+    (allow entries that apply to the directory itself; deny entries are not credited, and
+    object or callback entries are refused) any of `DELETE`, `FILE_DELETE_CHILD`, `WRITE_DAC`,
+    `WRITE_OWNER`, `FILE_WRITE_DATA`, `FILE_WRITE_ATTRIBUTES`, `FILE_WRITE_EA`,
+    `GENERIC_WRITE` or `GENERIC_ALL`. Otherwise another user could rename an ancestor away and
+    put their own directory (or a junction) in its place, so that the missing parents, or files
+    saved to the path while the drive is not mounted, land where they choose. The right to add
+    entries is allowed (`C:\` grants `FILE_ADD_SUBDIRECTORY` to all authenticated users): a
+    component created by someone else first only makes the mount fail. Missing parents are
+    then created from the top down with `CreateDirectoryW` and an owner-only, inheritable
+    security descriptor, so none is accessible to anyone else even briefly, and one that
+    appears in the meantime is refused. A mount that would contain the data directory is
+    refused.
   - *Not handled.* Named streams, extended attributes, reparse points and hard links are not
     supported; file attributes other than read-only are not stored. Case-insensitive lookups
     scan the directory.
