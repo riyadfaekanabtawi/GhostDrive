@@ -49,7 +49,8 @@ inline void append_json_string(std::string& out, std::string_view text) {
 }
 
 // The `ghostdrive status --json` text: one JSON object and a newline. An empty `mountpoint`
-// (not mounted) and an absent rendezvous server or observed address are encoded as null.
+// (not mounted) and an absent rendezvous server, observed address or admission ID are encoded
+// as null.
 inline std::string format_status_json(const ServiceStatus& status, const std::string& mountpoint) {
     std::string out = "{";
     auto key = [&](std::string_view name) {
@@ -98,6 +99,26 @@ inline std::string format_status_json(const ServiceStatus& status, const std::st
 
     string_or_null("removed_by", status.removed_by);
     string_or_null("discovery_error", status.discovery_error);
+
+    key("admission");
+    if (status.admission.empty()) {
+        out += "null";
+    } else {
+        out += '{';
+        key("id");
+        append_json_string(out, status.admission);
+        key("generation");
+        out += std::to_string(status.admission_generation);
+        key("earlier");
+        out += '[';
+        for (const auto& id : status.earlier_admissions) {
+            if (out.back() != '[') out += ',';
+            append_json_string(out, id);
+        }
+        out += ']';
+        boolean("members_caught_up", status.members_caught_up);
+        out += '}';
+    }
 
     key("peers");
     out += '[';

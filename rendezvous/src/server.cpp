@@ -17,7 +17,8 @@ using Udp = asio::ip::udp;
 
 namespace {
 
-constexpr std::uint32_t kMaxControlFrame = 256;  // a Register with every hidden group
+// A Register with every admission ID and hidden group.
+constexpr std::uint32_t kMaxControlFrame = 512;
 // Frames waiting for a client that does not read; beyond this they are dropped, not buffered.
 constexpr std::size_t kMaxOutbox = 64;
 constexpr std::chrono::seconds kRegisterTimeout{10};
@@ -275,7 +276,10 @@ void Server::drop(const std::shared_ptr<Client>& client) {
 }
 
 bool Server::admits(const discovery::Register& reg) {
-    if (!options_.allowed_groups.empty() && !options_.allowed_groups.contains(reg.admission)) {
+    const auto& allowed = options_.allowed_groups;
+    if (!allowed.empty() &&
+        std::none_of(reg.admissions.begin(), reg.admissions.end(),
+                     [&](const discovery::GroupId& id) { return allowed.contains(id); })) {
         return false;
     }
     // Only the group a client can be found in counts: anyone who knows an earlier group could

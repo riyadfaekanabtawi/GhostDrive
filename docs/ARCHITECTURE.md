@@ -345,18 +345,35 @@ document assumes the corrected version.
     While a connection also has stream data to send, packets alternate strictly between
     frames and stream data, with the turn kept across sending rounds, so relayed traffic
     cannot starve the control stream even when congestion control allows one packet a round. `--allow-group HEX`
-    restricts the server to the operator's own drives; `ghostdrive status` shows the group.
+    restricts the server to the operator's own drives; `ghostdrive status` shows their
+    admission IDs (below).
   - Daemons act on a `PeerAt` for one peer at most every 2 s and run at most 32 dials at once,
     so even a malicious server cannot turn them into amplifiers. Probes carry no key. Active
     migration is disabled on every connection.
   - The group ID is a bearer credential, so since section 3.7 it is derived from the drive's
-    current discovery key, which a removed device does not get. `Register` also carries an
-    admission ID, the group of the drive secret, which never changes: `--allow-group` is
-    checked against it (a 32-byte `Register` from an older client is its own admission ID).
-    A removed device can still be admitted by such a server, but only to a group no member
-    is in. The admission ID is the same value as the group before section 3.7, so existing
-    allow lists keep working; it is also a stable drive identifier that a removed device can
-    compute, so a server operator working with one could still link the drive's groups.
+    current discovery key, which a removed device does not get. `Register` also carries
+    admission IDs, which `--allow-group` is checked against: the client is admitted if any
+    one it lists is on the list. The admission ID of a discovery key of generation 1 or higher
+    is `HMAC-SHA256(key, "ghostdrive-rendezvous-admission-v1")`, so it rotates with the key
+    and differs from the group (an operator who knows it cannot join the group). Generation 0
+    keeps `HMAC-SHA256(drive_secret, "ghostdrive-rendezvous-group-v1")`, the value allow lists
+    held before IDs rotated (and the group before section 3.7). A device lists the current
+    key's ID, then those of its earlier keys (section 3.7), then generation 0's, at most 5.
+  - `Register` is `group | count u8 | admission IDs | count u8 | hidden groups`. Servers also
+    take the forms older clients send, told apart by length modulo 32: a bare 32-byte group,
+    which is its own admission ID, and `group | admission | count u8 | hidden groups`. Older
+    servers take only those, so a device whose `Register` gets no `Registered` tries the
+    other form on its next connection (the older one carries generation 0's ID only).
+  - Operator story. Existing allow lists hold generation 0's ID, which every device still
+    sends, so they keep working. After a device is removed, the members move to a new key;
+    `ghostdrive status` on a member shows `Admission: <hex> (generation g)` and the earlier
+    IDs, and the operator adds the new ID. Once the status says that all members have the
+    current key (every member has sent this device a key at or above the current one since
+    the daemon started), the earlier IDs can be dropped; from then on the removed device,
+    which only has those, is refused. A member that has not caught up is refused too after
+    the drop, and has to catch up on the LAN or at a stored address. Until the old IDs are
+    dropped, a removed device can still be admitted, but only to groups no member is visible
+    in, and generation 0's ID stays a drive identifier it can compute.
   - `Register` also lists up to 4 hidden groups, where the client may `Connect` to others but
     is never found itself. Only the visible group counts toward the 256 per group, since anyone
     who knows an earlier key could fill its group.
@@ -566,7 +583,9 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   in the new group, and updates its LAN advertisement. The last 3 keys that were current here,
   and the drive secret, are kept as earlier keys. The daemon is hidden in their groups (see
   section 3.5), so it finds a member that missed the change while a removed device that knows
-  those keys cannot find it there.
+  those keys cannot find it there. The `Register` lists the admission IDs of the current key,
+  the earlier ones and generation 0 (section 3.5), so an allow list that holds any of them
+  still admits it, and `ghostdrive status` shows them with whether every member has caught up.
 - LAN sightings are matched against the current key first, then every other key held. A match
   on an older key may be a member that has not caught up, or a removed device posing as one
   (it knows the drive secret and every member's public key). Such a match only leads to a
@@ -587,6 +606,10 @@ As built after step (c), before discovery (ahead of the planned order so the dri
   there by it until it catches up. A removed device can still make members on its LAN dial it
   by posing as a member that has not sent a newer key since the daemon started, which tells
   it that the dialing host belongs to the drive.
+- Follow-up: the drive secret stays an earlier key for good, so members stay hidden in its
+  group and keep listing generation 0's admission ID. Dropping it once a key of generation 1
+  or higher has been current for 30 days would need that time saved with the keys (the
+  `discovery` file has no field for it) and is not built.
 
 ### 3.8 Windows (phase 1: builds and passes the tests; phase 2: WinFsp mount)
 - **Toolchain.** clang-cl with Ninja and the `x64-windows` vcpkg triplet (preset `windows`, CI
@@ -916,7 +939,12 @@ Revocation:
    device never receives, so it can no longer recognise their LAN announcements or meet them
    in a rendezvous group (built; section 3.7).
 3. The drive secret itself is not replaced: it still keys chunk IDs, which only travel inside
-   member connections, so the removed device learns nothing new from knowing it.
+   member connections, so the removed device learns nothing new from knowing it. A rendezvous
+   server with an allow list admits the removed device while the list holds an admission ID
+   it can compute (generation 0's, or an earlier key's), though only to groups no member is
+   visible in. Existing lists keep working; after a removal the operator adds the new ID that
+   `ghostdrive status` shows, and drops the old ones once it says all members have the
+   current key (section 3.5).
 
 ## 8. Failure modes
 
