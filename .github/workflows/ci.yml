@@ -269,15 +269,8 @@ jobs:
         working-directory: windows/GhostDriveApp
         run: dotnet test GhostDriveApp.Core.Tests -c Release
 
-      - name: Build the app
-        working-directory: windows/GhostDriveApp
-        run: |
-          dotnet publish GhostDriveApp -c Release -o "$env:RUNNER_TEMP\GhostDriveApp"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $files = Get-ChildItem -Recurse -File "$env:RUNNER_TEMP\GhostDriveApp"
-          "{0} files, {1:N1} MB" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB)
-
       - name: Measure publish variants (temporary)
+        continue-on-error: true
         working-directory: windows/GhostDriveApp
         run: |
           $variants = [ordered]@{
@@ -296,6 +289,14 @@ jobs:
             "{0}: {1} files, {2:N1} MB, zipped {3:N1} MB" -f $v.Key, $files.Count,
               (($files | Measure-Object Length -Sum).Sum / 1MB), ((Get-Item "$out.zip").Length / 1MB)
           }
+
+      - name: Build the app
+        working-directory: windows/GhostDriveApp
+        run: |
+          dotnet publish GhostDriveApp -c Release -o "$env:RUNNER_TEMP\GhostDriveApp"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $files = Get-ChildItem -Recurse -File "$env:RUNNER_TEMP\GhostDriveApp"
+          "{0} files, {1:N1} MB" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB)
 
       # ghostdrive.exe and ghostdrived.exe for the UI check, from the windows preset with the
       # vcpkg tree the windows job caches (restored only; that job saves it).

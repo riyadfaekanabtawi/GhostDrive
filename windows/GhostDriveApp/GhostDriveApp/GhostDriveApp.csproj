@@ -29,6 +29,8 @@
          and with TreatWarningsAsErrors any trim warning fails the build. -->
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <PublishTrimmed>true</PublishTrimmed>
+    <TrimmerSingleWarn>false</TrimmerSingleWarn>
+    <WindowsSdkPackageVersion>10.0.19041.87</WindowsSdkPackageVersion>
   </PropertyGroup>
 
   <ItemGroup>
