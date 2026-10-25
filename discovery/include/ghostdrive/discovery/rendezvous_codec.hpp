@@ -15,8 +15,8 @@
 // The rendezvous control stream, between a device and its rendezvous server (ARCHITECTURE.md
 // section 3.5). The device opens one stream and sends Register; the server answers Registered
 // with the address it sees. A later Register on the same stream moves the device to other
-// groups, keeping its relay token. The device asks for peers with Connect; the server answers
-// PeerAt to both sides, so both can start hole punching at once.
+// groups, keeping its connection and so its relayed connections. The device asks for peers with
+// Connect; the server answers PeerAt to both sides, so both can start hole punching at once.
 namespace ghostdrive::discovery {
 
 inline constexpr std::size_t kGroupIdSize = 32;
@@ -38,14 +38,9 @@ struct Register {
     std::vector<GroupId> hidden;
 };
 inline constexpr std::size_t kMaxHiddenGroups = 4;
-inline constexpr std::size_t kRelayTokenSize = 16;
-using RelayToken = std::array<std::byte, kRelayTokenSize>;
 
 struct Registered {
     asio::ip::udp::endpoint observed;
-    // Random per registration; carried in every relay datagram so the server knows the sender
-    // without trusting the (spoofable) source address, and the client knows the server sent it.
-    RelayToken relay_token{};
 };
 struct Connect {
     core::PublicKey peer{};

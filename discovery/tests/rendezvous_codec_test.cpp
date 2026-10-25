@@ -54,5 +54,17 @@ TEST(RendezvousCodec, MalformedRegistersAreRejected) {
     EXPECT_EQ(capped.value().hidden.size(), kMaxHiddenGroups);
 }
 
+TEST(RendezvousCodec, RegisteredCarriesOnlyTheObservedAddress) {
+    asio::ip::udp::endpoint observed(asio::ip::make_address("192.0.2.7"), 4242);
+    auto frame = encode(Registered{observed});
+    auto decoded = decode_registered(payload_of(frame));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded.value().observed, observed);
+    // The 16-byte relay token that used to follow is gone; trailing bytes are malformed.
+    core::Bytes longer(payload_of(frame).begin(), payload_of(frame).end());
+    longer.resize(longer.size() + 16);
+    EXPECT_FALSE(decode_registered(longer));
+}
+
 }  // namespace
 }  // namespace ghostdrive::discovery

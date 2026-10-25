@@ -118,8 +118,14 @@ private:
 // Who a connection is allowed to talk to. Peers are authenticated only by pinned Ed25519 keys.
 using PinCheck = std::function<bool(const core::PublicKey&)>;
 
-inline constexpr std::size_t kRelayTokenSize = 16;
-using RelayToken = std::array<std::byte, kRelayTokenSize>;
+// Relay frames are QUIC DATAGRAM frames (RFC 9221) on the authenticated connection to the
+// rendezvous server: a 32-byte peer key (the destination when a client sends, the source when
+// the server delivers), then one QUIC packet of the relayed connection. Relayed connections send
+// packets of at most kMaxRelayedPacket bytes so a frame always fits in one packet of the server
+// connection (ARCHITECTURE.md section 3.5).
+inline constexpr std::size_t kRelayKeySize = 32;
+inline constexpr std::size_t kMaxRelayedPacket = 1280;
+inline constexpr std::size_t kMaxRelayFrame = kRelayKeySize + kMaxRelayedPacket;
 
 struct EndpointOptions {
     Udp::endpoint bind{asio::ip::address_v4::loopback(), 0};
@@ -138,7 +144,14 @@ struct EndpointOptions {
     // when the client returns the token, proving it receives at its address (RFC 9000 8.1).
     // Stops spoofed Initials from filling handshake slots or reflecting handshakes.
     bool require_address_validation = false;
+    // Incoming connections accept and may send DATAGRAM frames (the rendezvous server).
+    bool accept_datagrams = false;
     Impairment impairment{};
+};
+
+struct ConnectOptions {
+    // Negotiate DATAGRAM frames (RFC 9221), as the connection to a rendezvous server does.
+    bool datagrams = false;
 };
 
 // A QUIC connection to one authenticated peer. Not thread-safe: use it only from the
@@ -165,6 +178,16 @@ public:
     // Sends CONNECTION_CLOSE and fails all pending operations with Errc::closed.
     void close(std::uint64_t app_error_code = 0);
 
+    // DATAGRAM frames, on connections made with ConnectOptions::datagrams or
+    // EndpointOptions::accept_datagrams. The handler runs once ngtcp2 has returned, never inside
+    // its callbacks, and only after the handshake.
+    using DatagramHandler = std::function<void(core::Bytes datagram)>;
+    void set_datagram_handler(DatagramHandler handler) { datagram_handler_ = std::move(handler); }
+    // Queues one DATAGRAM frame, sent when congestion control allows. Returns false if it was
+    // dropped instead: datagrams are off, it is larger than kMaxDatagram, or the queue is full.
+    bool send_datagram(core::Bytes datagram);
+    static constexpr std::size_t kMaxDatagram = kMaxRelayFrame;
+
 private:
     friend class Endpoint;
     friend class Stream;
@@ -177,7 +200,7 @@ private:
 
     static Result<std::shared_ptr<Connection>> create_client(
         const std::shared_ptr<Endpoint>& endpoint, const Udp::endpoint& remote,
-        const core::PublicKey& expected_peer);
+        const core::PublicKey& expected_peer, ConnectOptions options);
     // `original_dcid` is set when the Initial carried a valid Retry token; it is the DCID the
     // client used before the Retry.
     static Result<std::shared_ptr<Connection>> create_server(
@@ -207,6 +230,8 @@ private:
 
     bool authorize(const core::PublicKey& key) const;
     Status check_peer_certificate();
+
+    void deliver_datagrams();
 
     void start_open_stream(StreamHandler handler);
     void start_accept_stream(StreamHandler handler);
@@ -241,6 +266,11 @@ private:
     bool streams_credit_ = false;
     std::optional<core::Error> callback_error_;
 
+    bool datagrams_ = false;
+    std::deque<core::Bytes> rx_datagrams_;  // received, not yet handed to the handler
+    std::deque<core::Bytes> tx_datagrams_;  // queued for sending
+    DatagramHandler datagram_handler_;
+
     // Pending close: either a library error code or an application error code.
     int close_liberr_ = 0;
     std::uint64_t close_app_code_ = 0;
@@ -271,22 +301,23 @@ public:
 
     // Dials `remote` and completes after a handshake in which the peer proved `peer_key`.
     asio::awaitable<Result<std::shared_ptr<Connection>>> connect(Udp::endpoint remote,
-                                                                 core::PublicKey peer_key);
+                                                                 core::PublicKey peer_key,
+                                                                 ConnectOptions options = {});
     // Waits for an incoming connection whose peer passed EndpointOptions::accept_peer.
     asio::awaitable<Result<std::shared_ptr<Connection>>> accept();
 
-    // Receives datagrams that start with kDatagramMagic (probes, relay frames).
+    // Receives datagrams that start with kDatagramMagic (hole-punching probes).
     void set_datagram_handler(DatagramHandler handler) { datagram_handler_ = std::move(handler); }
     // Sends a raw datagram on the shared socket. Subject to the impairment shim.
     void send_datagram(std::span<const std::byte> datagram, const Udp::endpoint& to);
 
     // Relaying through a rendezvous server. Each relayed peer gets a virtual address (in the
     // unrouted 198.18.0.0/15 range); QUIC dials and talks to it like any address, and the
-    // endpoint wraps those packets into relay datagrams to `server` and unwraps the replies.
-    // `token` is this client's registration token, carried in every relay datagram both ways,
-    // so neither end accepts a relay datagram from someone who merely spoofs an address.
-    // Relayed packets are accepted only from keys `allowed` returns true for.
-    void set_relay(Udp::endpoint server, RelayToken token, PinCheck allowed);
+    // endpoint carries those packets as relay frames on `server`, a connection to the
+    // rendezvous server made with datagrams enabled, and hands received frames to QUIC as
+    // coming from the source's virtual address. Relayed packets are accepted only from keys
+    // `allowed` returns true for.
+    void set_relay(const std::shared_ptr<Connection>& server, PinCheck allowed);
     void clear_relay();
     // The virtual address of a relayed peer; nullopt once the table is full.
     std::optional<Udp::endpoint> relay_address(const core::PublicKey& peer);
@@ -316,10 +347,11 @@ private:
     void start_receive();
     void on_receive(std::size_t length);
     void route_quic(std::span<const std::uint8_t> packet, const Udp::endpoint& from);
+    void on_relay_frame(std::span<const std::byte> frame);
     void send_retry(std::span<const std::uint8_t> packet, const Udp::endpoint& to);
 
     void start_connect(ConnectionHandler handler, const Udp::endpoint& remote,
-                       const core::PublicKey& peer_key);
+                       const core::PublicKey& peer_key, ConnectOptions options);
     void start_accept(ConnectionHandler handler);
     void on_established(const std::shared_ptr<Connection>& conn);
 
@@ -342,8 +374,7 @@ private:
     std::deque<std::shared_ptr<Connection>> accepted_;
     ConnectionHandler accept_handler_;
     DatagramHandler datagram_handler_;
-    std::optional<Udp::endpoint> relay_server_;
-    RelayToken relay_token_{};
+    std::weak_ptr<Connection> relay_;
     PinCheck relay_allowed_;
     std::map<core::PublicKey, Udp::endpoint> relay_address_;
     std::map<Udp::endpoint, core::PublicKey> relay_peer_;

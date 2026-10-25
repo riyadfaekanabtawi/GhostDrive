@@ -531,5 +531,62 @@ TEST_F(Loopback, MagicDatagramsReachTheDatagramHandler) {
     });
 }
 
+TEST_F(Loopback, DatagramFramesFlowOnlyWhenBothSidesEnableThem) {
+    auto client_key = new_key();
+    auto client = Endpoint::create(io_.get_executor(), client_key, {}).value();
+    auto server_key = new_key();
+    EndpointOptions options;
+    auto client_public = client_key.public_key();
+    options.accept_peer = [client_public](const core::PublicKey& k) { return k == client_public; };
+    options.accept_datagrams = true;
+    auto server = Endpoint::create(io_.get_executor(), server_key, options).value();
+    endpoints_.push_back(client.get());
+    endpoints_.push_back(server.get());
+
+    // The largest frame must fit in one packet of the connection.
+    auto big = random_payload(Connection::kMaxDatagram, 7);
+    run([&]() -> awaitable<void> {
+        auto plain = co_await client->connect(server->local_endpoint(), server_key.public_key());
+        CO_ASSERT_OK(plain);
+        auto plain_accepted = co_await server->accept();
+        CO_ASSERT_OK(plain_accepted);
+        EXPECT_FALSE(plain.value()->send_datagram(core::Bytes(10)))
+            << "a connection made without datagrams sent one";
+
+        auto conn = co_await client->connect(server->local_endpoint(), server_key.public_key(),
+                                             {.datagrams = true});
+        CO_ASSERT_OK(conn);
+        auto accepted = co_await server->accept();
+        CO_ASSERT_OK(accepted);
+        core::Bytes at_server;
+        accepted.value()->set_datagram_handler([&](core::Bytes d) { at_server = std::move(d); });
+        core::Bytes at_client;
+        conn.value()->set_datagram_handler([&](core::Bytes d) { at_client = std::move(d); });
+        core::Bytes at_plain;
+        plain.value()->set_datagram_handler([&](core::Bytes d) { at_plain = std::move(d); });
+
+        EXPECT_FALSE(conn.value()->send_datagram(core::Bytes(Connection::kMaxDatagram + 1)));
+        // Datagrams are unreliable; resend until one arrives.
+        for (int i = 0; i < 50 && at_server.empty(); ++i) {
+            EXPECT_TRUE(conn.value()->send_datagram(big));
+            co_await sleep_for(20ms);
+        }
+        EXPECT_TRUE(at_server == big);
+        for (int i = 0; i < 50 && at_client.empty(); ++i) {
+            EXPECT_TRUE(accepted.value()->send_datagram(big));
+            // The peer of this one never enabled datagrams, so the frame is discarded unsent.
+            (void)plain_accepted.value()->send_datagram(big);
+            co_await sleep_for(20ms);
+        }
+        EXPECT_TRUE(at_client == big);
+        EXPECT_TRUE(at_plain.empty());
+        EXPECT_TRUE(plain.value()->is_open() && plain_accepted.value()->is_open());
+        // The handlers refer to this frame's locals.
+        for (auto* c : {accepted.value().get(), conn.value().get(), plain.value().get()}) {
+            c->set_datagram_handler(nullptr);
+        }
+    });
+}
+
 }  // namespace
 }  // namespace ghostdrive::transport

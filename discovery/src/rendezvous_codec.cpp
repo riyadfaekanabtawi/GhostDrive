@@ -99,7 +99,6 @@ core::Bytes encode(const Register& m) {
 core::Bytes encode(const Registered& m) {
     core::Bytes p;
     put_endpoint(p, m.observed);
-    p.insert(p.end(), m.relay_token.begin(), m.relay_token.end());
     return frame(wire::FrameType::rendezvous_registered, p);
 }
 
@@ -138,12 +137,8 @@ core::Result<Register> decode_register(std::span<const std::byte> payload) {
 
 core::Result<Registered> decode_registered(std::span<const std::byte> payload) {
     std::optional<asio::ip::udp::endpoint> ep;
-    if (!get_endpoint(payload, ep) || !ep || payload.size() != kRelayTokenSize) {
-        return malformed("Registered");
-    }
-    Registered m{*ep, {}};
-    std::copy(payload.begin(), payload.end(), m.relay_token.begin());
-    return m;
+    if (!get_endpoint(payload, ep) || !ep || !payload.empty()) return malformed("Registered");
+    return Registered{*ep};
 }
 
 core::Result<Connect> decode_connect(std::span<const std::byte> payload) {

@@ -45,9 +45,9 @@ struct ServerStats {
 
 // Self-hostable rendezvous and relay (ARCHITECTURE.md section 3.5). Devices hold a QUIC
 // connection to it; it tells members of a group where the others are, and forwards relay
-// datagrams between members of one group. It keeps everything in memory and never sees file
-// data or keys beyond the devices' public keys: relayed packets are QUIC, end-to-end encrypted
-// between the devices.
+// frames (QUIC DATAGRAM frames on those connections) between members of one group. It keeps
+// everything in memory and never sees file data or keys beyond the devices' public keys: relayed
+// packets are QUIC, end-to-end encrypted between the devices.
 //
 // Unlike a GhostDrive peer, the server completes TLS with any client key (the handshake still
 // proves the client holds it); a client gets service only after registering into a group, and
@@ -74,7 +74,9 @@ private:
     asio::awaitable<void> accept_loop();
     asio::awaitable<void> serve(std::shared_ptr<transport::Connection> conn);
     void send(const std::shared_ptr<Client>& client, core::Bytes frame);
-    void on_datagram(std::span<const std::byte> datagram, const asio::ip::udp::endpoint& from);
+    // A relay frame (DATAGRAM frame, transport::kMaxRelayFrame) received on `sender`'s
+    // connection.
+    void on_relay_frame(Client& sender, core::Bytes frame);
     void drop(const std::shared_ptr<Client>& client);
     // Whether `reg` may register: admitted by the allow list, and every group in it has room.
     bool admits(const discovery::Register& reg);
@@ -85,7 +87,6 @@ private:
     ServerOptions options_;
     std::shared_ptr<transport::Endpoint> endpoint_;
     std::map<core::PublicKey, std::shared_ptr<Client>> clients_;
-    std::map<discovery::RelayToken, std::shared_ptr<Client>> by_token_;
     std::map<std::string, std::size_t> per_ip_;
     std::map<discovery::GroupId, std::size_t> group_sizes_;
     ServerStats stats_;

@@ -29,6 +29,8 @@ struct Callbacks {
                             void* user_data, void* stream_user_data);
     static int stream_reset(ngtcp2_conn* conn, std::int64_t stream_id, std::uint64_t final_size,
                             std::uint64_t app_error_code, void* user_data, void* stream_user_data);
+    static int recv_datagram(ngtcp2_conn* conn, std::uint32_t flags, const std::uint8_t* data,
+                             std::size_t datalen, void* user_data);
     static int extend_max_local_streams_bidi(ngtcp2_conn* conn, std::uint64_t max_streams,
                                              void* user_data);
 

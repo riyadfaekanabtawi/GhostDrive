@@ -26,10 +26,16 @@ using detail::post_completion;
 namespace {
 
 constexpr std::size_t kCidLen = 18;
-// Leaves room for the 37-byte relay header inside a 1500-byte MTU (1472 bytes of UDP payload
-// over IPv4), so relayed packets are never fragmented.
+// Fits a 1500-byte MTU over IPv4 (1472 bytes of UDP payload) and IPv6 (1452).
 constexpr std::size_t kMaxUdpPayload = 1400;
+// One relay frame must fit in one 1-RTT packet of the rendezvous connection: a short header
+// (1 + 18-byte CID + up to 4-byte packet number), the 16-byte AEAD tag, and the DATAGRAM frame
+// header (type and a 2-byte length) take 42 of its 1400 bytes, leaving 1358.
+static_assert(kMaxRelayFrame + 1 + kCidLen + 4 + 16 + 3 <= kMaxUdpPayload);
 constexpr std::size_t kMaxPacketsPerFlush = 64;
+// Received and outgoing DATAGRAM frames held per connection; beyond this they are dropped, and
+// QUIC on the relayed connection recovers the loss.
+constexpr std::size_t kMaxQueuedDatagrams = 64;
 constexpr std::size_t kMaxVectors = 16;
 
 constexpr std::uint64_t kMiB = 1024 * 1024;
@@ -66,16 +72,28 @@ Status random_cid(ngtcp2_cid& cid, std::size_t len) {
     return {};
 }
 
-void fill_settings(ngtcp2_settings& settings, const EndpointOptions& options) {
+// `relayed`: the remote is a relay virtual address. `datagrams`: the connection to a rendezvous
+// server, which carries relay frames.
+void fill_settings(ngtcp2_settings& settings, const EndpointOptions& options, bool relayed,
+                   bool datagrams) {
     ngtcp2_settings_default(&settings);
     settings.initial_ts = now();
     settings.handshake_timeout = to_duration(options.handshake_timeout);
-    settings.max_tx_udp_payload_size = kMaxUdpPayload;
+    settings.max_tx_udp_payload_size = relayed ? kMaxRelayedPacket : kMaxUdpPayload;
     settings.max_window = 64 * kMiB;
     settings.max_stream_window = 16 * kMiB;
+    if (relayed || datagrams) {
+        // Otherwise ngtcp2 sends 1200-byte packets until Path MTU Discovery finds more, and a
+        // relay frame holding a 1200-byte Initial does not fit in 1200 bytes. The sizes are
+        // fixed instead: the rendezvous connection uses the 1400 bytes direct connections reach
+        // at most, and relayed packets always fit inside its frames.
+        settings.no_tx_udp_payload_size_shaping = 1;
+        settings.no_pmtud = 1;
+    }
 }
 
-void fill_params(ngtcp2_transport_params& params, const EndpointOptions& options) {
+void fill_params(ngtcp2_transport_params& params, const EndpointOptions& options, bool relayed,
+                 bool datagrams) {
     ngtcp2_transport_params_default(&params);
     params.initial_max_stream_data_bidi_local = kMiB;
     params.initial_max_stream_data_bidi_remote = kMiB;
@@ -90,6 +108,9 @@ void fill_params(ngtcp2_transport_params& params, const EndpointOptions& options
     // Paths change only by NAT rebinding (handled by ngtcp2) or by a new connection; never let
     // a peer move a connection, which would also slip a direct one onto the relay unnoticed.
     params.disable_active_migration = 1;
+    if (relayed) params.max_udp_payload_size = kMaxRelayedPacket;
+    // The largest frame a 1400-byte packet could hold; send_datagram enforces the smaller limit.
+    if (datagrams) params.max_datagram_frame_size = kMaxUdpPayload;
 }
 
 }  // namespace
@@ -115,6 +136,7 @@ const ngtcp2_callbacks Callbacks::client = {
     .handshake_confirmed = Callbacks::handshake_confirmed,
     .delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb,
     .delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb,
+    .recv_datagram = Callbacks::recv_datagram,
     .version_negotiation = ngtcp2_crypto_version_negotiation_cb,
     .get_new_connection_id2 = Callbacks::get_new_connection_id,
     .get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb,
@@ -138,6 +160,7 @@ const ngtcp2_callbacks Callbacks::server = {
     .stream_reset = Callbacks::stream_reset,
     .delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb,
     .delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb,
+    .recv_datagram = Callbacks::recv_datagram,
     .version_negotiation = ngtcp2_crypto_version_negotiation_cb,
     .get_new_connection_id2 = Callbacks::get_new_connection_id,
     .get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb,
@@ -250,6 +273,19 @@ int Callbacks::extend_max_local_streams_bidi(ngtcp2_conn*, std::uint64_t, void* 
     return 0;
 }
 
+int Callbacks::recv_datagram(ngtcp2_conn*, std::uint32_t flags, const std::uint8_t* data,
+                             std::size_t datalen, void* user_data) {
+    auto* self = from_user_data(user_data);
+    // Before the handshake completes the peer is not authenticated (0-RTT is never enabled).
+    if ((flags & NGTCP2_DATAGRAM_FLAG_0RTT) != 0 || !self->datagrams_) return 0;
+    if (self->rx_datagrams_.size() >= kMaxQueuedDatagrams) return 0;
+    // COPY: ngtcp2's decrypted packet is valid only during this callback, and the frame is
+    // handled after ngtcp2 returns.
+    auto* bytes = reinterpret_cast<const std::byte*>(data);
+    self->rx_datagrams_.emplace_back(bytes, bytes + datalen);
+    return 0;
+}
+
 int Callbacks::verify_certificate(int, X509_STORE_CTX* store) {
     // Chain elements above the leaf carry no trust here; only the leaf key is checked. This runs
     // before CertificateVerify, so the peer has not yet proven it holds the key: only the pure
@@ -291,9 +327,11 @@ Connection::~Connection() {
 
 Result<std::shared_ptr<Connection>> Connection::create_client(
     const std::shared_ptr<Endpoint>& endpoint, const Udp::endpoint& remote,
-    const core::PublicKey& expected_peer) {
+    const core::PublicKey& expected_peer, ConnectOptions options) {
     auto self = std::make_shared<Connection>(Private{}, endpoint, remote, true);
     self->expected_peer_ = expected_peer;
+    self->datagrams_ = options.datagrams;
+    bool relayed = endpoint->is_relay_address(remote);
 
     ngtcp2_cid dcid{};
     ngtcp2_cid scid{};
@@ -301,9 +339,9 @@ Result<std::shared_ptr<Connection>> Connection::create_client(
     if (auto st = random_cid(scid, kCidLen); !st) return st.error();
 
     ngtcp2_settings settings;
-    fill_settings(settings, endpoint->options_);
+    fill_settings(settings, endpoint->options_, relayed, self->datagrams_);
     ngtcp2_transport_params params;
-    fill_params(params, endpoint->options_);
+    fill_params(params, endpoint->options_, relayed, self->datagrams_);
 
     ngtcp2_path path{
         .local = to_ngtcp2(self->local_), .remote = to_ngtcp2(remote), .user_data = nullptr};
@@ -331,14 +369,16 @@ Result<std::shared_ptr<Connection>> Connection::create_server(
         return Error{Errc::protocol, "not an acceptable Initial packet"};
     }
     auto self = std::make_shared<Connection>(Private{}, endpoint, remote, false);
+    self->datagrams_ = endpoint->options_.accept_datagrams;
+    bool relayed = endpoint->is_relay_address(remote);
 
     ngtcp2_cid scid{};
     if (auto st = random_cid(scid, kCidLen); !st) return st.error();
 
     ngtcp2_settings settings;
-    fill_settings(settings, endpoint->options_);
+    fill_settings(settings, endpoint->options_, relayed, self->datagrams_);
     ngtcp2_transport_params params;
-    fill_params(params, endpoint->options_);
+    fill_params(params, endpoint->options_, relayed, self->datagrams_);
     if (original_dcid) {
         // After a Retry the client addresses the CID we put in the Retry (now its DCID); the
         // transport parameters must name both, so the client can check nobody tampered.
@@ -533,6 +573,30 @@ void Connection::after_events() {
         ngtcp2_conn_set_stream_user_data(conn_, id, stream.get());
         post_completion(executor_, handler, Result<std::shared_ptr<Stream>>(stream));
     }
+
+    deliver_datagrams();
+}
+
+void Connection::deliver_datagrams() {
+    if (!announced_ || rx_datagrams_.empty()) return;
+    auto self = shared_from_this();
+    auto received = std::move(rx_datagrams_);
+    rx_datagrams_.clear();
+    auto handler = datagram_handler_;
+    for (auto& datagram : received) {
+        if (closed_ || !handler) break;
+        handler(std::move(datagram));
+    }
+}
+
+bool Connection::send_datagram(core::Bytes datagram) {
+    if (!datagrams_ || closed_ || datagram.empty() || datagram.size() > kMaxDatagram ||
+        tx_datagrams_.size() >= kMaxQueuedDatagrams) {
+        return false;
+    }
+    tx_datagrams_.push_back(std::move(datagram));
+    schedule_flush();
+    return true;
 }
 
 void Connection::on_packet(std::span<const std::uint8_t> packet, const Udp::endpoint& from) {
@@ -629,6 +693,47 @@ void Connection::flush() {
     std::vector<std::int64_t> candidates(send_queue_.begin(), send_queue_.end());
     std::size_t next = 0;
     std::size_t sent = 0;
+
+    // DATAGRAM frames first, one per packet. They are never retransmitted; those congestion
+    // control or pacing holds back wait in the bounded queue.
+    bool retried = false;
+    while (announced_ && !tx_datagrams_.empty() && sent < max_packets) {
+        auto& datagram = tx_datagrams_.front();
+        ngtcp2_vec vector{
+            .base = reinterpret_cast<std::uint8_t*>(datagram.data()),
+            .len = datagram.size(),
+        };
+        int accepted = 0;
+        auto written = ngtcp2_conn_writev_datagram(
+            conn_, &ps.path, &pi, buffer.data(), buffer.size(), &accepted,
+            NGTCP2_WRITE_DATAGRAM_FLAG_NONE, 0, &vector, 1, ts);
+        if (written == NGTCP2_ERR_INVALID_STATE || written == NGTCP2_ERR_INVALID_ARGUMENT) {
+            // The peer takes no DATAGRAM frames, or none this large.
+            tx_datagrams_.pop_front();
+            continue;
+        }
+        if (written < 0) {
+            close_liberr_ = static_cast<int>(written);
+            fail(Error{Errc::protocol, std::string("ngtcp2_conn_writev_datagram: ") +
+                                           ngtcp2_strerror(static_cast<int>(written))},
+                 true);
+            return;
+        }
+        // Written but not accepted: other frames (ACKs) took the room, so the frame goes in the
+        // next packet. One that does not fit a second packet either is dropped, not left at the
+        // head of the queue.
+        if (accepted != 0 || (written > 0 && retried)) {
+            tx_datagrams_.pop_front();
+            retried = false;
+        } else {
+            retried = written > 0;
+        }
+        if (written == 0) break;  // congestion control or pacing says wait
+        endpoint->send_packet(
+            std::as_bytes(std::span(buffer.data(), static_cast<std::size_t>(written))),
+            to_endpoint(ps.path.remote, remote_));
+        ++sent;
+    }
 
     for (;;) {
         Stream* stream = nullptr;
@@ -753,6 +858,10 @@ void Connection::send_close_packet() {
 void Connection::close(std::uint64_t app_error_code) {
     if (closed_) return;
     close_app_code_ = app_error_code;
+    // Queued frames go out first: they may carry the closes of relayed connections, which are
+    // closed just before the connection to the server.
+    if (!tx_datagrams_.empty()) flush();
+    if (closed_) return;
     fail(Error{Errc::closed, "connection closed locally"}, true);
 }
 
@@ -777,6 +886,9 @@ void Connection::fail(core::Error error, bool send_close) {
     for (auto& [id, stream] : streams) stream->on_closed(error);
     incoming_.clear();
     send_queue_.clear();
+    rx_datagrams_.clear();
+    tx_datagrams_.clear();
+    datagram_handler_ = nullptr;
 
     release_pending_handshake();
     if (auto endpoint = endpoint_.lock()) endpoint->forget(*this);
