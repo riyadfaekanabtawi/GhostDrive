@@ -200,7 +200,8 @@ Drive::Drive(DrivePaths paths, std::unique_ptr<core::DeviceKey> key, DriveId dri
       key_(std::move(key)),
       drive_id_(drive_id),
       secret_(secret),
-      device_name_(std::move(device_name)),
+      // Shown in terminals and sent to peers; a name stored before this was cleaned is too.
+      device_name_(printable_name(device_name)),
       index_(std::move(index)),
       store_(std::move(store)),
       membership_(std::move(membership)),

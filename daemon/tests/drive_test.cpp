@@ -49,6 +49,18 @@ TEST(Drive, SecretsArePrivate) {
     EXPECT_EQ(opened.error().code, core::Errc::permission);
 }
 
+TEST(Drive, ItsOwnNameIsSafeToShowInATerminal) {
+    test::TempDir dir;
+    auto root = dir.path() / "a";
+    auto created = Drive::create(root, "desk\x1b[2J\xE2\x80\xAE");
+    ASSERT_TRUE(created) << created.error().message;
+    EXPECT_EQ(created.value()->device_name(), "desk?[2J?");
+    created.value().reset();
+    auto opened = Drive::open(root);
+    ASSERT_TRUE(opened) << opened.error().message;
+    EXPECT_EQ(opened.value()->device_name(), "desk?[2J?");
+}
+
 TEST(Drive, CreateRefusesToReplaceAnExistingDrive) {
     test::TempDir dir;
     ASSERT_TRUE(Drive::create(dir.path() / "a", "desk"));
