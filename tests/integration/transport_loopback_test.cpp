@@ -588,5 +588,112 @@ TEST_F(Loopback, DatagramFramesFlowOnlyWhenBothSidesEnableThem) {
     });
 }
 
+TEST_F(Loopback, AFloodOfDatagramsDoesNotStarveStreams) {
+    auto client_key = new_key();
+    auto client = Endpoint::create(io_.get_executor(), client_key, {}).value();
+    auto server_key = new_key();
+    EndpointOptions options;
+    auto client_public = client_key.public_key();
+    options.accept_peer = [client_public](const core::PublicKey& k) { return k == client_public; };
+    options.accept_datagrams = true;
+    auto server = Endpoint::create(io_.get_executor(), server_key, options).value();
+    endpoints_.push_back(client.get());
+    endpoints_.push_back(server.get());
+
+    auto payload = random_payload(512 * 1024, 8);
+    auto frame = random_payload(Connection::kMaxDatagram, 9);
+    std::chrono::steady_clock::duration took{};
+    run({[&]() -> awaitable<void> { co_await echo_server(server, 1); },
+         [&]() -> awaitable<void> {
+             auto conn = co_await client->connect(server->local_endpoint(),
+                                                  server_key.public_key(), {.datagrams = true});
+             CO_ASSERT_OK(conn);
+             bool done = false;
+             // Keeps the frame queue full for as long as the echo runs.
+             asio::co_spawn(
+                 co_await asio::this_coro::executor,
+                 [&, c = conn.value()]() -> awaitable<void> {
+                     while (!done) {
+                         while (c->send_datagram(frame)) {
+                         }
+                         co_await sleep_for(1ms);
+                     }
+                 },
+                 asio::detached);
+             auto start = std::chrono::steady_clock::now();
+             co_await echo_once(conn.value(), payload);
+             took = std::chrono::steady_clock::now() - start;
+             done = true;
+             co_await sleep_for(5ms);
+         }},
+        30s);
+    EXPECT_LT(took, 10s) << "the stream starved behind DATAGRAM frames";
+}
+
+// A relayed connection must authenticate the key behind its virtual address. A malicious
+// rendezvous server relays C's handshake to A but labels it as coming from B, another member.
+TEST_F(Loopback, ARelayedConnectionMustBeWithTheKeyOfItsVirtualAddress) {
+    auto a_key = new_key();
+    auto b_key = new_key();  // never online
+    auto c_key = new_key();
+    auto a_public = a_key.public_key();
+    std::set<core::PublicKey> members{b_key.public_key(), c_key.public_key()};
+    EndpointOptions a_options;
+    a_options.accept_peer = [members](const core::PublicKey& k) { return members.contains(k); };
+    auto a = Endpoint::create(io_.get_executor(), a_key, a_options).value();
+    EndpointOptions c_options;
+    c_options.handshake_timeout = 3s;
+    auto c = Endpoint::create(io_.get_executor(), c_key, c_options).value();
+    auto server_key = new_key();
+    EndpointOptions server_options;
+    std::set<core::PublicKey> clients{a_public, c_key.public_key()};
+    server_options.accept_peer = [clients](const core::PublicKey& k) { return clients.contains(k); };
+    server_options.accept_datagrams = true;
+    auto server = Endpoint::create(io_.get_executor(), server_key, server_options).value();
+    for (auto* e : {a.get(), c.get(), server.get()}) endpoints_.push_back(e);
+
+    core::PublicKey claimed{};  // the source key the server puts on C's frames
+    std::shared_ptr<Connection> at_a;
+    std::shared_ptr<Connection> at_c;
+    auto relabel = [](core::Bytes frame, const core::PublicKey& source,
+                      const std::shared_ptr<Connection>& to) {
+        std::copy(source.begin(), source.end(), frame.begin());
+        if (to) to->send_datagram(std::move(frame));
+    };
+    std::vector<bool> results;
+    run([&]() -> awaitable<void> {
+        auto to_server = server->local_endpoint();
+        auto a_conn = co_await a->connect(to_server, server_key.public_key(), {.datagrams = true});
+        CO_ASSERT_OK(a_conn);
+        auto first = co_await server->accept();
+        CO_ASSERT_OK(first);
+        auto c_conn = co_await c->connect(to_server, server_key.public_key(), {.datagrams = true});
+        CO_ASSERT_OK(c_conn);
+        auto second = co_await server->accept();
+        CO_ASSERT_OK(second);
+        at_a = first.value()->peer_key() == a_public ? first.value() : second.value();
+        at_c = at_a == first.value() ? second.value() : first.value();
+        at_c->set_datagram_handler([&](core::Bytes f) { relabel(std::move(f), claimed, at_a); });
+        at_a->set_datagram_handler([&](core::Bytes f) { relabel(std::move(f), a_public, at_c); });
+        auto any = [](const core::PublicKey&) { return true; };
+        a->set_relay(a_conn.value(), any);
+        c->set_relay(c_conn.value(), any);
+
+        auto via_relay = *c->relay_address(a_public);
+        claimed = b_key.public_key();
+        auto forged = co_await c->connect(via_relay, a_public);
+        results.push_back(forged.ok());
+        claimed = c_key.public_key();
+        auto honest = co_await c->connect(via_relay, a_public);
+        results.push_back(honest.ok());
+        if (honest) honest.value()->close();
+        at_a->set_datagram_handler(nullptr);
+        at_c->set_datagram_handler(nullptr);
+    });
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_FALSE(results[0]) << "A accepted C at B's virtual address";
+    EXPECT_TRUE(results[1]) << "A refused C at its own virtual address";
+}
+
 }  // namespace
 }  // namespace ghostdrive::transport

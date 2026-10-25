@@ -303,8 +303,10 @@ document assumes the corrected version.
     within the group rules below, on the receiver's connection, after replacing the
     destination key with the sender's. Clients take frames only from their server connection
     and only for member keys, and hand the packet to QUIC from a virtual address in
-    198.18.0.0/15 (bounded table); QUIC still authenticates the peer end to end. Raw UDP is
-    never relayed. ngtcp2 1.25.0 provides this as `ngtcp2_conn_writev_datagram` (one frame per
+    198.18.0.0/15 (bounded table); QUIC still authenticates the peer end to end, and a
+    relayed connection must authenticate the very key its virtual address stands for, so the
+    server cannot present one device's handshake (or a non-member's) at another member's
+    address. Raw UDP is never relayed. ngtcp2 1.25.0 provides this as `ngtcp2_conn_writev_datagram` (one frame per
     packet here, subject to congestion control and pacing; DATAGRAM frames are never
     retransmitted) and the `recv_datagram` callback (frames are copied out and handled after
     ngtcp2 returns; frames flagged 0-RTT, before the handshake, are dropped).
@@ -318,15 +320,23 @@ document assumes the corrected version.
     Path MTU Discovery finds more, and a 1200-byte Initial plus the key does not fit in 1200
     bytes, so the server connection and relayed connections turn off payload shaping and PMTUD
     and use these fixed sizes. Like the raw relay datagrams before, relaying therefore needs a
-    path that carries 1428-byte IPv4 (1448-byte IPv6) packets, or IP fragmentation.
+    path that carries 1428-byte IPv4 (1448-byte IPv6) packets, or IP fragmentation: with Path
+    MTU Discovery off, the server connection's packets stay at 1400 bytes, so on a path whose
+    MTU is below about 1428 bytes (some VPNs and tunnels) that drops rather than fragments
+    them, full-size relay traffic is lost and relayed connections stall.
   - New Initials get a Retry (RFC 9000 section 8.1): no state is created until the client
     returns the token from its own address, so spoofed Initials cannot fill handshake slots or
     use the server as a reflector. Handshakes time out after 5 s.
   - Limits: 10,000 clients, 16 per IPv4 address or IPv6 /64, 256 per group, registration
     within 10 s, 30 `Connect` per 10 s, 64 queued control frames per client (more are
     dropped), relayed payloads must be QUIC packets of at most 1280 bytes, a per-client
-    token bucket (4 MiB/s, 1 MiB burst) that drops instead of queueing, and at most 64 frames
-    waiting on each connection for congestion control (more are dropped). `--allow-group HEX`
+    token bucket charged with whole relay frames (4 MiB/s, 1 MiB burst) that drops instead
+    of queueing, a second one per receiving client (8 MiB/s, 2 MiB burst) so many senders,
+    such as throwaway clients in an earlier group, cannot flood one member together, and at
+    most 64 frames waiting on each connection for congestion control (more are dropped).
+    While a connection also has stream data to send, queued frames get at most half of each
+    sending round before the streams and only what they leave after, so relayed traffic
+    cannot starve the control stream. `--allow-group HEX`
     restricts the server to the operator's own drives; `ghostdrive status` shows the group.
   - Daemons act on a `PeerAt` for one peer at most every 2 s and run at most 32 dials at once,
     so even a malicious server cannot turn them into amplifiers. Probes carry no key. Active

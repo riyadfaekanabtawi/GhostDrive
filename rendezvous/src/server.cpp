@@ -35,6 +35,22 @@ std::string ip_bucket(const asio::ip::address& address) {
     return address.to_string();
 }
 
+// A token bucket in bytes; starts full.
+struct Bucket {
+    double tokens = 0;
+    std::chrono::steady_clock::time_point refilled{};
+
+    Bucket() = default;
+    explicit Bucket(std::size_t burst)
+        : tokens(static_cast<double>(burst)), refilled(std::chrono::steady_clock::now()) {}
+
+    void refill(std::chrono::steady_clock::time_point now, std::size_t rate, std::size_t burst) {
+        double elapsed = std::chrono::duration<double>(now - refilled).count();
+        refilled = now;
+        tokens = std::min(static_cast<double>(burst), tokens + elapsed * static_cast<double>(rate));
+    }
+};
+
 }  // namespace
 
 struct Server::Client {
@@ -49,8 +65,8 @@ struct Server::Client {
     std::deque<core::Bytes> outbox;
     bool writing = false;
 
-    double tokens = 0;
-    std::chrono::steady_clock::time_point refilled{};
+    Bucket sent;      // relay frames from this client
+    Bucket received;  // relay frames to this client
     std::chrono::steady_clock::time_point connect_window{};
     int connects = 0;
 };
@@ -121,8 +137,8 @@ asio::awaitable<void> Server::serve(std::shared_ptr<transport::Connection> conn)
     auto client = std::make_shared<Client>();
     client->key = conn->peer_key();
     client->conn = conn;
-    client->tokens = static_cast<double>(options_.relay_burst_bytes);
-    client->refilled = std::chrono::steady_clock::now();
+    client->sent = Bucket(options_.relay_burst_bytes);
+    client->received = Bucket(options_.relay_receive_burst_bytes);
     // The connection authenticates the sender, so a frame needs no token and shows nothing
     // identifying on the wire. Weak: the connection owns this handler.
     conn->set_datagram_handler(
@@ -276,15 +292,13 @@ void Server::send(const std::shared_ptr<Client>& client, core::Bytes frame) {
 void Server::on_relay_frame(Client& sender, core::Bytes frame) {
     // The sender is the authenticated client on whose connection the frame arrived; until it
     // registers (or once it is replaced or moving between groups) it may not relay.
-    auto payload = std::span<const std::byte>(frame);
     if (!sender.registered || !sender.placed || frame.size() <= transport::kRelayKeySize ||
         frame.size() > transport::kMaxRelayFrame ||
-        transport::classify_packet(payload.subspan(transport::kRelayKeySize)) !=
+        transport::classify_packet(std::span(frame).subspan(transport::kRelayKeySize)) !=
             transport::PacketKind::quic) {
         ++stats_.dropped_datagrams;
         return;
     }
-    payload = payload.subspan(transport::kRelayKeySize);
     core::PublicKey dest_key{};
     std::copy_n(frame.begin(), transport::kRelayKeySize, dest_key.begin());
     // Between clients that could have found each other: a shared group, or one looking in the
@@ -300,22 +314,24 @@ void Server::on_relay_frame(Client& sender, core::Bytes frame) {
     }
 
     auto now = std::chrono::steady_clock::now();
-    double elapsed = std::chrono::duration<double>(now - sender.refilled).count();
-    sender.refilled = now;
-    sender.tokens = std::min(static_cast<double>(options_.relay_burst_bytes),
-                             sender.tokens + elapsed * static_cast<double>(options_.relay_bytes_per_second));
-    auto size = payload.size();
-    if (sender.tokens < static_cast<double>(size)) {
+    auto& receiver = *dest->second;
+    sender.sent.refill(now, options_.relay_bytes_per_second, options_.relay_burst_bytes);
+    receiver.received.refill(now, options_.relay_receive_bytes_per_second,
+                             options_.relay_receive_burst_bytes);
+    auto size = frame.size();
+    auto cost = static_cast<double>(size);
+    if (sender.sent.tokens < cost || receiver.received.tokens < cost) {
         ++stats_.dropped_datagrams;  // over budget: drop, never queue (QUIC recovers)
         return;
     }
-    sender.tokens -= static_cast<double>(size);
+    sender.sent.tokens -= cost;
+    receiver.received.tokens -= cost;
 
     // The frame is reused for the receiver: the destination key becomes the source key, and
     // the packet bytes stay where they are.
     std::copy(sender.key.begin(), sender.key.end(), frame.begin());
     // A receiver whose queue is full (it is not keeping up) loses the frame.
-    if (!dest->second->conn->send_datagram(std::move(frame))) {
+    if (!receiver.conn->send_datagram(std::move(frame))) {
         ++stats_.dropped_datagrams;
         return;
     }
