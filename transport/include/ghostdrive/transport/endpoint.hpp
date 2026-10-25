@@ -269,6 +269,7 @@ private:
     bool datagrams_ = false;
     std::deque<core::Bytes> rx_datagrams_;  // received, not yet handed to the handler
     std::deque<core::Bytes> tx_datagrams_;  // queued for sending
+    bool datagram_turn_taken_ = false;      // the last packet sent was a DATAGRAM frame
     DatagramHandler datagram_handler_;
 
     // Pending close: either a library error code or an application error code.

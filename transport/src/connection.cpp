@@ -701,55 +701,55 @@ void Connection::flush() {
     std::size_t next = 0;
     std::size_t sent = 0;
 
-    // DATAGRAM frames, one per packet. They are never retransmitted; those congestion control
-    // or pacing holds back wait in the bounded queue. While streams have data, frames get at
-    // most half of the round first and only what the streams leave after, so a flood of relay
-    // frames cannot starve the control stream. Returns false if the connection failed.
-    auto write_datagrams = [&](std::size_t limit) {
-        bool retried = false;
-        for (std::size_t n = 0;
-             announced_ && !tx_datagrams_.empty() && n < limit && sent < max_packets;) {
-            auto& datagram = tx_datagrams_.front();
-            ngtcp2_vec vector{
-                .base = reinterpret_cast<std::uint8_t*>(datagram.data()),
-                .len = datagram.size(),
-            };
-            int accepted = 0;
-            auto written = ngtcp2_conn_writev_datagram(
-                conn_, &ps.path, &pi, buffer.data(), buffer.size(), &accepted,
-                NGTCP2_WRITE_DATAGRAM_FLAG_NONE, 0, &vector, 1, ts);
-            if (written == NGTCP2_ERR_INVALID_STATE || written == NGTCP2_ERR_INVALID_ARGUMENT) {
-                // The peer takes no DATAGRAM frames, or none this large.
-                tx_datagrams_.pop_front();
-                continue;
-            }
-            if (written < 0) {
-                close_liberr_ = static_cast<int>(written);
-                fail(Error{Errc::protocol, std::string("ngtcp2_conn_writev_datagram: ") +
-                                               ngtcp2_strerror(static_cast<int>(written))},
-                     true);
-                return false;
-            }
-            // Written but not accepted: other frames (ACKs) took the room, so the frame goes in
-            // the next packet. One that does not fit a second packet either is dropped, not left
-            // at the head of the queue.
-            if (accepted != 0 || (written > 0 && retried)) {
-                tx_datagrams_.pop_front();
-                retried = false;
-            } else {
-                retried = written > 0;
-            }
-            if (written == 0) break;  // congestion control or pacing says wait
-            endpoint->send_packet(
-                std::as_bytes(std::span(buffer.data(), static_cast<std::size_t>(written))),
-                to_endpoint(ps.path.remote, remote_));
-            ++sent;
-            ++n;
+    // DATAGRAM frames go one per packet, never retransmitted; those congestion control or
+    // pacing holds back wait in the bounded queue. When streams also have data, packets
+    // alternate between the two, and the turn carries over to the next flush: with a small
+    // congestion window a flush may send only one packet, and a flood of relay frames must not
+    // take every one of them from the control stream.
+    enum class DatagramResult { sent, blocked, skipped, failed };
+    bool retried = false;
+    auto write_datagram = [&]() {
+        auto& datagram = tx_datagrams_.front();
+        ngtcp2_vec vector{
+            .base = reinterpret_cast<std::uint8_t*>(datagram.data()),
+            .len = datagram.size(),
+        };
+        int accepted = 0;
+        auto written = ngtcp2_conn_writev_datagram(conn_, &ps.path, &pi, buffer.data(),
+                                                   buffer.size(), &accepted,
+                                                   NGTCP2_WRITE_DATAGRAM_FLAG_NONE, 0, &vector, 1,
+                                                   ts);
+        if (written == NGTCP2_ERR_INVALID_STATE || written == NGTCP2_ERR_INVALID_ARGUMENT) {
+            // The peer takes no DATAGRAM frames, or none this large.
+            tx_datagrams_.pop_front();
+            return DatagramResult::skipped;
         }
-        return true;
+        if (written < 0) {
+            close_liberr_ = static_cast<int>(written);
+            fail(Error{Errc::protocol, std::string("ngtcp2_conn_writev_datagram: ") +
+                                           ngtcp2_strerror(static_cast<int>(written))},
+                 true);
+            return DatagramResult::failed;
+        }
+        // Written but not accepted: other frames (ACKs) took the room, so the frame goes in the
+        // next packet. One that does not fit a second packet either is dropped, not left at the
+        // head of the queue.
+        if (accepted != 0 || (written > 0 && retried)) {
+            tx_datagrams_.pop_front();
+            retried = false;
+        } else {
+            retried = written > 0;
+        }
+        if (written == 0) return DatagramResult::blocked;  // congestion control or pacing
+        endpoint->send_packet(
+            std::as_bytes(std::span(buffer.data(), static_cast<std::size_t>(written))),
+            to_endpoint(ps.path.remote, remote_));
+        return DatagramResult::sent;
     };
-    auto share = candidates.empty() ? max_packets : std::max<std::size_t>(1, max_packets / 2);
-    if (!write_datagrams(share)) return;
+
+    // Set while ngtcp2 holds a partly built packet (NGTCP2_ERR_WRITE_MORE); a DATAGRAM frame
+    // may only start a new packet.
+    bool coalescing = false;
 
     for (;;) {
         Stream* stream = nullptr;
@@ -777,6 +777,18 @@ void Connection::flush() {
             if (stream->wants_fin()) flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
         }
 
+        if (!coalescing && announced_ && !tx_datagrams_.empty() &&
+            (stream == nullptr || !datagram_turn_taken_)) {
+            auto result = write_datagram();
+            if (result == DatagramResult::failed) return;
+            if (result == DatagramResult::blocked) break;
+            if (result == DatagramResult::sent) {
+                datagram_turn_taken_ = true;
+                if (++sent >= max_packets) break;
+            }
+            continue;
+        }
+
         ngtcp2_ssize consumed = -1;
         auto written =
             ngtcp2_conn_writev_stream(conn_, &ps.path, &pi, buffer.data(), buffer.size(), &consumed,
@@ -786,6 +798,7 @@ void Connection::flush() {
         if (written < 0) {
             switch (written) {
                 case NGTCP2_ERR_WRITE_MORE:
+                    coalescing = true;
                     stream->on_sent(static_cast<std::size_t>(consumed), fin_flagged);
                     if (!stream->has_unsent() && !stream->wants_fin()) ++next;
                     continue;
@@ -810,14 +823,15 @@ void Connection::flush() {
             stream->on_sent(static_cast<std::size_t>(consumed), fin_flagged);
             if (!stream->has_unsent() && !stream->wants_fin()) ++next;
         }
+        coalescing = false;
         if (written == 0) break;  // nothing left, or congestion and pacing say wait
 
+        datagram_turn_taken_ = false;
         endpoint->send_packet(
             std::as_bytes(std::span(buffer.data(), static_cast<std::size_t>(written))),
             to_endpoint(ps.path.remote, remote_));
         if (++sent >= max_packets) break;
     }
-    if (!write_datagrams(max_packets)) return;
     ngtcp2_conn_update_pkt_tx_time(conn_, ts);
 
     std::erase_if(send_queue_, [this](std::int64_t id) {
