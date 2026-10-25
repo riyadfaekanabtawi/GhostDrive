@@ -286,9 +286,9 @@ core::Result<std::unique_ptr<Drive>> Drive::join(const std::filesystem::path& ro
     // Its retired signers too, which the membership entries may no longer name. On the
     // inviter's word only, so provisionally: they let adopted records be checked, and a device
     // this one sees as a member, now or later, is not held to them.
-    for (const auto& key : info.retired_signers) {
-        if (view.members.contains(key) || key == d.key().public_key()) continue;
-        if (auto st = d.index().retire_signer(key, true); !st) return st.error();
+    for (const auto& retired : info.retired_signers) {
+        if (view.members.contains(retired) || retired == d.key().public_key()) continue;
+        if (auto st = d.index().retire_signer(retired, true); !st) return st.error();
     }
     std::set<core::PublicKey> members;
     for (const auto& [k, name] : view.members) members.insert(k);
