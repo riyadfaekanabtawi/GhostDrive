@@ -249,8 +249,9 @@ tests run in the normal `ctest` on Linux and macOS. `cmake --install` also insta
 
 ## Installing
 
-GhostDrive installs three programs: `ghostdrive` (the CLI), `ghostdrived` (the daemon) and
-`ghostdrive-rendezvous` (the optional server). Keep `ghostdrive` and `ghostdrived` in the same
+GhostDrive installs a desktop app and three programs: `ghostdrive` (the CLI), `ghostdrived`
+(the daemon) and `ghostdrive-rendezvous` (the optional server). The app does everything through
+`ghostdrive`. Keep `ghostdrive` and `ghostdrived` in the same
 directory; `ghostdrive autostart on` runs the `ghostdrived` next to it. `ghostdrive --version`
 prints the installed version.
 
@@ -262,39 +263,70 @@ before GhostDrive.
 
 Each [release](https://github.com/riyadfaekanabtawi/GhostDrive/releases) has
 `ghostdrive-<version>-<os>-<arch>.tar.gz` for macOS (arm64) and Linux (x86_64), with a
-`.sha256` file next to it. The macOS build runs on macOS 13 or later (from 0.1.1; 0.1.0 may
-need the macOS version it was built on). On Linux it needs libfuse3 and avahi-client.
+`.sha256` file next to it. Each holds its platform's desktop app, the three programs in
+`bin/`, and an `INSTALL.txt`. Download the one for your system and check it:
 
 ```
-shasum -a 256 -c ghostdrive-0.1.0-macos-arm64.tar.gz.sha256   # sha256sum -c on Linux
-tar -xzf ghostdrive-0.1.0-macos-arm64.tar.gz
-cp ghostdrive-0.1.0-macos-arm64/bin/* ~/.local/bin/            # or any directory on PATH
+shasum -a 256 -c ghostdrive-0.1.2-macos-arm64.tar.gz.sha256   # sha256sum -c on Linux
+tar -xzf ghostdrive-0.1.2-macos-arm64.tar.gz                  # or double-click it in Finder
 ```
 
-The macOS tarball also holds `GhostDrive.app` with its own copy of `ghostdrive` and
-`ghostdrived`; move it to `/Applications`. Its signature is ad-hoc, so macOS asks for
+#### macOS
+
+Open the extracted folder and drag `GhostDrive.app` to `/Applications`, then open it. It
+needs macOS 13 or later (from 0.1.1; 0.1.0 may need the macOS version it was built on) and
+FUSE-T. The app holds its own copy of `ghostdrive` and `ghostdrived`, so nothing else needs
+installing. Its signature is ad-hoc, not from a registered developer, so macOS asks for
 confirmation the first time it opens (Control-click, Open), and a browser download is
-quarantined (`xattr -dr com.apple.quarantine GhostDrive.app`). The Linux binaries also
-need avahi-client (`libavahi-client3`) for LAN discovery.
+quarantined (`xattr -dr com.apple.quarantine /Applications/GhostDrive.app`). For the
+terminal, copy the programs to a directory on PATH: `cp bin/* ~/.local/bin/`.
+
+#### Linux
+
+Releases after 0.1.1 include the GTK desktop app, `bin/ghostdrive-app`, with its menu entry
+and icon. The programs need glibc 2.38 or later, and these runtime packages (Ubuntu 24.04,
+Debian 13 and Fedora 40 or later have new enough versions):
+
+| Needed for | Library | Debian and Ubuntu | Fedora |
+|---|---|---|---|
+| The app | GTK 4.10+ | `libgtk-4-1` | `gtk4` |
+| The app | libadwaita 1.5+ | `libadwaita-1-0` | `libadwaita` |
+| Mounting | libfuse3 | `fuse3`, `libfuse3-3` (`libfuse3-4` on Debian 13) | `fuse3`, `fuse3-libs` |
+| LAN discovery | avahi-client | `libavahi-client3` | `avahi-libs` |
+
+```
+cd ghostdrive-0.1.2-linux-x86_64
+./install.sh      # into ~/.local/bin, ~/.local/share/applications and ~/.local/share/icons
+```
+
+`install.sh` installs for your user only, never uses sudo, and writes only under your home
+directory (`$XDG_DATA_HOME` if it is set). Then open GhostDrive from the application menu.
+The app also runs in place (`bin/ghostdrive-app`); keep it in the same folder as `ghostdrive`
+and `ghostdrived`. `INSTALL.txt` in the tarball says how to remove it again.
 
 ### On Windows
 
 Releases after 0.1.1 also have `ghostdrive-<version>-windows-x86_64.zip`, for Windows 10
-or later on x64, with a `.sha256` file next to it. It holds one folder with `ghostdrive.exe`,
-`ghostdrived.exe`, `ghostdrive-rendezvous.exe`, `LICENSE` and `README.md`. The programs are
-linked statically, the Visual C++ runtime included, so no Visual C++ Redistributable or other
-DLLs are needed. Mounting needs [WinFsp](https://winfsp.dev) 2.x (the default installer
-options are enough); `ghostdrived --no-mount` and `ghostdrive-rendezvous` run without it.
+(1809) or later on x64, with a `.sha256` file next to it. It holds one folder with
+`ghostdrive.exe`, `ghostdrived.exe`, `ghostdrive-rendezvous.exe`, `LICENSE`, `README.md`, and
+the desktop app in `app\`. The programs are linked statically, the Visual C++ runtime
+included, and the app carries its own .NET and Windows App SDK runtimes, so nothing else needs
+installing except [WinFsp](https://winfsp.dev) 2.x for mounting (the default installer options
+are enough); `ghostdrived --no-mount` and `ghostdrive-rendezvous` run without it.
 
 ```
 (Get-FileHash ghostdrive-0.1.2-windows-x86_64.zip -Algorithm SHA256).Hash   # compare with .sha256
+Unblock-File ghostdrive-0.1.2-windows-x86_64.zip
 Expand-Archive ghostdrive-0.1.2-windows-x86_64.zip -DestinationPath $env:LOCALAPPDATA\Programs
-$env:Path += ";$env:LOCALAPPDATA\Programs\ghostdrive-0.1.2-windows-x86_64"   # or add it in Settings
+& "$env:LOCALAPPDATA\Programs\ghostdrive-0.1.2-windows-x86_64\app\GhostDriveApp.exe"
 ```
 
-Keep the three programs together in that folder. A browser download is marked as coming from
-the internet, and the programs are not signed, so SmartScreen may ask before the first run
-(More info, Run anyway); `Unblock-File` on the zip before extracting avoids that.
+Start the app with `app\GhostDriveApp.exe`; it runs the `ghostdrive.exe` in the folder above,
+so keep the folder as it is. The app is unpackaged and adds no Start menu entry; make a
+shortcut to `GhostDriveApp.exe` if you want one. For the terminal, add the folder to PATH
+(`$env:Path += ";<folder>"`, or in Settings). A browser download is marked as coming from the
+internet, and neither the programs nor the app are signed, so SmartScreen may ask before the
+first run (More info, Run anyway); `Unblock-File` on the zip before extracting avoids that.
 
 ### From Homebrew
 
@@ -320,9 +352,13 @@ cmake --install build/release --prefix ~/.local     # bin/, plus share/doc/ghost
 ```
 
 `scripts/package.sh` does the release build and writes the tarball described above into
-`build/release/`, including GhostDrive.app on macOS; it writes nothing outside `build/release`.
+`build/release/`, including GhostDrive.app on macOS and `ghostdrive-app` on Linux (which needs
+`libgtk-4-dev` and `libadwaita-1-dev` to build); it writes nothing outside `build/release`.
 On Windows, `pwsh scripts/package.ps1` does the same with the `windows-release` preset (static
-`x64-windows-static-release` triplet) and writes the zip into `build\windows-release\`.
+`x64-windows-static-release` triplet), publishes the desktop app into `app\` with the .NET SDK
+from `windows/GhostDriveApp/global.json`, and writes the zip into `build\windows-release\`.
+Running the Release workflow by hand (`gh workflow run release.yml --ref <branch>`) builds and
+checks all three packages and keeps them as workflow artifacts without publishing a release.
 
 ## Building
 

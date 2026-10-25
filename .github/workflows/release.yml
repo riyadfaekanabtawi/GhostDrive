@@ -1,10 +1,14 @@
 name: Release
 
 # Pushing a tag such as v0.1.0 builds the release tarballs on macOS and Linux and the zip on
-# Windows, and publishes them, with their .sha256 files, as a GitHub release for that tag.
+# Windows, each with its platform's desktop app, and publishes them, with their .sha256 files,
+# as a GitHub release for that tag. Run by hand (workflow_dispatch) on a branch, it builds and
+# checks the packages and uploads them as workflow artifacts only: the tag check and the
+# release job are skipped.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,8 +21,10 @@ jobs:
       fail-fast: true
       matrix:
         include:
+          # Not ubuntu-latest: the oldest supported LTS keeps the glibc, GTK 4 and libadwaita
+          # the binaries need as low as the README says (GTK 4.10+, libadwaita 1.5+).
           - name: linux
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - name: macos
             os: macos-latest
     steps:
@@ -30,7 +36,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config libfuse3-dev libavahi-client-dev
+          sudo apt-get install -y ninja-build pkg-config libfuse3-dev libavahi-client-dev \
+            libgtk-4-dev libadwaita-1-dev desktop-file-utils
 
       - name: Install system packages (macOS)
         if: runner.os == 'macOS'
@@ -48,11 +55,55 @@ jobs:
         run: scripts/package.sh
 
       - name: Check the version matches the tag
+        if: github.ref_type == 'tag'
         run: |
           version="$(sed -n 's/^CMAKE_PROJECT_VERSION:STATIC=//p' build/release/CMakeCache.txt)"
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "tag $GITHUB_REF_NAME does not match project version $version" >&2
             exit 1
+          fi
+
+      # Unpacks the tarball elsewhere, lists it, and checks that the desktop app is in it: on
+      # macOS that every Mach-O targets macOS 13, on Linux the app's libraries, the .desktop
+      # file, and install.sh into a throwaway home directory.
+      - name: Check the tarball
+        run: |
+          tarball="$(ls build/release/ghostdrive-*.tar.gz)"
+          (cd build/release && { shasum -a 256 -c "$(basename "$tarball").sha256" 2>/dev/null || sha256sum -c "$(basename "$tarball").sha256"; })
+          check="$RUNNER_TEMP/check"
+          mkdir -p "$check"
+          tar -C "$check" -xzf "$tarball"
+          dir="$check/$(basename "$tarball" .tar.gz)"
+          (cd "$check" && find . -type f | sort)
+          du -sh "$tarball" "$dir"
+          "$dir/bin/ghostdrive" --version
+          if [ "$RUNNER_OS" = macOS ]; then
+            app="$dir/GhostDrive.app"
+            test -f "$dir/INSTALL.txt"
+            for f in "$app/Contents/MacOS/"* "$dir/bin/"*; do
+              minos="$(vtool -show-build "$f" | awk '/minos/ { print $2; exit }')"
+              echo "$f: minos $minos"
+              [ "$minos" = 13.0 ] || { echo "$f targets macOS $minos, not 13.0" >&2; exit 1; }
+            done
+            plutil -extract LSMinimumSystemVersion raw "$app/Contents/Info.plist"
+            codesign --verify --deep --strict "$app"
+            "$app/Contents/MacOS/ghostdrive" --version
+          else
+            test -f "$dir/INSTALL.txt"
+            test -x "$dir/install.sh"
+            app="$dir/bin/ghostdrive-app"
+            readelf -d "$app" | grep NEEDED
+            echo "newest glibc symbol version: $(objdump -T "$dir"/bin/* | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1)"
+            desktop-file-validate "$dir/share/applications/org.ghostdrive.GhostDrive.desktop"
+            test -f "$dir/share/icons/hicolor/scalable/apps/org.ghostdrive.GhostDrive.svg"
+            if ldd "$app" | grep 'not found'; then exit 1; fi
+            home="$RUNNER_TEMP/home"
+            mkdir -p "$home"
+            env -u XDG_DATA_HOME HOME="$home" "$dir/install.sh"
+            (cd "$home" && find . | sort)
+            for prog in ghostdrive ghostdrived ghostdrive-rendezvous ghostdrive-app; do test -x "$home/.local/bin/$prog"; done
+            grep -qx "Exec=$home/.local/bin/ghostdrive-app" "$home/.local/share/applications/org.ghostdrive.GhostDrive.desktop"
+            test -f "$home/.local/share/icons/hicolor/scalable/apps/org.ghostdrive.GhostDrive.svg"
           fi
 
       - uses: actions/upload-artifact@v7
@@ -85,6 +136,11 @@ jobs:
           $install = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart ADDLOCAL=ALL" -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "msiexec failed with $($install.ExitCode)" }
 
+      # The .NET SDK the desktop app pins, for its dotnet publish in package.ps1.
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: windows/GhostDriveApp/global.json
+
       - name: Bootstrap vcpkg
         run: |
           .\external\vcpkg\bootstrap-vcpkg.bat -disableMetrics
@@ -94,18 +150,23 @@ jobs:
         run: scripts/package.ps1
 
       - name: Check the version matches the tag
+        if: github.ref_type == 'tag'
         run: |
           $version = (Select-String -Path build/windows-release/CMakeCache.txt -Pattern '^CMAKE_PROJECT_VERSION:STATIC=(.+)$').Matches.Groups[1].Value
           if ("v$version" -ne $env:GITHUB_REF_NAME) { throw "tag $env:GITHUB_REF_NAME does not match project version $version" }
 
       # The programs must start from a folder of their own with nothing but Windows: every DLL
       # they import (not counting the delay-loaded WinFsp DLL) has to be a system DLL, and none
-      # may be the Visual C++ runtime.
+      # may be the Visual C++ runtime. The desktop app in app\ may also import DLLs that it
+      # carries in app\ (the .NET and Windows App SDK runtimes) and the UCRT that Windows 10
+      # includes, but no Visual C++ runtime from the system. Then the app is started from the zip's layout against a --no-mount daemon,
+      # which proves it found ..\ghostdrive.exe, and closed through its window.
       - name: Check the zip runs from a clean folder
         run: |
           $zip = Get-Item build/windows-release/ghostdrive-*-windows-x86_64.zip
           $line = (Get-Content "$($zip.FullName).sha256" -Raw).Trim()
           if ($line -ne "$((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant())  $($zip.Name)") { throw "bad .sha256: $line" }
+          "{0}: {1:N1} MB" -f $zip.Name, ($zip.Length / 1MB)
           $clean = Join-Path $env:RUNNER_TEMP clean
           Expand-Archive -Path $zip -DestinationPath $clean
           Get-ChildItem -Recurse -File $clean | ForEach-Object { $_.FullName.Substring($clean.Length + 1) }
@@ -136,6 +197,74 @@ jobs:
             Pop-Location
           }
 
+          $appDir = Join-Path $dir app
+          $appFiles = Get-ChildItem -Recurse -File $appDir
+          "app\: {0} files, {1:N1} MB" -f $appFiles.Count, (($appFiles | Measure-Object Length -Sum).Sum / 1MB)
+          $exe = Get-Item (Join-Path $appDir GhostDriveApp.exe)
+          "GhostDriveApp.exe version $($exe.VersionInfo.ProductVersion)"
+          $bundled = @{}
+          $appFiles | ForEach-Object { $bundled[$_.Name.ToLowerInvariant()] = $true }
+          $checked = 0
+          foreach ($pe in $appFiles | Where-Object { $_.Extension -in '.exe', '.dll' }) {
+            $text = & $dumpbin /nologo /dependents $pe.FullName | Out-String
+            $imports = ($text -split 'Image has the following delay load dependencies:')[0]
+            $dlls = [regex]::Matches($imports, '(?m)^\s+(\S+\.dll)\s*$') | ForEach-Object { $_.Groups[1].Value }
+            foreach ($dll in $dlls) {
+              $name = $dll.ToLowerInvariant()
+              if ($bundled.ContainsKey($name)) { continue }
+              # API sets are resolved by the loader, not files. That includes the UCRT's
+              # (api-ms-win-crt-*), which the .NET runtime uses: it is part of Windows 10.
+              if ($name -match '^(api-ms-win-|ext-ms-)' -or $name -eq 'ucrtbase.dll') { continue }
+              if ($name -match '^(vcruntime|msvcp|concrt|vccorlib)' -or -not (Test-Path (Join-Path $env:SystemRoot "System32\$dll"))) {
+                throw "app\$($pe.Name) needs $dll, which is neither in app\ nor part of Windows"
+              }
+            }
+            $checked++
+          }
+          "checked the imports of $checked DLLs and EXEs in app\"
+
+          # A drive in the default data folder (this runner's), served by a --no-mount daemon.
+          $cli = Join-Path $dir ghostdrive.exe
+          & $cli init --name release-check
+          if ($LASTEXITCODE) { throw "ghostdrive init failed: $LASTEXITCODE" }
+          $daemon = Start-Process -FilePath (Join-Path $dir ghostdrived.exe) -ArgumentList '--no-mount' -PassThru -WindowStyle Hidden
+          $app = $null
+          try {
+            $deadline = (Get-Date).AddSeconds(60)
+            do {
+              Start-Sleep -Seconds 1
+              & $cli status --json *> $null
+            } while ($LASTEXITCODE -and (Get-Date) -lt $deadline -and -not $daemon.HasExited)
+            if ($LASTEXITCODE) { throw "the daemon did not start: $LASTEXITCODE" }
+            $global:LASTEXITCODE = 0
+
+            Add-Type -AssemblyName UIAutomationClient
+            Add-Type -AssemblyName UIAutomationTypes
+            $app = Start-Process -FilePath $exe.FullName -ArgumentList '--page', 'home' -PassThru
+            $found = $false
+            $deadline = (Get-Date).AddSeconds(60)
+            while (-not $found -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 2
+              if ($app.HasExited) { throw "GhostDriveApp exited on its own with code $($app.ExitCode)" }
+              $app.Refresh()
+              if ($app.MainWindowHandle -eq 0) { continue }
+              $root = [System.Windows.Automation.AutomationElement]::FromHandle($app.MainWindowHandle)
+              $cond = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::NameProperty, 'release-check')
+              $found = $null -ne $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+            }
+            if (-not $found) { throw "GhostDriveApp did not show the device 'release-check' (did it find ..\ghostdrive.exe?)" }
+            Write-Output "GhostDriveApp shows this device, so it runs ..\ghostdrive.exe"
+            if (-not $app.CloseMainWindow() -or -not $app.WaitForExit(15000)) { throw 'GhostDriveApp did not close' }
+            Write-Output "GhostDriveApp closed with exit code $($app.ExitCode)"
+            if ($app.ExitCode -ne 0) { throw "GhostDriveApp exited with $($app.ExitCode)" }
+          } finally {
+            if ($app -and -not $app.HasExited) { $app.Kill() }
+            & $cli stop *> $null
+            if (-not $daemon.WaitForExit(20000)) { $daemon.Kill() }
+            $global:LASTEXITCODE = 0
+          }
+
       - uses: actions/upload-artifact@v7
         with:
           name: package-windows
@@ -146,6 +275,7 @@ jobs:
 
   release:
     needs: [package, package-windows]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -1,0 +1,24 @@
+GhostDrive for macOS
+====================
+
+Drag GhostDrive.app into your Applications folder and open it. It needs macOS 13 or later and
+FUSE-T for mounting (https://www.fuse-t.org, or `brew install --cask fuse-t`); install FUSE-T
+first.
+
+The app carries its own copy of the ghostdrive and ghostdrived programs, so nothing else needs
+installing. The app is signed ad hoc, not by a registered developer, so the first time macOS
+refuses to open it: Control-click GhostDrive.app, choose Open, then Open again. If it still will
+not open after a browser download, remove the quarantine flag in Terminal:
+
+  xattr -dr com.apple.quarantine /Applications/GhostDrive.app
+
+The bin folder holds the same programs for the terminal, plus the optional rendezvous server:
+
+  bin/ghostdrive              the CLI
+  bin/ghostdrived             the daemon that mounts the drive
+  bin/ghostdrive-rendezvous   the rendezvous and relay server
+
+Copy them to a directory on PATH if you want them there (keep ghostdrive and ghostdrived
+together), for example: cp bin/* ~/.local/bin/
+
+More: README.md in share/doc/ghostdrive, and https://github.com/riyadfaekanabtawi/GhostDrive
